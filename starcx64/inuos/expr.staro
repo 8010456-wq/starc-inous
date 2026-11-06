@@ -1,0 +1,52 @@
+// inuos/expr.staro - 表达式 token -> x64 汇编 (P2 线性映射, 验证产出 .asm 机制)
+// 依赖: emit.staro(emit_str/emit_int/emit_nl/emit_line), sys.staro(raw_get32/raw_byteat)
+// P2 为线性映射 (不处理优先级); P3 再做语法树+优先级
+
+// 遍历 token, 数字 -> mov eax,N ; 运算符后接数字 -> mov ecx,N + 对应 op eax,ecx
+// tokens: token 缓冲; n: token 数; out: 输出缓冲; off: 起始偏移
+// 返回新 off
+Funktion expr_compile(tokens, n, out, off)
+    i = 0
+    pend_op = 0  // 0=无待定运算符; 43=+ 45=- 42=* 47=/
+    Solange i < n
+        base = i * 32
+        t = raw_get32(tokens, base)
+        Wenn t == 1 dann  // 数字
+            v = raw_get32(tokens, base + 4)
+            Wenn pend_op == 0 dann
+                // 第一个操作数 -> mov eax, v
+                off = emit_str(out, off, "mov eax, ")
+                off = emit_int(out, off, v)
+                off = emit_nl(out, off)
+            Sonst
+                // 第二个操作数 -> mov ecx, v 然后 op eax, ecx
+                off = emit_str(out, off, "mov ecx, ")
+                off = emit_int(out, off, v)
+                off = emit_nl(out, off)
+                Wenn pend_op == 43 dann
+                    off = emit_line(out, off, "add eax, ecx")
+                Sonst
+                    Wenn pend_op == 45 dann
+                        off = emit_line(out, off, "sub eax, ecx")
+                    Sonst
+                        Wenn pend_op == 42 dann
+                            off = emit_line(out, off, "imul eax, ecx")
+                        Sonst
+                            Wenn pend_op == 47 dann
+                                off = emit_line(out, off, "div ecx")
+                            Ende
+                        Ende
+                    Ende
+                Ende
+                pend_op = 0
+            Ende
+        Sonst
+            Wenn t == 4 dann  // 运算符
+                c = raw_byteat(tokens, base + 8)
+                pend_op = c
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck off
+Ende

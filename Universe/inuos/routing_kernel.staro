@@ -1,0 +1,45 @@
+// inuos/routing_kernel.staro - GPU softmax6 内核 PTX 生成 (deepPuTT)
+// 依赖: sys.staro, str.staro (str_len)
+// 内核 softmax6: 6 线程, 每线程 e_i = exp((logit_i - max)*log2e), max 从 maxptr 读
+//   exp(x)=2^(x*log2e) 用 ex2.approx; log2e=1.4426950408889634 (f32 0x3FB8AA3B)
+// 参数: logits(u64) maxptr(u64) out(u64)  (各 6 个 f32)
+Funktion kstr_emit4(out, off, s)
+    n = str_len(s)
+    i = 0
+    Solange i < n
+        raw_setbyte(out, off + i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    gebe_zurueck off + n
+Ende
+
+Funktion softmax6_ptx(out, off)
+    off = kstr_emit4(out, off, ".version 7.0\n")
+    off = kstr_emit4(out, off, ".target sm_75\n")
+    off = kstr_emit4(out, off, ".address_size 64\n")
+    off = kstr_emit4(out, off, ".visible .entry softmax6(.param .u64 logits, .param .u64 maxptr, .param .u64 out) {\n")
+    off = kstr_emit4(out, off, ".reg .u32 %t, %t1;\n")
+    off = kstr_emit4(out, off, ".reg .u64 %rl, %rm, %ro, %addr;\n")
+    off = kstr_emit4(out, off, ".reg .f32 %l, %mx, %d, %e;\n")
+    off = kstr_emit4(out, off, ".reg .pred %p;\n")
+    off = kstr_emit4(out, off, "mov.u32 %t, %tid.x;\n")
+    off = kstr_emit4(out, off, "setp.ge.u32 %p, %t, 6;\n")
+    off = kstr_emit4(out, off, "@%p bra EXIT;\n")
+    off = kstr_emit4(out, off, "ld.param.u64 %rl, [logits];\n")
+    off = kstr_emit4(out, off, "mul.wide.u32 %addr, %t, 4;\n")
+    off = kstr_emit4(out, off, "add.u64 %addr, %rl, %addr;\n")
+    off = kstr_emit4(out, off, "ld.global.f32 %l, [%addr];\n")
+    off = kstr_emit4(out, off, "ld.param.u64 %rm, [maxptr];\n")
+    off = kstr_emit4(out, off, "ld.global.f32 %mx, [%rm];\n")
+    off = kstr_emit4(out, off, "sub.f32 %d, %l, %mx;\n")
+    off = kstr_emit4(out, off, "mul.f32 %d, %d, 0f3FB8AA3B;\n")
+    off = kstr_emit4(out, off, "ex2.approx.f32 %e, %d;\n")
+    off = kstr_emit4(out, off, "ld.param.u64 %ro, [out];\n")
+    off = kstr_emit4(out, off, "mul.wide.u32 %addr, %t, 4;\n")
+    off = kstr_emit4(out, off, "add.u64 %addr, %ro, %addr;\n")
+    off = kstr_emit4(out, off, "st.global.f32 [%addr], %e;\n")
+    off = kstr_emit4(out, off, "EXIT:\n")
+    off = kstr_emit4(out, off, "ret;\n")
+    off = kstr_emit4(out, off, "}\n")
+    gebe_zurueck off
+Ende

@@ -1,0 +1,533 @@
+// file_search.staro - File search functions using Windows API
+// Uses built-in: alloc, raw_setbyte, raw_byteat, liste_laenge, byteat
+// linx-o: FindFirstFileA, FindNextFileA, FindClose
+
+linx-o kernel32 FindFirstFileA FindNextFileA FindClose
+
+// ============ Memory Functions ============
+
+// alloc_raw(size) - allocate raw memory
+Funktion alloc_raw(size)
+    ptr = alloc(size)
+    gebe_zurueck ptr
+Ende
+
+// ============ String to C String ============
+
+// make_cstr(str) - convert StarC string to null-terminated C string in raw memory
+// StarC string: [length(8 bytes)][data...][null]
+// C string: [data...][null]
+Funktion make_cstr(str)
+    len = liste_laenge(str)
+    ptr = alloc(len + 16)
+    i = 0
+    Solange i < len
+        ch = byteat(str, i)
+        raw_setbyte(ptr, i, ch)
+        i = i + 1
+    Ende
+    raw_setbyte(ptr, len, 0)
+    gebe_zurueck ptr
+Ende
+
+// ============ File Search Functions ============
+
+// init_file_search() - allocate buffer for file search (WIN32_FIND_DATAA = 468 bytes)
+Funktion init_file_search()
+    buffer = alloc(468)
+    i = 0
+    Solange i < 468
+        raw_setbyte(buffer, i, 0)
+        i = i + 1
+    Ende
+    gebe_zurueck buffer
+Ende
+
+// open_dir(path, buffer) - open directory, return 1 on success
+Funktion open_dir(path, buffer)
+    // Convert path to C string first
+    path_cstr = make_cstr(path)
+    
+    // Get length of path
+    path_len = liste_laenge(path)
+    
+    // Append "*" to the C string (ASCII 42)
+    raw_setbyte(path_cstr, path_len, 42)
+    raw_setbyte(path_cstr, path_len + 1, 0)
+    
+    handle = FindFirstFileA(path_cstr, buffer)
+    
+    Wenn handle == -1 dann
+        // 句柄无效，清零末尾的句柄存储区
+        raw_setbyte(buffer, 460, 0)
+        raw_setbyte(buffer, 461, 0)
+        raw_setbyte(buffer, 462, 0)
+        raw_setbyte(buffer, 463, 0)
+        raw_setbyte(buffer, 464, 0)
+        raw_setbyte(buffer, 465, 0)
+        raw_setbyte(buffer, 466, 0)
+        raw_setbyte(buffer, 467, 0)
+        gebe_zurueck 0
+    Sonst
+        // 把句柄拆分存储到 buffer 末尾 (offset 460-467)
+        h0 = handle % 256
+        h1 = (handle / 256) % 256
+        h2 = (handle / 65536) % 256
+        h3 = (handle / 16777216) % 256
+        h4 = (handle / 4294967296) % 256
+        h5 = (handle / 1099511627776) % 256
+        h6 = (handle / 281474976710656) % 256
+        h7 = (handle / 72057594037927936) % 256
+        
+        raw_setbyte(buffer, 460, h0)
+        raw_setbyte(buffer, 461, h1)
+        raw_setbyte(buffer, 462, h2)
+        raw_setbyte(buffer, 463, h3)
+        raw_setbyte(buffer, 464, h4)
+        raw_setbyte(buffer, 465, h5)
+        raw_setbyte(buffer, 466, h6)
+        raw_setbyte(buffer, 467, h7)
+        
+        gebe_zurueck 1
+    Ende
+Ende
+
+// open_dir_pattern(pattern, buffer) - 直接搜索模式（如 "E:\\*foo.txt"）
+Funktion open_dir_pattern(pattern, buffer)
+    pattern_cstr = make_cstr(pattern)
+    
+    handle = FindFirstFileA(pattern_cstr, buffer)
+    
+    Wenn handle == -1 dann
+        raw_setbyte(buffer, 460, 0)
+        raw_setbyte(buffer, 461, 0)
+        raw_setbyte(buffer, 462, 0)
+        raw_setbyte(buffer, 463, 0)
+        raw_setbyte(buffer, 464, 0)
+        raw_setbyte(buffer, 465, 0)
+        raw_setbyte(buffer, 466, 0)
+        raw_setbyte(buffer, 467, 0)
+        gebe_zurueck 0
+    Sonst
+        h0 = handle % 256
+        h1 = (handle / 256) % 256
+        h2 = (handle / 65536) % 256
+        h3 = (handle / 16777216) % 256
+        h4 = (handle / 4294967296) % 256
+        h5 = (handle / 1099511627776) % 256
+        h6 = (handle / 281474976710656) % 256
+        h7 = (handle / 72057594037927936) % 256
+        
+        raw_setbyte(buffer, 460, h0)
+        raw_setbyte(buffer, 461, h1)
+        raw_setbyte(buffer, 462, h2)
+        raw_setbyte(buffer, 463, h3)
+        raw_setbyte(buffer, 464, h4)
+        raw_setbyte(buffer, 465, h5)
+        raw_setbyte(buffer, 466, h6)
+        raw_setbyte(buffer, 467, h7)
+        
+        gebe_zurueck 1
+    Ende
+Ende
+
+// next_file(buffer) - get next file, return 1 if exists
+// 从 buffer 末尾 (offset 460-467) 读取句柄
+Funktion next_file(buffer)
+    h0 = raw_byteat(buffer, 460)
+    h1 = raw_byteat(buffer, 461)
+    h2 = raw_byteat(buffer, 462)
+    h3 = raw_byteat(buffer, 463)
+    h4 = raw_byteat(buffer, 464)
+    h5 = raw_byteat(buffer, 465)
+    h6 = raw_byteat(buffer, 466)
+    h7 = raw_byteat(buffer, 467)
+    
+    handle = h0
+    handle = handle + h1 * 256
+    handle = handle + h2 * 65536
+    handle = handle + h3 * 16777216
+    handle = handle + h4 * 4294967296
+    handle = handle + h5 * 1099511627776
+    handle = handle + h6 * 281474976710656
+    handle = handle + h7 * 72057594037927936
+    
+    Wenn handle == 0 dann
+        gebe_zurueck 0
+    Ende
+    
+    result = FindNextFileA(handle, buffer)
+    
+    Wenn result == 0 dann
+        // 清零末尾的句柄存储区
+        raw_setbyte(buffer, 460, 0)
+        raw_setbyte(buffer, 461, 0)
+        raw_setbyte(buffer, 462, 0)
+        raw_setbyte(buffer, 463, 0)
+        raw_setbyte(buffer, 464, 0)
+        raw_setbyte(buffer, 465, 0)
+        raw_setbyte(buffer, 466, 0)
+        raw_setbyte(buffer, 467, 0)
+        gebe_zurueck 0
+    Sonst
+        gebe_zurueck 1
+    Ende
+Ende
+
+// get_filename(buffer) - extract filename from buffer
+// WIN32_FIND_DATAA.cFileName is at offset 44 (with #pragma pack(1))
+// StarC string layout: [length(8 bytes)][data...][null]
+Funktion get_filename(buffer)
+    // First, find the length of the filename starting at offset 44
+    len = 0
+    i = 0
+    Solange i < 260
+        ch = raw_byteat(buffer, 44 + i)
+        Wenn ch == 0 dann
+            i = 260
+        Sonst
+            len = len + 1
+        Ende
+        i = i + 1
+    Ende
+    
+    Wenn len == 0 dann
+        gebe_zurueck ""
+    Ende
+    
+    // Allocate string buffer: 8 bytes header + len bytes data + 1 null terminator
+    ptr = alloc(8 + len + 1)
+    
+    // Set length at offset 0
+    raw_setbyte(ptr, 0, len % 256)
+    raw_setbyte(ptr, 1, (len / 256) % 256)
+    raw_setbyte(ptr, 2, (len / 65536) % 256)
+    raw_setbyte(ptr, 3, (len / 16777216) % 256)
+    raw_setbyte(ptr, 4, 0)
+    raw_setbyte(ptr, 5, 0)
+    raw_setbyte(ptr, 6, 0)
+    raw_setbyte(ptr, 7, 0)
+    
+    // Copy filename data to ptr + 8
+    i = 0
+    Solange i < len
+        ch = raw_byteat(buffer, 44 + i)
+        raw_setbyte(ptr, 8 + i, ch)
+        i = i + 1
+    Ende
+    
+    // Null terminator
+    raw_setbyte(ptr, 8 + len, 0)
+    
+    gebe_zurueck ptr
+Ende
+
+// ============ String Concatenation (自实现，不依赖编译器 + 运算符) ============
+
+// concat(s1, s2) - 拼接两个 StarC 字符串
+// 返回新分配的 StarC 字符串指针
+Funktion concat(s1, s2)
+    len1 = liste_laenge(s1)
+    len2 = liste_laenge(s2)
+    total = len1 + len2
+    
+    ptr = alloc(8 + total + 1)
+    
+    // 写长度头 (小端序 8 字节)
+    raw_setbyte(ptr, 0, total % 256)
+    raw_setbyte(ptr, 1, (total / 256) % 256)
+    raw_setbyte(ptr, 2, (total / 65536) % 256)
+    raw_setbyte(ptr, 3, (total / 16777216) % 256)
+    raw_setbyte(ptr, 4, 0)
+    raw_setbyte(ptr, 5, 0)
+    raw_setbyte(ptr, 6, 0)
+    raw_setbyte(ptr, 7, 0)
+    
+    // 复制 s1 的数据
+    i = 0
+    Solange i < len1
+        raw_setbyte(ptr, 8 + i, byteat(s1, i))
+        i = i + 1
+    Ende
+    
+    // 复制 s2 的数据
+    i = 0
+    Solange i < len2
+        raw_setbyte(ptr, 8 + len1 + i, byteat(s2, i))
+        i = i + 1
+    Ende
+    
+    // 空终止符
+    raw_setbyte(ptr, 8 + total, 0)
+    
+    gebe_zurueck ptr
+Ende
+
+// close_dir(buffer) - close directory
+// 从 buffer 末尾 (offset 460-467) 读取句柄
+Funktion close_dir(buffer)
+    h0 = raw_byteat(buffer, 460)
+    h1 = raw_byteat(buffer, 461)
+    h2 = raw_byteat(buffer, 462)
+    h3 = raw_byteat(buffer, 463)
+    h4 = raw_byteat(buffer, 464)
+    h5 = raw_byteat(buffer, 465)
+    h6 = raw_byteat(buffer, 466)
+    h7 = raw_byteat(buffer, 467)
+    
+    handle = h0
+    handle = handle + h1 * 256
+    handle = handle + h2 * 65536
+    handle = handle + h3 * 16777216
+    handle = handle + h4 * 4294967296
+    handle = handle + h5 * 1099511627776
+    handle = handle + h6 * 281474976710656
+    handle = handle + h7 * 72057594037927936
+    
+    Wenn handle != 0 dann
+        FindClose(handle)
+    Ende
+    
+    // 清零句柄存储区
+    raw_setbyte(buffer, 460, 0)
+    raw_setbyte(buffer, 461, 0)
+    raw_setbyte(buffer, 462, 0)
+    raw_setbyte(buffer, 463, 0)
+    raw_setbyte(buffer, 464, 0)
+    raw_setbyte(buffer, 465, 0)
+    raw_setbyte(buffer, 466, 0)
+    raw_setbyte(buffer, 467, 0)
+    
+    gebe_zurueck 0
+Ende
+
+// ============ String Functions ============
+
+// str_eq(s1, s2) - check if two strings are equal
+Funktion str_eq(s1, s2)
+    len1 = liste_laenge(s1)
+    len2 = liste_laenge(s2)
+    Wenn len1 != len2 dann
+        gebe_zurueck 0
+    Ende
+    Wenn len1 == 0 dann
+        gebe_zurueck 1
+    Ende
+    i = 0
+    Solange i < len1
+        Wenn byteat(s1, i) != byteat(s2, i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// is_dot(name) - check if filename is "." or ".."
+Funktion is_dot(name)
+    len = liste_laenge(name)
+    Wenn len <= 2 dann
+        Wenn byteat(name, 0) == 46 dann
+            gebe_zurueck 1
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+// is_dir(buffer) - check if current file is a directory
+// WIN32_FIND_DATAA.dwFileAttributes at offset 0, FILE_ATTRIBUTE_DIRECTORY = 16
+Funktion is_dir(buffer)
+    a0 = raw_byteat(buffer, 0)
+    a1 = raw_byteat(buffer, 1)
+    a2 = raw_byteat(buffer, 2)
+    a3 = raw_byteat(buffer, 3)
+    attrs = a0
+    attrs = attrs + a1 * 256
+    attrs = attrs + a2 * 65536
+    attrs = attrs + a3 * 16777216
+    Wenn attrs % 32 >= 16 dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// has_str(str, sub) - check if string contains substring
+Funktion has_str(str, sub)
+    sub_len = liste_laenge(sub)
+    str_len = liste_laenge(str)
+    
+    Wenn sub_len == 0 dann
+        gebe_zurueck 1
+    Ende
+    
+    Wenn sub_len > str_len dann
+        gebe_zurueck 0
+    Ende
+    
+    i = 0
+    Solange i <= str_len - sub_len
+        match = 1
+        j = 0
+        Solange j < sub_len
+            Wenn byteat(str, i + j) != byteat(sub, j) dann
+                match = 0
+            Ende
+            j = j + 1
+        Ende
+        
+        Wenn match == 1 dann
+            gebe_zurueck 1
+        Ende
+        
+        i = i + 1
+    Ende
+    
+    gebe_zurueck 0
+Ende
+
+// i2s(num) - integer to string
+Funktion i2s(num)
+    Wenn num == 0 dann
+        gebe_zurueck "0"
+    Ende
+    
+    Wenn num < 0 dann
+        neg = 1
+        num = num * -1
+    Sonst
+        neg = 0
+    Ende
+    
+    str = ""
+    
+    Solange num > 0
+        digit = num % 10
+        Wenn digit == 0 dann
+            str = "0" + str
+        Ende
+        Wenn digit == 1 dann
+            str = "1" + str
+        Ende
+        Wenn digit == 2 dann
+            str = "2" + str
+        Ende
+        Wenn digit == 3 dann
+            str = "3" + str
+        Ende
+        Wenn digit == 4 dann
+            str = "4" + str
+        Ende
+        Wenn digit == 5 dann
+            str = "5" + str
+        Ende
+        Wenn digit == 6 dann
+            str = "6" + str
+        Ende
+        Wenn digit == 7 dann
+            str = "7" + str
+        Ende
+        Wenn digit == 8 dann
+            str = "8" + str
+        Ende
+        Wenn digit == 9 dann
+            str = "9" + str
+        Ende
+        num = num / 10
+    Ende
+    
+    Wenn neg == 1 dann
+        str = "-" + str
+    Ende
+    
+    gebe_zurueck str
+Ende
+
+// byte_to_str(byte) - byte to single character string
+Funktion byte_to_str(byte)
+    Wenn byte == 48 dann gebe_zurueck "0" Ende
+    Wenn byte == 49 dann gebe_zurueck "1" Ende
+    Wenn byte == 50 dann gebe_zurueck "2" Ende
+    Wenn byte == 51 dann gebe_zurueck "3" Ende
+    Wenn byte == 52 dann gebe_zurueck "4" Ende
+    Wenn byte == 53 dann gebe_zurueck "5" Ende
+    Wenn byte == 54 dann gebe_zurueck "6" Ende
+    Wenn byte == 55 dann gebe_zurueck "7" Ende
+    Wenn byte == 56 dann gebe_zurueck "8" Ende
+   Wenn byte == 57 dann gebe_zurueck "9" Ende
+    Wenn byte == 65 dann gebe_zurueck "A" Ende
+    Wenn byte == 66 dann gebe_zurueck "B" Ende
+    Wenn byte == 67 dann gebe_zurueck "C" Ende
+    Wenn byte == 68 dann gebe_zurueck "D" Ende
+    Wenn byte == 69 dann gebe_zurueck "E" Ende
+    Wenn byte == 70 dann gebe_zurueck "F" Ende
+    Wenn byte == 71 dann gebe_zurueck "G" Ende
+    Wenn byte == 72 dann gebe_zurueck "H" Ende
+    Wenn byte == 73 dann gebe_zurueck "I" Ende
+    Wenn byte == 74 dann gebe_zurueck "J" Ende
+    Wenn byte == 75 dann gebe_zurueck "K" Ende
+    Wenn byte == 76 dann gebe_zurueck "L" Ende
+    Wenn byte == 77 dann gebe_zurueck "M" Ende
+   Wenn byte == 78 dann gebe_zurueck "N" Ende
+    Wenn byte == 79 dann gebe_zurueck "O" Ende
+    Wenn byte == 80 dann gebe_zurueck "P" Ende
+    Wenn byte == 81 dann gebe_zurueck "Q" Ende
+    Wenn byte == 82 dann gebe_zurueck "R" Ende
+    Wenn byte == 83 dann gebe_zurueck "S" Ende
+    Wenn byte == 84 dann gebe_zurueck "T" Ende
+    Wenn byte == 85 dann gebe_zurueck "U" Ende
+    Wenn byte == 86 dann gebe_zurueck "V" Ende
+    Wenn byte == 87 dann gebe_zurueck "W" Ende
+    Wenn byte == 88 dann gebe_zurueck "X" Ende
+    Wenn byte == 89 dann gebe_zurueck "Y" Ende
+    Wenn byte == 90 dann gebe_zurueck "Z" Ende
+    Wenn byte == 97 dann gebe_zurueck "a" Ende
+    Wenn byte == 98 dann gebe_zurueck "b" Ende
+    Wenn byte == 99 dann gebe_zurueck "c" Ende
+    Wenn byte == 100 dann gebe_zurueck "d" Ende
+    Wenn byte == 101 dann gebe_zurueck "e" Ende
+    Wenn byte == 102 dann gebe_zurueck "f" Ende
+    Wenn byte == 103 dann gebe_zurueck "g" Ende
+    Wenn byte == 104 dann gebe_zurueck "h" Ende
+    Wenn byte == 105 dann gebe_zurueck "i" Ende
+    Wenn byte == 106 dann gebe_zurueck "j" Ende
+    Wenn byte == 107 dann gebe_zurueck "k" Ende
+    Wenn byte == 108 dann gebe_zurueck "l" Ende
+    Wenn byte == 109 dann gebe_zurueck "m" Ende
+    Wenn byte == 110 dann gebe_zurueck "n" Ende
+    Wenn byte == 111 dann gebe_zurueck "o" Ende
+    Wenn byte == 112 dann gebe_zurueck "p" Ende
+    Wenn byte == 113 dann gebe_zurueck "q" Ende
+    Wenn byte == 114 dann gebe_zurueck "r" Ende
+    Wenn byte == 115 dann gebe_zurueck "s" Ende
+    Wenn byte == 116 dann gebe_zurueck "t" Ende
+    Wenn byte == 117 dann gebe_zurueck "u" Ende
+    Wenn byte == 118 dann gebe_zurueck "v" Ende
+    Wenn byte == 119 dann gebe_zurueck "w" Ende
+    Wenn byte == 120 dann gebe_zurueck "x" Ende
+    Wenn byte == 121 dann gebe_zurueck "y" Ende
+    Wenn byte == 122 dann gebe_zurueck "z" Ende
+    Wenn byte == 32 dann gebe_zurueck " " Ende
+    Wenn byte == 45 dann gebe_zurueck "-" Ende
+    Wenn byte == 46 dann gebe_zurueck "." Ende
+    Wenn byte == 95 dann gebe_zurueck "_" Ende
+    Wenn byte == 40 dann gebe_zurueck "(" Ende
+    Wenn byte == 41 dann gebe_zurueck ")" Ende
+    Wenn byte == 43 dann gebe_zurueck "+" Ende
+    Wenn byte == 44 dann gebe_zurueck "," Ende
+    Wenn byte == 47 dann gebe_zurueck "/" Ende
+    Wenn byte == 58 dann gebe_zurueck ":" Ende
+    Wenn byte == 59 dann gebe_zurueck ";" Ende
+    Wenn byte == 61 dann gebe_zurueck "=" Ende
+    Wenn byte == 63 dann gebe_zurueck "?" Ende
+    Wenn byte == 64 dann gebe_zurueck "@" Ende
+    Wenn byte == 91 dann gebe_zurueck "[" Ende
+    Wenn byte == 93 dann gebe_zurueck "]" Ende
+    Wenn byte == 94 dann gebe_zurueck "^" Ende
+    Wenn byte == 96 dann gebe_zurueck "`" Ende
+    Wenn byte == 123 dann gebe_zurueck "{" Ende
+    Wenn byte == 124 dann gebe_zurueck "|" Ende
+    Wenn byte == 125 dann gebe_zurueck "}" Ende
+    Wenn byte == 126 dann gebe_zurueck "~" Ende
+    
+    gebe_zurueck ""
+Ende

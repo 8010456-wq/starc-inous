@@ -1,0 +1,224 @@
+// inuos/mhc.staro - Manifold-Constrained Hyper-Connections (deepPuTT)
+// 镜像 modeling_deepseek_v4.py HyperConnection.pre/_sinkhorn/post
+// 依赖: sys str file quant fp8 bf16 softfloat cuda fp32_kernel
+// x 布局: [hc_mult=4, hidden=4096] 连续 = x_flat[16384]
+// hc_fn: [mix_hc=24, 16384] F32; hc_base[24] F32; hc_scale[3] F32
+
+Funktion sigmoid_bits(v)
+    nv = fs_neg(v)
+    e = f32_exp(nv)
+    o = f32_add(e, 1065353216)
+    gebe_zurueck f32_div(1065353216, o)
+Ende
+
+// 4 元素 softmax (dim=-1), row/out 是 4 个 fp32 位模式缓冲
+Funktion softmax4(row, out)
+    zmax = raw_get32(row, 0)
+    i = 1
+    Solange i < 4
+        zv = raw_get32(row, i * 4)
+        Wenn f32_gt(zv, zmax) dann
+            zmax = zv
+        Ende
+        i = i + 1
+    Ende
+    s = 0
+    i = 0
+    Solange i < 4
+        zv = raw_get32(row, i * 4)
+        e = f32_exp(f32_sub(zv, zmax))
+        raw_set32(out, i * 4, e)
+        s = f32_add(s, e)
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < 4
+        raw_set32(out, i * 4, f32_div(raw_get32(out, i * 4), s))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// Sinkhorn 双随机归一化 (4x4), comb 原地 16 个 fp32
+Funktion mhc_sinkhorn(comb)
+    eps = 897988541
+    tmp = alloc(16 * 4)  // 4 行 softmax, 每行 4 个 fp32 = 64 字节
+    i = 0
+    Solange i < 4
+        softmax4(comb + i * 16, tmp + i * 16)
+        i = i + 1
+    Ende
+    // + eps, 复制回 comb
+    i = 0
+    Solange i < 16
+        raw_set32(comb, i * 4, f32_add(raw_get32(tmp, i * 4), eps))
+        i = i + 1
+    Ende
+    // 列归一化
+    j = 0
+    Solange j < 4
+        s = 0
+        i = 0
+        Solange i < 4
+            s = f32_add(s, raw_get32(comb, (i * 4 + j) * 4))
+            i = i + 1
+        Ende
+        s = f32_add(s, eps)
+        i = 0
+        Solange i < 4
+            raw_set32(comb, (i * 4 + j) * 4, f32_div(raw_get32(comb, (i * 4 + j) * 4), s))
+            i = i + 1
+        Ende
+        j = j + 1
+    Ende
+    // 19 迭代
+    it = 0
+    Solange it < 19
+        // 行归一化
+        i = 0
+        Solange i < 4
+            s = 0
+            j = 0
+            Solange j < 4
+                s = f32_add(s, raw_get32(comb, (i * 4 + j) * 4))
+                j = j + 1
+            Ende
+            s = f32_add(s, eps)
+            j = 0
+            Solange j < 4
+                raw_set32(comb, (i * 4 + j) * 4, f32_div(raw_get32(comb, (i * 4 + j) * 4), s))
+                j = j + 1
+            Ende
+            i = i + 1
+        Ende
+        // 列归一化
+        j = 0
+        Solange j < 4
+            s = 0
+            i = 0
+            Solange i < 4
+                s = f32_add(s, raw_get32(comb, (i * 4 + j) * 4))
+                i = i + 1
+            Ende
+            s = f32_add(s, eps)
+            i = 0
+            Solange i < 4
+                raw_set32(comb, (i * 4 + j) * 4, f32_div(raw_get32(comb, (i * 4 + j) * 4), s))
+                i = i + 1
+            Ende
+            j = j + 1
+        Ende
+        it = it + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// pre: x[4,4096] -> y[4096], postw[4], comb[16]
+//   rsqrt = 1/sqrt(mean(x_flat^2)+norm_eps); mixes = hc_fn @ x_flat * rsqrt (GPU fp32gemv)
+//   prew[c]=sigmoid(mixes[c]*scale0+base[c])+eps; postw[c]=2*sigmoid(mixes[4+c]*scale1+base[4+c])
+//   comb = sinkhorn(mixes[8:24]*scale2+base[8:24]); y[d]=sum_c prew[c]*x[c][d]
+Funktion mhc_pre(x, hc_fn, hc_base, hc_scale, prew, postw, comb, y, gpu_lut, mod, func)
+    // rsqrt
+    acc = 0
+    i = 0
+    Solange i < 16384
+        v = raw_get32(x, i * 4)
+        acc = f32_add(acc, f32_mul(v, v))
+        i = i + 1
+    Ende
+    mean = f32_div(acc, s32_to_f32(16384))
+    m2 = f32_add(mean, 897988541)  // +1e-6
+    rsqrt = f32_div(1065353216, f32_sqrt(m2))
+    // mixes = hc_fn[24,16384] @ x_flat  (GPU)
+    gpu_w = cuda_mem_alloc(24 * 16384 * 4)
+    gpu_act = cuda_mem_alloc(16384 * 4)
+    gpu_out = cuda_mem_alloc(24 * 4)
+    cuda_memcpy_htod(gpu_w, hc_fn, 24 * 16384 * 4)
+    cuda_memcpy_htod(gpu_act, x, 16384 * 4)
+    pw = alloc(8)
+    raw_set64(pw, 0, gpu_w)
+    pa = alloc(8)
+    raw_set64(pa, 0, gpu_act)
+    po = alloc(8)
+    raw_set64(po, 0, gpu_out)
+    pM = alloc(4)
+    raw_set32(pM, 0, 24)
+    pK = alloc(4)
+    raw_set32(pK, 0, 16384)
+    params = alloc(40)
+    raw_set64(params, 0, pw)
+    raw_set64(params, 8, pa)
+    raw_set64(params, 16, po)
+    raw_set64(params, 24, pM)
+    raw_set64(params, 32, pK)
+    cuda_launch(func, 1, 1, 1, 32, 1, 1, 0, 0, params)
+    mixes = alloc(24 * 4)
+    cuda_memcpy_dtoh(mixes, gpu_out, 24 * 4)
+    cuda_mem_free(gpu_w)
+    cuda_mem_free(gpu_act)
+    cuda_mem_free(gpu_out)
+    // mixes *= rsqrt
+    i = 0
+    Solange i < 24
+        raw_set32(mixes, i * 4, f32_mul(raw_get32(mixes, i * 4), rsqrt))
+        i = i + 1
+    Ende
+    // prew/postw
+    s0 = raw_get32(hc_scale, 0)
+    s1 = raw_get32(hc_scale, 4)
+    s2 = raw_get32(hc_scale, 8)
+    eps = 897988541
+    i = 0
+    Solange i < 4
+        v = raw_get32(mixes, i * 4)
+        b = raw_get32(hc_base, i * 4)
+        raw_set32(prew, i * 4, f32_add(sigmoid_bits(f32_add(f32_mul(v, s0), b)), eps))
+        v2 = raw_get32(mixes, (4 + i) * 4)
+        b2 = raw_get32(hc_base, (4 + i) * 4)
+        raw_set32(postw, i * 4, f32_mul(s32_to_f32(2), sigmoid_bits(f32_add(f32_mul(v2, s1), b2))))
+        i = i + 1
+    Ende
+    // comb = mixes[8:24]*s2 + base[8:24], sinkhorn
+    i = 0
+    Solange i < 16
+        v = raw_get32(mixes, (8 + i) * 4)
+        b = raw_get32(hc_base, (8 + i) * 4)
+        raw_set32(comb, i * 4, f32_add(f32_mul(v, s2), b))
+        i = i + 1
+    Ende
+    mhc_sinkhorn(comb)
+    // y[d] = sum_c prew[c]*x[c][d]
+    d = 0
+    Solange d < 4096
+        a = 0
+        c = 0
+        Solange c < 4
+            a = f32_add(a, f32_mul(raw_get32(prew, c * 4), raw_get32(x, (c * 4096 + d) * 4)))
+            c = c + 1
+        Ende
+        raw_set32(y, d * 4, a)
+        d = d + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// post: y[4096] + x[4,4096] -> post_out[4,4096]
+//   post_out[c][d] = postw[c]*y[d] + sum_j comb[c*4+j]*x[j][d]
+Funktion mhc_post(y, x, postw, comb, post_out)
+    c = 0
+    Solange c < 4
+        d = 0
+        Solange d < 4096
+            a = f32_mul(raw_get32(postw, c * 4), raw_get32(y, d * 4))
+            j = 0
+            Solange j < 4
+                a = f32_add(a, f32_mul(raw_get32(comb, (c * 4 + j) * 4), raw_get32(x, (j * 4096 + d) * 4)))
+                j = j + 1
+            Ende
+            raw_set32(post_out, (c * 4096 + d) * 4, a)
+            d = d + 1
+        Ende
+        c = c + 1
+    Ende
+    gebe_zurueck 0
+Ende

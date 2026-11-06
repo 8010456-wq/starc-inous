@@ -1,0 +1,130 @@
+// ============================================================================
+//  json_parse.staro —— language-bench 考题「Json-parse」能力层
+//  铁律 E：能力全在 .staro。解析 JSON 实例，精确复现 lbgen ref_json_seed。
+//  约定：objects=记录+meta 对象数（'{' 计数，2/记录=180000）；
+//        int_sum=字符串外所有数字和（id+score+mx+my+history）；
+//        trues="true" 数；nulls="null" 数；
+//        str_len=Σ所有字符串反转义后值长 − 键长(38/记录×90000=3420000)。
+//        键固定：id2+name4+active6+score5+tags4+meta4+x1+y1+note4+history7=38。
+//  json_parse_run(buf, n) -> 返回 alloc(40)：[objects,int_sum,str_len,trues,nulls]。
+// ============================================================================
+
+Funktion jp_is_digit(c)
+    Wenn c >= 48 dann
+        Wenn c <= 57 dann
+            gebe_zurueck 1
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion json_parse_run(buf, n)
+    objects = 0
+    int_sum = 0
+    trues = 0
+    nulls = 0
+    s = 0
+    i = 0
+    Solange i < n
+        c = raw_byteat(buf, i)
+        Wenn c == 34 dann
+            // '"'：解析字符串，统计反转义后长度
+            i = i + 1
+            fertig = 0
+            Solange fertig == 0
+                cc = raw_byteat(buf, i)
+                Wenn cc == 34 dann
+                    fertig = 1
+                    i = i + 1
+                Sonst
+                    Wenn cc == 92 dann
+                        // '\'：跳过转义字符，算 1 个字符
+                        i = i + 2
+                        s = s + 1
+                    Sonst
+                        i = i + 1
+                        s = s + 1
+                    Ende
+                Ende
+            Ende
+        Sonst
+            Wenn c == 123 dann
+                // '{'
+                objects = objects + 1
+                i = i + 1
+            Sonst
+                Wenn c == 45 dann
+                    // '-'：负数
+                    i = i + 1
+                    v = 0
+                    cc = raw_byteat(buf, i)
+                    Solange jp_is_digit(cc) == 1
+                        v = v * 10 + (cc - 48)
+                        i = i + 1
+                        cc = raw_byteat(buf, i)
+                    Ende
+                    int_sum = int_sum - v
+                Sonst
+                    Wenn jp_is_digit(c) == 1 dann
+                        v = 0
+                        cc = c
+                        Solange jp_is_digit(cc) == 1
+                            v = v * 10 + (cc - 48)
+                            i = i + 1
+                            cc = raw_byteat(buf, i)
+                        Ende
+                        int_sum = int_sum + v
+                    Sonst
+                        Wenn c == 116 dann
+                            // 't'：检查 "true"
+                            Wenn raw_byteat(buf, i + 1) == 114 dann
+                                Wenn raw_byteat(buf, i + 2) == 117 dann
+                                    Wenn raw_byteat(buf, i + 3) == 101 dann
+                                        trues = trues + 1
+                                        i = i + 4
+                                    Sonst
+                                        i = i + 1
+                                    Ende
+                                Sonst
+                                    i = i + 1
+                                Ende
+                            Sonst
+                                i = i + 1
+                            Ende
+                        Sonst
+                            Wenn c == 110 dann
+                                // 'n'：检查 "null"
+                                Wenn raw_byteat(buf, i + 1) == 117 dann
+                                    Wenn raw_byteat(buf, i + 2) == 108 dann
+                                        Wenn raw_byteat(buf, i + 3) == 108 dann
+                                            nulls = nulls + 1
+                                            i = i + 4
+                                        Sonst
+                                            i = i + 1
+                                        Ende
+                                    Sonst
+                                        i = i + 1
+                                    Ende
+                                Sonst
+                                    i = i + 1
+                                Ende
+                            Sonst
+                                i = i + 1
+                            Ende
+                        Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+    Ende
+
+    str_len = s - 3420000
+
+    out = alloc(40)
+    write_u64(out, 0, objects)
+    write_u64(out, 8, int_sum)
+    write_u64(out, 16, str_len)
+    write_u64(out, 24, trues)
+    write_u64(out, 32, nulls)
+    gebe_zurueck out
+Ende

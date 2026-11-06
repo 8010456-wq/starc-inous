@@ -1,0 +1,287 @@
+// inuos/codegen_bare.staro - StarOS 裸机 x64 代码生成后端 (地基)
+// 依赖: sys.staro(raw_setbyte), str.staro
+// 本文件: x64 机器码字节发射原语 + 整数 RPN 栈式求值器
+// 约定: 结果在栈顶, 最后 pop rax; 整数变量映射到 [rbp - slot]
+//   整数 RPN 项 (8B): [0]type [4]a; type 1=const(a=值) 2=intvar(a=aux) 4=intop(a=ASCII/编码)
+//   intop 编码: 43='+' 45='-' 42='*' 47='/' 60='<' 61='==' 62='>' 64='>=' 65='<=' 0='und'
+
+// ---- 字节发射原语 (小端) ----
+
+Funktion b8(out, off, v)
+    raw_setbyte(out, off, v)
+    gebe_zurueck off + 1
+Ende
+
+Funktion b16(out, off, v)
+    raw_setbyte(out, off, v % 256)
+    raw_setbyte(out, off + 1, (v / 256) % 256)
+    gebe_zurueck off + 2
+Ende
+
+Funktion b32(out, off, v)
+    raw_setbyte(out, off, v % 256)
+    raw_setbyte(out, off + 1, (v / 256) % 256)
+    raw_setbyte(out, off + 2, (v / 65536) % 256)
+    raw_setbyte(out, off + 3, (v / 16777216) % 256)
+    gebe_zurueck off + 4
+Ende
+
+// ---- x64 指令快捷发射 (整数栈式) ----
+
+Funktion x_push_reg(out, off, reg)   // push r64: 50+reg
+    off = b8(out, off, 80 + reg)
+    gebe_zurueck off
+Ende
+
+Funktion x_pop_reg(out, off, reg)    // pop r64: 58+reg
+    off = b8(out, off, 88 + reg)
+    gebe_zurueck off
+Ende
+
+Funktion x_push_imm32(out, off, v)   // push imm32: 68 imm32 (符号扩展)
+    off = b8(out, off, 104)
+    off = b32(out, off, v)
+    gebe_zurueck off
+Ende
+
+// push [rbp - disp8]  (FF 75 disp8); disp8 为 0..127 内无符号, 表示负偏移
+Funktion x_push_rbp_disp(out, off, disp8)
+    off = b8(out, off, 255)   // FF
+    off = b8(out, off, 117)   // 75: /6 push r/m64, modrm=01 110 101 (rbp+disp8)
+    off = b8(out, off, disp8)
+    gebe_zurueck off
+Ende
+
+// 整数 RPN -> x64 机器码 (栈式). 变量 aux 映射槽: slot = (aux-16+1)*8, 即 [rbp - slot]
+Funktion codegen_int_rpn_bare(irpn, start, len, out, off)
+    sp = 0
+    i = 0
+    Solange i < len
+        item = (start + i) * 8
+        t = raw_get32(irpn, item)
+        Wenn t == 1 dann  // 常量 -> push imm32
+            off = x_push_imm32(out, off, raw_get32(irpn, item + 4))
+        Sonst
+            Wenn t == 2 dann  // 变量 -> push [rbp - slot]
+                aux = raw_get32(irpn, item + 4)
+                slot = (aux - 16 + 1) * 8
+                off = x_push_rbp_disp(out, off, 0 - slot)
+            Sonst
+                Wenn t == 4 dann  // 整数运算符
+                    // pop rcx(右) pop rax(左)
+                    off = x_pop_reg(out, off, 1)   // rcx
+                    off = x_pop_reg(out, off, 0)   // rax
+                    c = raw_get32(irpn, item + 4)
+                    Wenn c == 43 dann  // add eax, ecx: 01 C8
+                        off = b8(out, off, 1)
+                        off = b8(out, off, 200)
+                    Sonst
+                        Wenn c == 45 dann  // sub eax, ecx: 29 C8
+                            off = b8(out, off, 41)
+                            off = b8(out, off, 200)
+                        Sonst
+                            Wenn c == 42 dann  // imul eax, ecx: 0F AF C1
+                                off = b8(out, off, 15)
+                                off = b8(out, off, 175)
+                                off = b8(out, off, 193)
+                            Sonst
+                                Wenn c == 47 dann  // 无符号 div: xor edx,edx; div ecx
+                                    off = b8(out, off, 49)   // xor edx, edx: 31 D2
+                                    off = b8(out, off, 210)
+                                    off = b8(out, off, 247)  // div ecx: F7 F1
+                                    off = b8(out, off, 241)
+                                Sonst
+                                    // 比较: cmp eax,ecx (39 C8) + setcc al + movzx eax,al (0F B6 C0)
+                                    off = b8(out, off, 57)   // cmp eax, ecx
+                                    off = b8(out, off, 200)
+                                    cc = 0
+                                    Wenn c == 60 dann cc = 156 Ende   // setl  (signed <): 0F 9C C0
+                                    Wenn c == 61 dann cc = 148 Ende   // sete  ==: 0F 94 C0
+                                    Wenn c == 62 dann cc = 159 Ende   // setg  >: 0F 9F C0
+                                    Wenn c == 64 dann cc = 157 Ende   // setge >=: 0F 9D C0
+                                    Wenn c == 65 dann cc = 158 Ende   // setle <=: 0F 9E C0
+                                    Wenn c == 0 dann cc = 149 Ende    // setne != (und 视为 !=0? 保守)
+                                    off = b8(out, off, 15)   // setcc al
+                                    off = b8(out, off, cc)
+                                    off = b8(out, off, 192)
+                                    off = b8(out, off, 15)   // movzx eax, al
+                                    off = b8(out, off, 182)
+                                    off = b8(out, off, 192)
+                                Ende
+                            Ende
+                        Ende
+                    Ende
+                    off = x_push_reg(out, off, 0)   // push rax
+                Ende
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    // 结果在栈顶 -> pop rax
+    off = x_pop_reg(out, off, 0)
+    gebe_zurueck off
+Ende
+
+// ================= 语句级代码生成 (整数内核) =================
+// 调用约定(内部): 所有整数结果在 rax; int 变量槽 [rbp - (aux-16+1)*8]
+// AST 节点(32B) 类型(复用 parse_prog 编号 + 新增):
+//   5=int assign: a=rreg b=irpn_start c=irpn_len
+//   7=loop:       a=cond_start b=cond_len c=body_start d=body_count
+//   8=if:         a=cond_start b=cond_len c=then_start d=then_count e=else_start f=else_count
+//   2=ret:        b=irpn_start c=irpn_len  (整数返回)
+// irpn 是独立缓冲区(项/8B), ast 是节点缓冲区(项/32B); cgst[0]=fx 回填计数(共享)
+
+// 写 int 结果到变量槽: mov [rbp - slot], rax   (48 89 45 disp8, disp8=(-slot)&0xFF 即 256-slot)
+Funktion x_store_rbp_disp(out, off, slot)
+    off = b8(out, off, 72)        // 48
+    off = b8(out, off, 137)       // 89
+    off = b8(out, off, 69)        // 45 modrm: mod01 reg000 rbp
+    off = b8(out, off, 256 - slot)
+    gebe_zurueck off
+Ende
+
+// 发射 test rax,rax (48 85 C0)
+Funktion x_test_rax(out, off)
+    off = b8(out, off, 72)
+    off = b8(out, off, 133)
+    off = b8(out, off, 192)
+    gebe_zurueck off
+Ende
+
+// 发射 jz rel32 (0F 84) 到未知目标; fixbuf[fx] = rel 字段位置(回填用); fx 由 cgst[0] 维护
+Funktion x_jz_fwd(out, off, fixbuf, cgst)
+    off = b8(out, off, 15)
+    off = b8(out, off, 132)
+    raw_set32(fixbuf, raw_get32(cgst, 0) * 8, off)
+    raw_set32(cgst, 0, raw_get32(cgst, 0) + 1)
+    off = b8(out, off, 0)
+    off = b8(out, off, 0)
+    off = b8(out, off, 0)
+    off = b8(out, off, 0)
+    gebe_zurueck off
+Ende
+
+// 发射 jmp rel32 (E9) 到未知目标
+Funktion x_jmp_fwd(out, off, fixbuf, cgst)
+    off = b8(out, off, 233)
+    raw_set32(fixbuf, raw_get32(cgst, 0) * 8, off)
+    raw_set32(cgst, 0, raw_get32(cgst, 0) + 1)
+    off = b8(out, off, 0)
+    off = b8(out, off, 0)
+    off = b8(out, off, 0)
+    off = b8(out, off, 0)
+    gebe_zurueck off
+Ende
+
+// 回填: 在 patch_off 处写 rel32 = target - (patch_off+4)
+Funktion x_patch_rel32(out, patch_off, target)
+    rel = target - (patch_off + 4)
+    raw_setbyte(out, patch_off, rel % 256)
+    raw_setbyte(out, patch_off + 1, (rel / 256) % 256)
+    raw_setbyte(out, patch_off + 2, (rel / 65536) % 256)
+    raw_setbyte(out, patch_off + 3, (rel / 16777216) % 256)
+    gebe_zurueck 0
+Ende
+
+// 发射 jmp rel32 回已知目标 (loop 回跳)
+Funktion x_jmp_back(out, off, target)
+    off = b8(out, off, 233)
+    rel = target - (off + 4)
+    off = b8(out, off, rel % 256)
+    off = b8(out, off, (rel / 256) % 256)
+    off = b8(out, off, (rel / 65536) % 256)
+    off = b8(out, off, (rel / 16777216) % 256)
+    gebe_zurueck off
+Ende
+
+// 生成一个语句节点; cgst[0]=fx 共享回填计数; 返回新 off
+Funktion codegen_stmt_bare(ast, node, irpn, out, off, fixbuf, cgst)
+    t = raw_get32(ast, node * 32)
+    Wenn t == 5 dann  // 整数赋值: 求 RPN -> rax -> 存槽
+        off = codegen_int_rpn_bare(irpn, raw_get32(ast, node * 32 + 8), raw_get32(ast, node * 32 + 12), out, off)
+        off = x_store_rbp_disp(out, off, (raw_get32(ast, node * 32 + 4) - 16 + 1) * 8)
+    Sonst
+        Wenn t == 7 dann  // 循环
+            loop_start = off
+            off = codegen_int_rpn_bare(irpn, raw_get32(ast, node * 32 + 4), raw_get32(ast, node * 32 + 8), out, off)
+            off = x_test_rax(out, off)
+            off = x_jz_fwd(out, off, fixbuf, cgst)
+            body_start = raw_get32(ast, node * 32 + 12)
+            body_count = raw_get32(ast, node * 32 + 16)
+            b = 0
+            Solange b < body_count
+                off = codegen_stmt_bare(ast, body_start + b, irpn, out, off, fixbuf, cgst)
+                b = b + 1
+            Ende
+            off = x_jmp_back(out, off, loop_start)
+            x_patch_rel32(out, raw_get32(fixbuf, (raw_get32(cgst, 0) - 1) * 8), off)
+        Sonst
+            Wenn t == 8 dann  // if
+                off = codegen_int_rpn_bare(irpn, raw_get32(ast, node * 32 + 4), raw_get32(ast, node * 32 + 8), out, off)
+                off = x_test_rax(out, off)
+                off = x_jz_fwd(out, off, fixbuf, cgst)
+                jz_patch = raw_get32(cgst, 0) - 1
+                then_start = raw_get32(ast, node * 32 + 12)
+                then_count = raw_get32(ast, node * 32 + 16)
+                b = 0
+                Solange b < then_count
+                    off = codegen_stmt_bare(ast, then_start + b, irpn, out, off, fixbuf, cgst)
+                    b = b + 1
+                Ende
+                else_count = raw_get32(ast, node * 32 + 24)
+                Wenn else_count > 0 dann
+                    off = x_jmp_fwd(out, off, fixbuf, cgst)
+                    jmp_patch = raw_get32(cgst, 0) - 1
+                    x_patch_rel32(out, raw_get32(fixbuf, jz_patch * 8), off)
+                    else_start = raw_get32(ast, node * 32 + 20)
+                    b = 0
+                    Solange b < else_count
+                        off = codegen_stmt_bare(ast, else_start + b, irpn, out, off, fixbuf, cgst)
+                        b = b + 1
+                    Ende
+                    x_patch_rel32(out, raw_get32(fixbuf, jmp_patch * 8), off)
+                Sonst
+                    x_patch_rel32(out, raw_get32(fixbuf, jz_patch * 8), off)
+                Ende
+            Sonst
+                Wenn t == 2 dann  // ret: 求 RPN -> rax (尾声由调用方统一加)
+                    off = codegen_int_rpn_bare(irpn, raw_get32(ast, node * 32 + 8), raw_get32(ast, node * 32 + 12), out, off)
+                Ende
+            Ende
+        Ende
+    Ende
+    gebe_zurueck off
+Ende
+
+// 生成语句块 [node_start, node_start+count); cgst 由调用方初始化 fx=0
+Funktion codegen_stmt_block_bare(ast, node_start, count, irpn, out, off, fixbuf, cgst)
+    i = 0
+    Solange i < count
+        off = codegen_stmt_bare(ast, node_start + i, irpn, out, off, fixbuf, cgst)
+        i = i + 1
+    Ende
+    gebe_zurueck off
+Ende
+
+// 函数序言: push rbp(55); mov rbp,rsp(48 89 E5); sub rsp,framesize(48 81 EC i32)
+Funktion x_func_prologue(out, off, framesize)
+    off = b8(out, off, 85)         // push rbp
+    off = b8(out, off, 72)         // 48
+    off = b8(out, off, 137)        // 89
+    off = b8(out, off, 229)        // E5: mov rbp,rsp
+    off = b8(out, off, 72)         // 48
+    off = b8(out, off, 129)        // 81
+    off = b8(out, off, 236)        // EC: sub rsp,imm32
+    off = b32(out, off, framesize)
+    gebe_zurueck off
+Ende
+
+// 函数尾声: mov rsp,rbp(48 89 EC); pop rbp(5D); ret(C3)
+Funktion x_func_epilogue(out, off)
+    off = b8(out, off, 72)         // 48
+    off = b8(out, off, 137)        // 89
+    off = b8(out, off, 236)        // EC
+    off = b8(out, off, 93)         // 5D pop rbp
+    off = b8(out, off, 195)        // C3 ret
+    gebe_zurueck off
+Ende

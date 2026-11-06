@@ -1,0 +1,78 @@
+// ============================================================================
+//  hashmap.staro —— language-bench 考题「Hashmap」能力层
+//  铁律 E：能力全在 .staro。精确复现 lbgen ref_hashmap。
+//  cnt=n/8=1M。a[0..cnt-1]=插入键(<500000)，a[cnt..2cnt-1]=查询键(<1000000)。
+//  counts[1M] 计数；distinct=去重插入数；checksum=Σk*counts[k]；hits=Σ查询命中。
+//  hashmap_run(buf) -> 返回 alloc(24)：[distinct, checksum, hits]。
+//  buf = 实例净荷（2M×4 字节）。
+// ============================================================================
+
+Funktion read_u32_le(buf, off)
+    v = raw_byteat(buf, off + 0) + raw_byteat(buf, off + 1) * 256
+    v = v + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    gebe_zurueck v
+Ende
+
+Funktion write_u32_le(buf, off, v)
+    raw_setbyte(buf, off + 0, v % 256)
+    raw_setbyte(buf, off + 1, (v / 256) % 256)
+    raw_setbyte(buf, off + 2, (v / 65536) % 256)
+    raw_setbyte(buf, off + 3, (v / 16777216) % 256)
+    gebe_zurueck 0
+Ende
+
+Funktion hashmap_run(buf)
+    cnt = 1000000
+    counts = alloc(cnt * 4)
+
+    // 清零
+    i = 0
+    Solange i < cnt
+        write_u32_le(counts, i * 4, 0)
+        i = i + 1
+    Ende
+
+    // 插入：distinct + 计数
+    distinct = 0
+    j = 0
+    Solange j < cnt
+        key = read_i32(buf, j * 4)
+        c = read_u32_le(counts, key * 4)
+        Wenn c == 0 dann
+            distinct = distinct + 1
+        Ende
+        write_u32_le(counts, key * 4, c + 1)
+        j = j + 1
+    Ende
+
+    // checksum：Σ k*counts[k]，非零区在 [0,500000)
+    checksum = 0
+    k = 0
+    Solange k < 500000
+        c = read_u32_le(counts, k * 4)
+        Wenn c != 0 dann
+            checksum = checksum + k * c
+        Ende
+        k = k + 1
+    Ende
+
+    // hits：查询键命中计数
+    hits = 0
+    j = 0
+    Solange j < cnt
+        k = read_i32(buf, (cnt + j) * 4)
+        Wenn k < cnt dann
+            c = read_u32_le(counts, k * 4)
+            Wenn c != 0 dann
+                hits = hits + c
+            Ende
+        Ende
+        j = j + 1
+    Ende
+
+    out = alloc(24)
+    write_u64(out, 0, distinct)
+    write_u64(out, 8, checksum)
+    write_u64(out, 16, hits)
+    gebe_zurueck out
+Ende

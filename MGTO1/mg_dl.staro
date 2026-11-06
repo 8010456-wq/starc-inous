@@ -1,0 +1,288 @@
+// ============================================================================
+//  MGTO1 :: mg_dl.staro —— HTTPS 下载客户端（WinHTTP，系统内置 TLS，零第三方）
+//  .starc 正文禁止 linx；全部能力在此层。
+//  WinHTTP 字符串参数为 UTF-16（WCHAR*），故 ANSI→UTF-16 转换。
+// ============================================================================
+
+linx "winhttp.dll!WinHttpOpen"
+linx "winhttp.dll!WinHttpConnect"
+linx "winhttp.dll!WinHttpOpenRequest"
+linx "winhttp.dll!WinHttpSendRequest"
+linx "winhttp.dll!WinHttpReceiveResponse"
+linx "winhttp.dll!WinHttpQueryDataAvailable"
+linx "winhttp.dll!WinHttpReadData"
+linx "winhttp.dll!WinHttpQueryHeaders"
+linx "winhttp.dll!WinHttpAddRequestHeaders"
+linx "winhttp.dll!WinHttpCloseHandle"
+linx "kernel32.dll!Sleep"
+
+// ---- 常量 ----
+// WINHTTP_FLAG_SECURE = 0x00800000 (HTTPS)
+// WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
+// WINHTTP_HTTP_VERSION_1_1 = 0x00010001
+
+// 拼接两个 C 串 → 新 C 串（a 前缀 + b 后缀）
+Funktion mg_path(a, b)
+    la = cstr_len(a)
+    lb = cstr_len(b)
+    q = alloc(la + lb + 1)
+    i = 0
+    Solange i < la
+        raw_setbyte(q, i, raw_byteat(a, i))
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < lb
+        raw_setbyte(q, la + i, raw_byteat(b, i))
+        i = i + 1
+    Ende
+    raw_setbyte(q, la + lb, 0)
+    gebe_zurueck q
+Ende
+
+// ANSI C 字符串 → UTF-16 宽字符串（新分配，含双 NUL 结尾）
+Funktion mg_utf16(s)
+    n = cstr_len(s)
+    q = alloc((n + 1) * 2)
+    i = 0
+    Solange i < n
+        c = raw_byteat(s, i)
+        raw_setbyte(q, i * 2, c)
+        raw_setbyte(q, i * 2 + 1, 0)
+        i = i + 1
+    Ende
+    raw_setbyte(q, n * 2, 0)
+    raw_setbyte(q, n * 2 + 1, 0)
+    gebe_zurueck q
+Ende
+
+// HTTPS GET host:port/path → outbuf（cap 容量），字节数写回 olen(8字节)。
+// 返回 0 成功 / 负错误码。仅支持 ASCII host/path（魔搭模型路径全 ASCII）。
+Funktion dl_get(host, port, path, outbuf, cap, olen)
+    raw_set64(olen, 0, 0)
+    // NO_PROXY(1)：本机可直连；默认代理在部分环境会让 WinHTTP 取不到响应体
+    sess = WinHttpOpen(mg_utf16(mg_cstr("MGTO1/0.1")), 1, 0, 0, 0)
+    Wenn sess == 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    conn = WinHttpConnect(sess, mg_utf16(host), port, 0)
+    Wenn conn == 0 dann
+        WinHttpCloseHandle(sess)
+        gebe_zurueck 0 - 2
+    Ende
+    req = WinHttpOpenRequest(conn, mg_utf16(mg_cstr("GET")), mg_utf16(path), 0, 0, 0, 8388608)
+    Wenn req == 0 dann
+        WinHttpCloseHandle(conn)
+        WinHttpCloseHandle(sess)
+        gebe_zurueck 0 - 3
+    Ende
+    ok = WinHttpSendRequest(req, 0, 0, 0, 0, 0, 0)
+    Wenn ok == 0 dann
+        WinHttpCloseHandle(req)
+        WinHttpCloseHandle(conn)
+        WinHttpCloseHandle(sess)
+        gebe_zurueck 0 - 4
+    Ende
+    ok = WinHttpReceiveResponse(req, 0)
+    Wenn ok == 0 dann
+        WinHttpCloseHandle(req)
+        WinHttpCloseHandle(conn)
+        WinHttpCloseHandle(sess)
+        gebe_zurueck 0 - 5
+    Ende
+    // 先查响应头：实测能"解锁" body 读取（否则 QueryDataAvailable 恒 0）。
+    // 顺序复刻已验证的 dl_debug3：raw headers(22) 然后 status(19)，两者都试。
+    hd = alloc(8192)
+    mem_zero(hd, 8192)
+    hl = alloc(8)
+    raw_set64(hl, 0, 8192)
+    WinHttpQueryHeaders(req, 22, 0, hd, hl, 0)
+    sc = alloc(8)
+    mem_zero(sc, 8)
+    sl = alloc(8)
+    raw_set64(sl, 0, 4)
+    WinHttpQueryHeaders(req, 536870931, 0, sc, sl, 0)
+    // 响应体可能异步到达：QueryDataAvailable 先返回 0，需重试等待（同步句柄下实测如此）
+    total = 0
+    lauf = 1
+    idle = 0
+    Solange lauf == 1
+        avail = alloc(8)
+        mem_zero(avail, 8)
+        q = WinHttpQueryDataAvailable(req, avail)
+        Wenn q == 0 dann
+            lauf = 0
+        Sonst
+            a = raw_get64(avail, 0)
+            Wenn a == 0 dann
+                idle = idle + 1
+                Wenn idle > 60 dann
+                    lauf = 0
+                Sonst
+                    Sleep(20)
+                Ende
+            Sonst
+                idle = 0
+                Wenn total + a > cap dann
+                    a = cap - total
+                Ende
+                Wenn a <= 0 dann
+                    lauf = 0
+                Sonst
+                    rd = alloc(8)
+                    mem_zero(rd, 8)
+                    r = WinHttpReadData(req, outbuf + total, a, rd)
+                    got = raw_get64(rd, 0)
+                    Wenn r == 0 dann
+                        lauf = 0
+                    Sonst
+                        total = total + got
+                    Ende
+                Ende
+            Ende
+        Ende
+    Ende
+    raw_set64(olen, 0, total)
+    WinHttpCloseHandle(req)
+    WinHttpCloseHandle(conn)
+    WinHttpCloseHandle(sess)
+    gebe_zurueck 0
+Ende
+
+// 构造 "Authorization: Bearer <token_c>\r\n" 的 UTF-16 串，返回宽串指针（调用方不再释放）。
+// token_c 为 C 串（0 表示无认证，返回 0）。
+Funktion dl_auth_header(token_c)
+    Wenn token_c == 0 dann
+        gebe_zurueck 0
+    Ende
+    // 前缀 + token + "\r\n"
+    prefix = mg_utf16(mg_cstr("Authorization: Bearer "))
+    tn = cstr_len(token_c)
+    // 宽串：prefix 宽长 + tn 个宽字符 + 2 宽（\r\n）+ 1 双 NUL
+    plen = cstr_len(mg_cstr("Authorization: Bearer "))
+    q = alloc((plen + tn + 3) * 2)
+    i = 0
+    Solange i < plen * 2
+        raw_setbyte(q, i, raw_byteat(prefix, i))
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < tn
+        c = raw_byteat(token_c, i)
+        raw_setbyte(q, plen * 2 + i * 2, c)
+        raw_setbyte(q, plen * 2 + i * 2 + 1, 0)
+        i = i + 1
+    Ende
+    // "\r\n"
+    raw_setbyte(q, plen * 2 + tn * 2, 13)
+    raw_setbyte(q, plen * 2 + tn * 2 + 1, 0)
+    raw_setbyte(q, plen * 2 + tn * 2 + 2, 10)
+    raw_setbyte(q, plen * 2 + tn * 2 + 3, 0)
+    // 结尾双 NUL
+    raw_setbyte(q, plen * 2 + tn * 2 + 4, 0)
+    raw_setbyte(q, plen * 2 + tn * 2 + 5, 0)
+    gebe_zurueck q
+Ende
+
+// HTTPS GET 流式写盘到 name_c（C 串文件名）。auth_c 为可选 Bearer token（0 无认证）。
+// 返回写入字节数（>0 成功）/ 负错误码。内部复用 256KB 读缓冲。
+Funktion dl_get_file(host, port, path, name_c, auth_c)
+    sess = WinHttpOpen(mg_utf16(mg_cstr("MGTO1/0.1")), 1, 0, 0, 0)
+    Wenn sess == 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    conn = WinHttpConnect(sess, mg_utf16(host), port, 0)
+    Wenn conn == 0 dann
+        WinHttpCloseHandle(sess)
+        gebe_zurueck 0 - 2
+    Ende
+    req = WinHttpOpenRequest(conn, mg_utf16(mg_cstr("GET")), mg_utf16(path), 0, 0, 0, 8388608)
+    Wenn req == 0 dann
+        WinHttpCloseHandle(conn)
+        WinHttpCloseHandle(sess)
+        gebe_zurueck 0 - 3
+    Ende
+    // 可选 Bearer 认证头
+    Wenn auth_c != 0 dann
+        ah = dl_auth_header(auth_c)
+        WinHttpAddRequestHeaders(req, ah, 4294967295, 536870912)
+    Ende
+    ok = WinHttpSendRequest(req, 0, 0, 0, 0, 0, 0)
+    Wenn ok == 0 dann
+        WinHttpCloseHandle(req)
+        WinHttpCloseHandle(conn)
+        WinHttpCloseHandle(sess)
+        gebe_zurueck 0 - 4
+    Ende
+    ok = WinHttpReceiveResponse(req, 0)
+    Wenn ok == 0 dann
+        WinHttpCloseHandle(req)
+        WinHttpCloseHandle(conn)
+        WinHttpCloseHandle(sess)
+        gebe_zurueck 0 - 5
+    Ende
+    // 解锁 body（与 dl_get 一致）
+    hd = alloc(8192)
+    mem_zero(hd, 8192)
+    hl = alloc(8)
+    raw_set64(hl, 0, 8192)
+    WinHttpQueryHeaders(req, 22, 0, hd, hl, 0)
+    sc = alloc(8)
+    mem_zero(sc, 8)
+    sl = alloc(8)
+    raw_set64(sl, 0, 4)
+    WinHttpQueryHeaders(req, 536870931, 0, sc, sl, 0)
+    // 打开输出文件（CREATE_ALWAYS=2, GENERIC_WRITE=1073741824, SHARE_READ=1, NORMAL=128）
+    fh = CreateFileA(name_c, 1073741824, 1, 0, 2, 128, 0)
+    Wenn isneg(fh) == 1 dann
+        WinHttpCloseHandle(req)
+        WinHttpCloseHandle(conn)
+        WinHttpCloseHandle(sess)
+        gebe_zurueck 0 - 6
+    Ende
+    // 复用 256KB 读缓冲
+    buf = alloc(262144)
+    total = 0
+    lauf = 1
+    idle = 0
+    Solange lauf == 1
+        avail = alloc(8)
+        mem_zero(avail, 8)
+        q = WinHttpQueryDataAvailable(req, avail)
+        Wenn q == 0 dann
+            lauf = 0
+        Sonst
+            a = raw_get64(avail, 0)
+            Wenn a == 0 dann
+                idle = idle + 1
+                Wenn idle > 600 dann
+                    lauf = 0
+                Sonst
+                    Sleep(20)
+                Ende
+            Sonst
+                idle = 0
+                Wenn a > 262144 dann
+                    a = 262144
+                Ende
+                rd = alloc(8)
+                mem_zero(rd, 8)
+                r = WinHttpReadData(req, buf, a, rd)
+                got = raw_get64(rd, 0)
+                Wenn r == 0 dann
+                    lauf = 0
+                Sonst
+                    nb = alloc(8)
+                    mem_zero(nb, 8)
+                    WriteFile(fh, buf, got, nb, 0)
+                    total = total + got
+                Ende
+            Ende
+        Ende
+    Ende
+    CloseHandle(fh)
+    WinHttpCloseHandle(req)
+    WinHttpCloseHandle(conn)
+    WinHttpCloseHandle(sess)
+    gebe_zurueck total
+Ende

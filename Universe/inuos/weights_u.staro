@@ -1,0 +1,216 @@
+// weights_u.staro - 自研 .u 权重文件格式 (Universe-V1 自研容器, 零第三方依赖)
+// 布局 (小端):
+//   Header 32 字节:
+//     [0..4)   magic u32 = 0x31574655 ("UWF1" = 'U''W''F''1' 小端落盘)
+//     [4..8)   version u32 = 1
+//     [8..12)  total_w u32
+//     [12..16) total_b u32
+//     [16..20) step u32
+//     [20..24) flags u32  (bit0: 含优化器 m/v 状态)
+//     [24..28) reserved u32 = 0
+//     [28..32) reserved u32 = 0
+//   Data (连续 fp32):
+//     W:  total_w*4
+//     B:  total_b*4
+//     [flags&1]: mW total_w*4, vW total_w*4, mB total_b*4, vB total_b*4
+// 魔数常量: 0x31574655 (= 0x55 'U' | 0x57 'W'<<8 | 0x46 'F'<<16 | 0x31 '1'<<24)
+
+Funktion u_magic()
+    gebe_zurueck 826359381  // 0x31574655
+Ende
+
+Funktion u_version()
+    gebe_zurueck 1
+Ende
+
+// ---- 校验头: 返回 1 合法, 0 非法 ----
+Funktion u_header_ok(base, total_w, total_b)
+    Wenn raw_get32(base, 0) != u_magic() dann
+        gebe_zurueck 0
+    Ende
+    Wenn raw_get32(base, 4) != u_version() dann
+        gebe_zurueck 0
+    Ende
+    Wenn raw_get32(base, 8) != total_w dann
+        gebe_zurueck 0
+    Ende
+    Wenn raw_get32(base, 12) != total_b dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// ---- 保存 W/B (无优化器状态) 到 path.u, 返回文件字节数, 0 失败 ----
+Funktion save_weights_u(path, W, B, total_w, total_b, step)
+    flags = 0
+    // 组装: header(32) + W + B
+    sz = 32 + total_w * 4 + total_b * 4
+    buf = alloc(sz)
+    raw_set32(buf, 0, u_magic())
+    raw_set32(buf, 4, u_version())
+    raw_set32(buf, 8, total_w)
+    raw_set32(buf, 12, total_b)
+    raw_set32(buf, 16, step)
+    raw_set32(buf, 20, flags)
+    raw_set32(buf, 24, 0)
+    raw_set32(buf, 28, 0)
+    i = 0
+    Solange i < total_w
+        raw_set32(buf, 32 + i * 4, raw_get32(W, i * 4))
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < total_b
+        raw_set32(buf, 32 + total_w * 4 + i * 4, raw_get32(B, i * 4))
+        i = i + 1
+    Ende
+    r = file_write(path, buf, sz)
+    gebe_zurueck r
+Ende
+
+// ---- 保存完整状态 (W/B + 优化器 m/v) 到 path.u, 返回文件字节数, 0 失败 ----
+Funktion save_ckpt_u(path, W, B, mW, vW, mB, vB, total_w, total_b, step)
+    flags = 1
+    sz = 32 + total_w * 4 * 3 + total_b * 4 * 3
+    buf = alloc(sz)
+    raw_set32(buf, 0, u_magic())
+    raw_set32(buf, 4, u_version())
+    raw_set32(buf, 8, total_w)
+    raw_set32(buf, 12, total_b)
+    raw_set32(buf, 16, step)
+    raw_set32(buf, 20, flags)
+    raw_set32(buf, 24, 0)
+    raw_set32(buf, 28, 0)
+    off = 32
+    i = 0
+    Solange i < total_w
+        raw_set32(buf, off + i * 4, raw_get32(W, i * 4))
+        i = i + 1
+    Ende
+    off = off + total_w * 4
+    i = 0
+    Solange i < total_b
+        raw_set32(buf, off + i * 4, raw_get32(B, i * 4))
+        i = i + 1
+    Ende
+    off = off + total_b * 4
+    i = 0
+    Solange i < total_w
+        raw_set32(buf, off + i * 4, raw_get32(mW, i * 4))
+        i = i + 1
+    Ende
+    off = off + total_w * 4
+    i = 0
+    Solange i < total_w
+        raw_set32(buf, off + i * 4, raw_get32(vW, i * 4))
+        i = i + 1
+    Ende
+    off = off + total_w * 4
+    i = 0
+    Solange i < total_b
+        raw_set32(buf, off + i * 4, raw_get32(mB, i * 4))
+        i = i + 1
+    Ende
+    off = off + total_b * 4
+    i = 0
+    Solange i < total_b
+        raw_set32(buf, off + i * 4, raw_get32(vB, i * 4))
+        i = i + 1
+    Ende
+    r = file_write(path, buf, sz)
+    gebe_zurueck r
+Ende
+
+// ---- 加载 W/B (无优化器) 到 path.u, 命中返回 1 (stepbuf[0]=step), 否则 0 ----
+Funktion load_weights_u(path, W, B, total_w, total_b, stepbuf)
+    m = alloc(32)
+    r = file_mmap(path, m)
+    Wenn r != 1 dann
+        gebe_zurueck 0
+    Ende
+    base = raw_get64(m, 0)
+    sz = raw_get64(m, 24)
+    Wenn sz < 32 + total_w * 4 + total_b * 4 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    Wenn u_header_ok(base, total_w, total_b) == 0 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    i = 0
+    Solange i < total_w
+        raw_set32(W, i * 4, raw_get32(base, 32 + i * 4))
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < total_b
+        raw_set32(B, i * 4, raw_get32(base, 32 + total_w * 4 + i * 4))
+        i = i + 1
+    Ende
+    raw_set32(stepbuf, 0, raw_get32(base, 16))
+    file_munmap(m)
+    gebe_zurueck 1
+Ende
+
+// ---- 加载完整状态 (W/B + 优化器) 到 path.u, 命中返回 1, 否则 0 ----
+Funktion load_ckpt_u(path, W, B, mW, vW, mB, vB, total_w, total_b, stepbuf)
+    m = alloc(32)
+    r = file_mmap(path, m)
+    Wenn r != 1 dann
+        gebe_zurueck 0
+    Ende
+    base = raw_get64(m, 0)
+    sz = raw_get64(m, 24)
+    Wenn sz < 32 + total_w * 4 * 3 + total_b * 4 * 3 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    Wenn u_header_ok(base, total_w, total_b) == 0 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    Wenn (raw_get32(base, 20) % 2) != 1 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    off = 32
+    i = 0
+    Solange i < total_w
+        raw_set32(W, i * 4, raw_get32(base, off + i * 4))
+        i = i + 1
+    Ende
+    off = off + total_w * 4
+    i = 0
+    Solange i < total_b
+        raw_set32(B, i * 4, raw_get32(base, off + i * 4))
+        i = i + 1
+    Ende
+    off = off + total_b * 4
+    i = 0
+    Solange i < total_w
+        raw_set32(mW, i * 4, raw_get32(base, off + i * 4))
+        i = i + 1
+    Ende
+    off = off + total_w * 4
+    i = 0
+    Solange i < total_w
+        raw_set32(vW, i * 4, raw_get32(base, off + i * 4))
+        i = i + 1
+    Ende
+    off = off + total_w * 4
+    i = 0
+    Solange i < total_b
+        raw_set32(mB, i * 4, raw_get32(base, off + i * 4))
+        i = i + 1
+    Ende
+    off = off + total_b * 4
+    i = 0
+    Solange i < total_b
+        raw_set32(vB, i * 4, raw_get32(base, off + i * 4))
+        i = i + 1
+    Ende
+    raw_set32(stepbuf, 0, raw_get32(base, 16))
+    file_munmap(m)
+    gebe_zurueck 1
+Ende

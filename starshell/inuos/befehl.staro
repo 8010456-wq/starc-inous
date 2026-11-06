@@ -1,0 +1,275 @@
+// ============================================================================
+//  starshell :: inuos/befehl.staro
+//  StarShell V4 能力库 · Befehlstabelle: laden, suchen, Hilfe ausgeben
+//
+//  Tabelle: starshell_cmd.txt
+//    [Bereich]              Bereichsueberschrift
+//    befehl | Beschreibung   eine echte Befehlszeile
+//    # Kommentar            Kommentarzeile
+//
+//  铁律 E：Tabelle ist externe Datendatei. Diese .staro enthaelt nur das
+//  Lesen, Suchen und Ausgeben der Tabelle - keine Befehlsimplementierung.
+// ============================================================================
+
+// ---------- Tabelle laden ----------
+// Sucht starshell_cmd.txt im Arbeitsverzeichnis, danach im Installationspfad.
+Funktion tabelle_laden()
+    t = file_read("starshell_cmd.txt")
+    Wenn t != 0 dann
+        gebe_zurueck t
+    Ende
+    t = file_read("D:/starc/starshell/starshell_cmd.txt")
+    gebe_zurueck t
+Ende
+
+// ---------- Zeilenende finden (Position von Zeilenumbruch oder Ende) ----------
+Funktion zeilen_ende(tab, pos)
+    tl = str_len(tab)
+    i = pos
+    Solange i < tl
+        Wenn raw_byteat(tab, 8 + i) == 10 dann
+            gebe_zurueck i
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck tl
+Ende
+
+// ---------- Befehlsname einer Zeile (bis '|' oder Zeilenende) ----------
+Funktion zeile_befehl(tab, pos, ende)
+    i = pos
+    Solange i < ende
+        Wenn raw_byteat(tab, 8 + i) == 124 dann
+            gebe_zurueck str_trim(str_slice(tab, pos, i - pos))
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck str_trim(str_slice(tab, pos, ende - pos))
+Ende
+
+// ---------- Beschreibung einer Zeile (nach '|') ----------
+Funktion zeile_beschreibung(tab, pos, ende)
+    i = pos
+    Solange i < ende
+        Wenn raw_byteat(tab, 8 + i) == 124 dann
+            gebe_zurueck str_trim(str_slice(tab, i + 1, ende - i - 1))
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck str_slice(tab, pos, 0)
+Ende
+Funktion bereich_name(tab, pos, ende)
+    i = pos + 1
+    Solange i < ende
+        Wenn raw_byteat(tab, 8 + i) == 93 dann
+            gebe_zurueck str_slice(tab, pos + 1, i - pos - 1)
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck str_slice(tab, pos + 1, 0)
+Ende
+
+// ---------- Obersten Befehlsnamen einer Zeile (bis Leerzeichen) ----------
+Funktion befehl_token(name)
+    n = str_len(name)
+    i = 0
+    Solange i < n
+        Wenn raw_byteat(name, 8 + i) == 32 dann
+            gebe_zurueck str_slice(name, 0, i)
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck name
+Ende
+
+// ---------- Ist der Befehl in der Tabelle vorhanden? ----------
+// name = StarC-Zeichenkette des obersten Befehlsnamens
+Funktion befehl_vorhanden(tab, name)
+    tl = str_len(tab)
+    pos = 0
+    Solange pos < tl
+        ende = zeilen_ende(tab, pos)
+        b = zeile_befehl(tab, pos, ende)
+        Wenn str_len(b) != 0 dann
+            Wenn raw_byteat(b, 8) != 91 dann
+                Wenn raw_byteat(b, 8) != 35 dann
+                    t = befehl_token(b)
+                    Wenn str_eq_ci(basis_name(t), name) == 1 dann
+                        gebe_zurueck 1
+                    Ende
+                Ende
+            Ende
+        Ende
+        pos = ende + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------- Befehlsbeschreibung eines Befehls ausgeben ----------
+// ---------- Befehlsbeschreibung eines Befehls ausgeben ----------
+// Erster Durchlauf: vollstaendiger Name (voll).
+// Zweiter Durchlauf: nur der erste Token (token), Basisname ohne Pfad.
+Funktion befehl_beschreibung(tab, voll, token)
+    r = befehl_beschreibung_runde(tab, voll, 1)
+    Wenn r == 0 dann
+        r = befehl_beschreibung_runde(tab, token, 0)
+    Ende
+    gebe_zurueck r
+Ende
+
+Funktion befehl_beschreibung_runde(tab, name, runde)
+    tl = str_len(tab)
+    pos = 0
+    Solange pos < tl
+        ende = zeilen_ende(tab, pos)
+        b = zeile_befehl(tab, pos, ende)
+        Wenn str_len(b) != 0 dann
+            Wenn raw_byteat(b, 8) != 91 dann
+                Wenn raw_byteat(b, 8) != 35 dann
+                    passt = 0
+                    Wenn runde == 1 dann
+                        Wenn str_eq(b, name) == 1 dann
+                            passt = 1
+                        Ende
+                    Sonst
+                        t = befehl_token(b)
+                        Wenn str_eq_ci(basis_name(t), name) == 1 dann
+                            passt = 1
+                        Ende
+                    Ende
+                    Wenn passt == 1 dann
+                        write_str("  ")
+                        write_str(b)
+                        write_str("  -  ")
+                        write_str(zeile_beschreibung(tab, pos, ende))
+                        write_newline()
+                        gebe_zurueck 1
+                    Ende
+                Ende
+            Ende
+        Ende
+        pos = ende + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------- Bereiche der Tabelle aufzaehlen ----------
+Funktion bereich_zaehlen(tab)
+    tl = str_len(tab)
+    pos = 0
+    anzahl = 0
+    Solange pos < tl
+        ende = zeilen_ende(tab, pos)
+        Wenn raw_byteat(tab, 8 + pos) == 91 dann
+            anzahl = anzahl + 1
+        Ende
+        pos = ende + 1
+    Ende
+    gebe_zurueck anzahl
+Ende
+
+// ---------- Befehle der Tabelle zaehlen ----------
+Funktion befehl_zaehlen(tab)
+    tl = str_len(tab)
+    pos = 0
+    anzahl = 0
+    Solange pos < tl
+        ende = zeilen_ende(tab, pos)
+        b = zeile_befehl(tab, pos, ende)
+        Wenn str_len(b) != 0 dann
+            Wenn raw_byteat(b, 8) != 91 dann
+                Wenn raw_byteat(b, 8) != 35 dann
+                    anzahl = anzahl + 1
+                Ende
+            Ende
+        Ende
+        pos = ende + 1
+    Ende
+    gebe_zurueck anzahl
+Ende
+
+// ---------- Komplette Tabelle als Hilfe ausgeben ----------
+Funktion tabelle_ausgeben(tab)
+    tl = str_len(tab)
+    pos = 0
+    Solange pos < tl
+        ende = zeilen_ende(tab, pos)
+        ch = raw_byteat(tab, 8 + pos)
+        Wenn ch == 91 dann
+            write_str("  [")
+            write_str(bereich_name(tab, pos, ende))
+            write_str("]")
+            write_newline()
+        Sonst
+            Wenn ch != 35 dann
+                b = zeile_befehl(tab, pos, ende)
+                Wenn str_len(b) != 0 dann
+                    write_str("    ")
+                    write_str(b)
+                    write_str("  -  ")
+                    write_str(zeile_beschreibung(tab, pos, ende))
+                    write_newline()
+                Ende
+            Ende
+        Ende
+        pos = ende + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------- Pfad oder Kommandoname des Tabellenbefehls ----------
+// Liefert den ersten Token des passenden Tabelleneintrags (z.B.
+// "C:/Windows/System32/arp.exe") oder 0, wenn der Befehl nicht existiert.
+Funktion tabelle_befehlpfad(tab, name)
+    tl = str_len(tab)
+    pos = 0
+    Solange pos < tl
+        ende = zeilen_ende(tab, pos)
+        b = zeile_befehl(tab, pos, ende)
+        Wenn str_len(b) != 0 dann
+            Wenn raw_byteat(b, 8) != 91 dann
+                Wenn raw_byteat(b, 8) != 35 dann
+                    t = befehl_token(b)
+                    Wenn str_eq_ci(basis_name(t), name) == 1 dann
+                        gebe_zurueck t
+                    Ende
+                Ende
+            Ende
+        Ende
+        pos = ende + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------- Bereichsueberschriften der Tabelle ausgeben ----------
+Funktion bereich_auflisten(tab)
+    tl = str_len(tab)
+    pos = 0
+    Solange pos < tl
+        ende = zeilen_ende(tab, pos)
+        Wenn raw_byteat(tab, 8 + pos) == 91 dann
+            write_str("    ")
+            write_str(bereich_name(tab, pos, ende))
+            write_newline()
+        Ende
+        pos = ende + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------- Ist der Befehl ein PS-Cmdlet? ----------
+// PowerShell-Cmdlets haben immer die Form Verb-Noun (mit Bindestrich).
+// Reale Systemwerkzeuge (tasklist, ipconfig, sc, netsh ...) tragen keinen
+// Bindestrich im Namen. Ein Bindestrich im Befehlsnamen ist daher ein
+// zuverlaessiges Kennzeichen fuer einen PS-Cmdlet-Aufruf.
+Funktion ist_powershell(name)
+    n = str_len(name)
+    i = 0
+    Solange i < n
+        Wenn raw_byteat(name, 8 + i) == 45 dann
+            gebe_zurueck 1
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende

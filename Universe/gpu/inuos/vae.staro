@@ -1,0 +1,406 @@
+// inuos/vae.staro - 体素 3D VAE 模型 (Universe) 前向
+// 依赖: tensor.staro, softfloat.staro, opt.staro
+// 架构: 16^3 体素输入 -> 3D 卷积编码 -> 潜向量 z (z_dim) -> 3D 反卷积解码 -> 16^3 概率
+// 布局约定: 通道 C, 尺寸 D=H=W=V. 张量扁平: ((c*D + d)*H + h)*W + w
+
+// ---- sigmoid: 1/(1+exp(-x)) ----
+Funktion vae_sigmoid(x)
+    // exp(-x)
+    nx = fs_neg(x)
+    e = f32_exp(nx)
+    o = f32_add(e, 1065353216)
+    gebe_zurueck f32_div(1065353216, o)
+Ende
+
+// ---- ReLU ----
+Funktion vae_relu(x)
+    Wenn (x / 2147483648) == 1 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck x
+Ende
+
+// ---- 3D 卷积 (带 pad=1, stride=1): 输出尺寸 = 输入尺寸 - 核 + 2*pad + 1 ----
+// 用于编码器前两层 (保持 16^3), pad=1, 核 3^3
+// in: (Ci,D,H,W), w: (Co,Ci,3,3,3), bias: (Co), out: (Co,D,H,W)  (pad=1, 尺寸不变)
+Funktion conv3d_pad1_relu(in, w, bias, out, Ci, D, H, W, Co)
+    // 遍历输出 (D,H,W 同输入, pad=1)
+    co = 0
+    Solange co < Co
+        od = 0
+        Solange od < D
+            oh = 0
+            Solange oh < H
+                ow = 0
+                Solange ow < W
+                    acc = 0
+                    ci = 0
+                    Solange ci < Ci
+                        kd = 0
+                        Solange kd < 3
+                            kh = 0
+                            Solange kh < 3
+                                kw = 0
+                                Solange kw < 3
+                                    id = od + kd - 1
+                                    ih = oh + kh - 1
+                                    iw = ow + kw - 1
+                                    Wenn id >= 0 und id < D und ih >= 0 und ih < H und iw >= 0 und iw < W dann
+                                        in_idx = ((ci * D + id) * H + ih) * W + iw
+                                        w_idx = (((co * Ci + ci) * 3 + kd) * 3 + kh) * 3 + kw
+                                        acc = f32_add(acc, f32_mul(t_get(in, in_idx), t_get(w, w_idx)))
+                                    Ende
+                                    kw = kw + 1
+                                Ende
+                                kh = kh + 1
+                            Ende
+                            kd = kd + 1
+                        Ende
+                        ci = ci + 1
+                    Ende
+                    acc = f32_add(acc, t_get(bias, co))
+                    acc = vae_relu(acc)
+                    out_idx = ((co * D + od) * H + oh) * W + ow
+                    t_set(out, out_idx, acc)
+                    ow = ow + 1
+                Ende
+                oh = oh + 1
+            Ende
+            od = od + 1
+        Ende
+        co = co + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 3D 卷积 (stride=2, pad=1, 核 3^3): 输出尺寸 = ceil(D/2) ----
+// 编码器后两层: 16->8->4. 核 3^3, stride 2, pad 1.
+// in: (Ci,D,H,W), w: (Co,Ci,3,3,3), bias: (Co), out: (Co,OD,OH,OW), OD=(D+1)/2
+Funktion conv3d_s2_relu(in, w, bias, out, Ci, D, H, W, Co)
+    OD = (D + 1) / 2
+    OH = (H + 1) / 2
+    OW = (W + 1) / 2
+    co = 0
+    Solange co < Co
+        od = 0
+        Solange od < OD
+            oh = 0
+            Solange oh < OH
+                ow = 0
+                Solange ow < OW
+                    acc = 0
+                    ci = 0
+                    Solange ci < Ci
+                        kd = 0
+                        Solange kd < 3
+                            kh = 0
+                            Solange kh < 3
+                                kw = 0
+                                Solange kw < 3
+                                    id = od * 2 + kd - 1
+                                    ih = oh * 2 + kh - 1
+                                    iw = ow * 2 + kw - 1
+                                    Wenn id >= 0 und id < D und ih >= 0 und ih < H und iw >= 0 und iw < W dann
+                                        in_idx = ((ci * D + id) * H + ih) * W + iw
+                                        w_idx = (((co * Ci + ci) * 3 + kd) * 3 + kh) * 3 + kw
+                                        acc = f32_add(acc, f32_mul(t_get(in, in_idx), t_get(w, w_idx)))
+                                    Ende
+                                    kw = kw + 1
+                                Ende
+                                kh = kh + 1
+                            Ende
+                            kd = kd + 1
+                        Ende
+                        ci = ci + 1
+                    Ende
+                    acc = f32_add(acc, t_get(bias, co))
+                    acc = vae_relu(acc)
+                    out_idx = ((co * OD + od) * OH + oh) * OW + ow
+                    t_set(out, out_idx, acc)
+                    ow = ow + 1
+                Ende
+                oh = oh + 1
+            Ende
+            od = od + 1
+        Ende
+        co = co + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 3D 反卷积 (stride=2, 核 3^3, pad=1): 输出尺寸 = Di*2 - 1 - 2 + 2 = 2*Di-1 (约) ----
+// 解码器: 4->8->16. 输入 (Ci,Di,Hi,Wi), 权重 (Ci,Co,3,3,3) [转置卷积], 输出 (Co, 2*Di, 2*Hi, 2*Wi) 裁剪
+// 简化: 输出 (Co, 2*Di, 2*Hi, 2*Wi), 用 stride-2 转置卷积 (每输入点分散到 3x3x3 输出窗口, 间隔 2)
+Funktion deconv3d_s2_relu(in, w, bias, out, Ci, Di, Hi, Wi, Co)
+    Do = Di * 2
+    Ho = Hi * 2
+    Wo = Wi * 2
+    t_zero(out, Co * Do * Ho * Wo)
+    ci = 0
+    Solange ci < Ci
+        di = 0
+        Solange di < Di
+            hi = 0
+            Solange hi < Hi
+                wi = 0
+                Solange wi < Wi
+                    vin = t_get(in, ((ci * Di + di) * Hi + hi) * Wi + wi)
+                    co = 0
+                    Solange co < Co
+                        kd = 0
+                        Solange kd < 3
+                            kh = 0
+                            Solange kh < 3
+                                kw = 0
+                                Solange kw < 3
+                                    od = di * 2 + kd - 1
+                                    oh = hi * 2 + kh - 1
+                                    ow = wi * 2 + kw - 1
+                                    Wenn od >= 0 und od < Do und oh >= 0 und oh < Ho und ow >= 0 und ow < Wo dann
+                                        w_idx = (((ci * Co + co) * 3 + kd) * 3 + kh) * 3 + kw
+                                        out_idx = ((co * Do + od) * Ho + oh) * Wo + ow
+                                        t_set(out, out_idx, f32_add(t_get(out, out_idx), f32_mul(vin, t_get(w, w_idx))))
+                                    Ende
+                                    kw = kw + 1
+                                Ende
+                                kh = kh + 1
+                            Ende
+                            kd = kd + 1
+                        Ende
+                        co = co + 1
+                    Ende
+                    wi = wi + 1
+                Ende
+                hi = hi + 1
+            Ende
+            di = di + 1
+        Ende
+        ci = ci + 1
+    Ende
+    // + bias + ReLU
+    co = 0
+    Solange co < Co
+        od = 0
+        Solange od < Do
+            oh = 0
+            Solange oh < Ho
+                ow = 0
+                Solange ow < Wo
+                    out_idx = ((co * Do + od) * Ho + oh) * Wo + ow
+                    acc = vae_relu(f32_add(t_get(out, out_idx), t_get(bias, co)))
+                    t_set(out, out_idx, acc)
+                    ow = ow + 1
+                Ende
+                oh = oh + 1
+            Ende
+            od = od + 1
+        Ende
+        co = co + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 编码器前向: 输入体素 (V^3) -> 均值 mu (z_dim), 对数方差 logvar (z_dim) ----
+// 通道布局 (8/16/32, 与 train_vae.starc 权重偏移一致):
+//   enc_w1: (8,1,3,3,3)=216,  enc_b1:(8)
+//   enc_w2: (16,8,3,3,3)=3456, enc_b2:(16)
+//   enc_w3: (32,16,3,3,3)=13824, enc_b3:(32)
+//   fc_w: (2*z_dim, hdim), fc_b: (2*z_dim)   hdim=32*(V/4)^3
+// w 传编码器权重基址 (偏移 0 起), b 传编码器偏置基址 (偏移 0 起)
+Funktion vae_encode(vox, w, b, mu, logvar, V, z_dim, tmp1, tmp2, tmp3)
+    // V^3 输入, enc1 -> 8ch V^3
+    conv3d_pad1_relu(vox, w, b, tmp1, 1, V, V, V, 8)
+    // enc2 stride2 -> 16ch (V/2)^3
+    conv3d_s2_relu(tmp1, w + 216 * 4, b + 8 * 4, tmp2, 8, V, V, V, 16)
+    // enc3 stride2 -> 32ch (V/4)^3
+    conv3d_s2_relu(tmp2, w + 3672 * 4, b + 24 * 4, tmp3, 16, V / 2, V / 2, V / 2, 32)
+    // flatten -> fc
+    hdim = 32 * (V / 4) * (V / 4) * (V / 4)
+    // fc: mu/logvar = fc_w @ flat + fc_b   (fc_w 在编码器权重偏移 17496 元素)
+    k = 0
+    Solange k < z_dim
+        acc = 0
+        j = 0
+        Solange j < hdim
+            acc = f32_add(acc, f32_mul(t_get(tmp3, j), t_get(w + 17496 * 4, k * hdim + j)))
+            j = j + 1
+        Ende
+        acc = f32_add(acc, t_get(b, 56 + k))
+        t_set(mu, k, acc)
+        // logvar
+        acc2 = 0
+        j = 0
+        Solange j < hdim
+            acc2 = f32_add(acc2, f32_mul(t_get(tmp3, j), t_get(w + 17496 * 4, (z_dim + k) * hdim + j)))
+            j = j + 1
+        Ende
+        acc2 = f32_add(acc2, t_get(b, 56 + z_dim + k))
+        t_set(logvar, k, acc2)
+        k = k + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 重参数化: z = mu + sigma * eps (eps ~ N(0,1) 用简化伪随机) ----
+// 简化: eps 用确定性伪随机序列 (训练可复现). zbuf: 输出 (z_dim)
+Funktion vae_reparam(zbuf, mu, logvar, z_dim, seed)
+    // sigma = exp(0.5*logvar)
+    i = 0
+    Solange i < z_dim
+        lv = t_get(logvar, i)
+        sigma = f32_exp(f32_mul(lv, 1056964608))  // exp(0.5*logvar)
+        // 伪随机 eps in [-1,1] (确定性, 基于 seed+i)
+        r = (seed * 2654435761 + i * 40503) % 65536
+        eps = f32_sub(f32_mul(s32_to_f32(r % 32768), f32_div(s32_to_f32(2), s32_to_f32(32767))), 1065353216)
+        zv = f32_add(t_get(mu, i), f32_mul(sigma, eps))
+        t_set(zbuf, i, zv)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 解码器前向: z (z_dim) -> 重建体素概率 (V^3) ----
+// 通道布局 (8/16/32):
+//   fc_dw: (hdim, z_dim), fc_db: (hdim)   hdim=32*(V/4)^3
+//   dec_w3: (32,16,3,3,3)=13824, dec_b3:(16)  (转置卷积 2^3->4^3, Ci=32 Co=16)
+//   dec_w2: (16,8,3,3,3)=3456,  dec_b2:(8)    (转置卷积 4^3->8^3, Ci=16 Co=8)
+//   dec_w1: (8,1,3,3,3)=216,    dec_b1:(1)    (pad1 卷积 8^3->8^3, Ci=8 Co=1)
+// w 传解码器权重基址 (相对偏移 0=fc_dw 起), b 传解码器偏置基址 (0=fc_db 起)
+// tmp1: 32*(V/4)^3, tmp2: 16*(V/2)^3, tmp3: 8*V^3, tmp4: 1*V^3
+Funktion vae_decode(z, w, b, prob, z_dim, V, tmp1, tmp2, tmp3, tmp4)
+    hdim = 32 * (V / 4) * (V / 4) * (V / 4)
+    // fc: flat = fc_dw @ z + fc_db
+    j = 0
+    Solange j < hdim
+        acc = 0
+        k = 0
+        Solange k < z_dim
+            acc = f32_add(acc, f32_mul(t_get(z, k), t_get(w, j * z_dim + k)))
+            k = k + 1
+        Ende
+        acc = f32_add(acc, t_get(b, j))
+        t_set(tmp1, j, vae_relu(acc))
+        j = j + 1
+    Ende
+    // dec3: 32ch (V/4)^3 -> 16ch (V/2)^3 (转置卷积 stride2)
+    deconv3d_s2_relu(tmp1, w + hdim * z_dim * 4, b + hdim * 4, tmp2, 32, V / 4, V / 4, V / 4, 16)
+    // dec2: 16ch (V/2)^3 -> 8ch V^3
+    deconv3d_s2_relu(tmp2, w + (hdim * z_dim + 32 * 16 * 27) * 4, b + (hdim + 16) * 4, tmp3, 16, V / 2, V / 2, V / 2, 8)
+    // dec1: 8ch V^3 -> 1ch V^3 (pad1 普通卷积, 保持尺寸)
+    conv3d_pad1_relu(tmp3, w + (hdim * z_dim + 32 * 16 * 27 + 16 * 8 * 27) * 4, b + (hdim + 16 + 8) * 4, tmp4, 8, V, V, V, 1)
+    // sigmoid -> prob
+    n = V * V * V
+    i = 0
+    Solange i < n
+        t_set(prob, i, vae_sigmoid(t_get(tmp4, i)))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 重建损失 (BCE) + KL: loss = BCE + beta*KL ----
+// vox: 目标 0/1, prob: 预测概率 (V^3), mu/logvar: (z_dim), beta: KL 权重
+// 返回 loss (fp32 位模式)
+Funktion vae_loss(vox, prob, mu, logvar, V, z_dim, beta)
+    n = V * V * V
+    bce = 0
+    i = 0
+    Solange i < n
+        p = t_get(prob, i)
+        y = t_get(vox, i)
+        // BCE = -(y*log(p) + (1-y)*log(1-p)), 裁剪防 log(0)
+        // 裁剪 p 到 [1e-7, 1-1e-7]
+        pmin = 9900000  // ~1e-7 fp32 近似
+        pmax = 1059900000
+        p2 = p
+        Wenn p2 < pmin dann
+            p2 = pmin
+        Ende
+        Wenn p2 > pmax dann
+            p2 = pmax
+        Ende
+        // log(p2), log(1-p2)
+        lp = f32_ln(p2)
+        onep = f32_sub(1065353216, p2)
+        l1p = f32_ln(onep)
+        term = f32_add(f32_mul(y, lp), f32_mul(f32_sub(1065353216, y), l1p))
+        bce = f32_add(bce, fs_neg(term))
+        i = i + 1
+    Ende
+    // KL = 0.5 * sum(mu^2 + exp(logvar) - logvar - 1)
+    kl = 0
+    i = 0
+    Solange i < z_dim
+        m = t_get(mu, i)
+        lv = t_get(logvar, i)
+        elv = f32_exp(lv)
+        term = f32_sub(f32_add(f32_mul(m, m), elv), f32_add(lv, 1065353216))
+        kl = f32_add(kl, term)
+        i = i + 1
+    Ende
+    kl = f32_mul(kl, 1056964608)  // *0.5
+    total = f32_add(f32_div(bce, s32_to_f32(n)), f32_mul(beta, kl))
+    gebe_zurueck total
+Ende
+
+// ---- 仅 BCE (平均每体素), 诊断用 ----
+Funktion vae_bce(vox, prob, V)
+    n = V * V * V
+    bce = 0
+    i = 0
+    Solange i < n
+        p = t_get(prob, i)
+        y = t_get(vox, i)
+        pmin = 9900000
+        pmax = 1059900000
+        p2 = p
+        Wenn p2 < pmin dann
+            p2 = pmin
+        Ende
+        Wenn p2 > pmax dann
+            p2 = pmax
+        Ende
+        lp = f32_ln(p2)
+        onep = f32_sub(1065353216, p2)
+        l1p = f32_ln(onep)
+        term = f32_add(f32_mul(y, lp), f32_mul(f32_sub(1065353216, y), l1p))
+        bce = f32_add(bce, fs_neg(term))
+        i = i + 1
+    Ende
+    gebe_zurueck f32_div(bce, s32_to_f32(n))
+Ende
+
+// ---- 仅 KL ----
+Funktion vae_kl(mu, logvar, z_dim)
+    kl = 0
+    i = 0
+    Solange i < z_dim
+        m = t_get(mu, i)
+        lv = t_get(logvar, i)
+        elv = f32_exp(lv)
+        term = f32_sub(f32_add(f32_mul(m, m), elv), f32_add(lv, 1065353216))
+        kl = f32_add(kl, term)
+        i = i + 1
+    Ende
+    gebe_zurueck f32_mul(kl, 1056964608)
+Ende
+
+// ---- 重建准确率: prob>0.5 与 x 一致的体素比例 (0~1) ----
+Funktion vae_acc(vox, prob, V)
+    n = V * V * V
+    ok = 0
+    i = 0
+    Solange i < n
+        p = t_get(prob, i)
+        y = t_get(vox, i)
+        pred = 0
+        Wenn p > 1056964608 dann  // p > 0.5
+            pred = 1065353216
+        Ende
+        Wenn pred == y dann
+            ok = ok + 1
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck f32_div(s32_to_f32(ok), s32_to_f32(n))
+Ende

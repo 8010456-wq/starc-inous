@@ -1,0 +1,182 @@
+// ============================================================================
+//  nc :: inuos/nc_lib.staro
+//  starc-Compiler 能力库（能力实现层）
+//  这是"能力实现层"：唯一允许使用底层 CPU 运算（+ - * / 等）的地方。
+//  所有能力（四则/比较/负数/字符串）在此实现，供 .starc 程序（零内建）调用。
+//  铁律 E：只用 alloc/raw_setbyte/raw_byteat + linx-o。
+// ============================================================================
+
+linx-o kernel32 GetStdHandle WriteFile
+
+// ---------- 数学（四则/比较/负数）----------
+
+Funktion mathe_add(a, b)
+    gebe_zurueck a + b
+Ende
+
+Funktion mathe_sub(a, b)
+    gebe_zurueck a - b
+Ende
+
+Funktion mathe_mul(a, b)
+    gebe_zurueck a * b
+Ende
+
+Funktion mathe_div(a, b)
+    gebe_zurueck a / b
+Ende
+
+Funktion mathe_neg(a)
+    gebe_zurueck 0 - a
+Ende
+
+Funktion mathe_eq(a, b)
+    Wenn a == b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_ne(a, b)
+    Wenn a != b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_lt(a, b)
+    Wenn a < b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_gt(a, b)
+    Wenn a > b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_le(a, b)
+    Wenn a <= b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_ge(a, b)
+    Wenn a >= b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------- 字符串（StarC 字符串：8 字节头 + 数据 + NUL）----------
+
+Funktion str_len(s)
+    i = 0
+    Solange raw_byteat(s, 8 + i) != 0
+        i = i + 1
+    Ende
+    gebe_zurueck i
+Ende
+
+Funktion str_eq(s1, s2)
+    n1 = str_len(s1)
+    n2 = str_len(s2)
+    Wenn n1 != n2 dann
+        gebe_zurueck 0
+    Ende
+    i = 0
+    Solange i < n1
+        Wenn raw_byteat(s1, 8 + i) != raw_byteat(s2, 8 + i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+Funktion str_copy(s)
+    n = str_len(s)
+    buf = alloc(8 + n + 1)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, 8 + i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 0, n % 256)
+    raw_setbyte(buf, 1, (n / 256) % 256)
+    raw_setbyte(buf, 2, (n / 65536) % 256)
+    raw_setbyte(buf, 3, (n / 16777216) % 256)
+    raw_setbyte(buf, 8 + n, 0)
+    gebe_zurueck buf
+Ende
+
+// ---------- 控制台（能力实现层，用 WriteFile）----------
+
+Funktion get_stdout()
+    gebe_zurueck GetStdHandle(-11)
+Ende
+
+Funktion write_str(s)
+    WriteFile(get_stdout(), s + 8, str_len(s), 0, 0)
+    gebe_zurueck 0
+Ende
+
+Funktion write_newline()
+    nl = alloc(1)
+    raw_setbyte(nl, 0, 10)
+    WriteFile(get_stdout(), nl, 1, 0, 0)
+    gebe_zurueck 0
+Ende
+
+// 整数 -> StarC 字符串（能力实现层）
+Funktion int_to_str(num)
+    Wenn num == 0 dann
+        buf = alloc(10)
+        raw_setbyte(buf, 0, 1)
+        raw_setbyte(buf, 1, 0)
+        raw_setbyte(buf, 2, 0)
+        raw_setbyte(buf, 3, 0)
+        raw_setbyte(buf, 12, 48)
+        raw_setbyte(buf, 13, 0)
+        gebe_zurueck buf
+    Ende
+    neg = 0
+    Wenn num < 0 dann
+        neg = 1
+        num = 0 - num
+    Ende
+    digits = alloc(24)
+    di = 0
+    Solange num > 0
+        raw_setbyte(digits, di, num % 10)
+        di = di + 1
+        num = num / 10
+    Ende
+    buf = alloc(24)
+    pos = 0
+    Wenn neg == 1 dann
+        raw_setbyte(buf, 8 + pos, 45)
+        pos = pos + 1
+    Ende
+    i = di - 1
+    Solange i >= 0
+        raw_setbyte(buf, 8 + pos, raw_byteat(digits, i) + 48)
+        pos = pos + 1
+        i = i - 1
+    Ende
+    raw_setbyte(buf, 0, pos % 256)
+    raw_setbyte(buf, 1, (pos / 256) % 256)
+    raw_setbyte(buf, 2, (pos / 65536) % 256)
+    raw_setbyte(buf, 3, (pos / 16777216) % 256)
+    raw_setbyte(buf, 8 + pos, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion write_int(num)
+    write_str(int_to_str(num))
+    gebe_zurueck 0
+Ende

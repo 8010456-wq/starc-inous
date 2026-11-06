@@ -1,0 +1,61 @@
+// inuos/bf16.staro - BF16 解码 (deepPuTT)
+// 依赖: sys.staro (raw_byteat)
+//
+// BF16 (bfloat16) 布局: 1符号 + 8指数 + 7尾数, 与 fp32 指数布局相同
+// BF16 -> fp32 位模式: bf16 位模式 << 16 (指数/符号/尾数高7位左移, 低位16位补0)
+// 返回 fp32 位模式 (整数, 可传给 CUDA 或用 int_to_str 输出)
+
+Funktion decode_bf16(buf, off)
+    lo = raw_byteat(buf, off)
+    hi = raw_byteat(buf, off + 1)
+    b16 = lo + hi * 256
+    gebe_zurueck b16 * 65536
+Ende
+
+// F16 (float16) -> fp32 位模式 (IEEE754 半精度转单精度)
+// 布局: 1符号 + 5指数 + 10尾数, 指数有偏置15, fp32 偏置127
+Funktion decode_f16(buf, off)
+    lo = raw_byteat(buf, off)
+    hi = raw_byteat(buf, off + 1)
+    h16 = lo + hi * 256
+    // 提取字段
+    sign = h16 / 32768
+    exp = (h16 / 1024) % 32
+    mant = h16 % 1024
+    // 组合成 fp32
+    f32 = 0
+    Wenn exp == 0 dann
+        // 次正规/零: fp32 指数 = 0 (或 1-bias 处理, 简化为 0 指数)
+        f32 = sign * 2147483648 + mant * 8192
+    Sonst
+        Wenn exp == 31 dann
+            // inf/nan
+            f32 = sign * 2147483648 + 2139095040 + mant * 8192
+        Sonst
+            // 正规: fp32 指数 = exp - 15 + 127 = exp + 112
+            e32 = exp + 112
+            f32 = sign * 2147483648 + e32 * 8388608 + mant * 8192
+        Ende
+    Ende
+    gebe_zurueck f32
+Ende
+
+// FP8_E4M3 -> fp32 位模式 (4指数 + 3尾数, bias 7)
+Funktion decode_fp8e4m3(buf, off)
+    b = raw_byteat(buf, off)
+    sign = b / 128
+    exp = (b / 8) % 16
+    mant = b % 8
+    f32 = 0
+    Wenn exp == 0 dann
+        f32 = sign * 2147483648 + mant * 1048576
+    Sonst
+        Wenn exp == 15 dann
+            f32 = sign * 2147483648 + 2139095040 + mant * 1048576
+        Sonst
+            e32 = exp - 7 + 127
+            f32 = sign * 2147483648 + e32 * 8388608 + mant * 1048576
+        Ende
+    Ende
+    gebe_zurueck f32
+Ende

@@ -1,0 +1,81 @@
+// ============================================================================
+//  MGTO1 :: mg_route.staro —— HTTP 路由（P1 骨架）
+//  路径：/v1/models /v1/chat/completions /v1/M/ /v1/tools /health /
+//  请求结构见 mg_http.staro：method=req+32, path=req+96, body=buf+off16, len=off24
+//  返回响应总长度（写入 out），0 失败。
+// ============================================================================
+
+Funktion mg_route(req, buf, out, cap)
+    method = req + 32
+    path = req + 96
+
+    // ---- /v1/models ----
+    Wenn cstr_eq(path, mg_cstr("/v1/models")) == 1 dann
+        body = mg_cstr("{\"object\":\"list\",\"data\":[],\"server\":\"MGTO1\",\"version\":\"0.1.0\",\"models\":[]}")
+        r = mg_http_resp(200, mg_cstr("application/json"), body, out, cap)
+        gebe_zurueck r
+    Ende
+
+    // ---- /health ----
+    Wenn cstr_eq(path, mg_cstr("/health")) == 1 dann
+        body = mg_cstr("{\"status\":\"ok\",\"server\":\"MGTO1\",\"version\":\"0.1.0\"}")
+        r = mg_http_resp(200, mg_cstr("application/json"), body, out, cap)
+        gebe_zurueck r
+    Ende
+
+    // ---- / 根 ----
+    Wenn cstr_eq(path, mg_cstr("/")) == 1 dann
+        body = mg_cstr("MGTO1 :: StarC 本地模型网关 (类似 ollama)\n端口 8631 · P1 骨架在线\n端到端: /v1/models  /v1/chat/completions  /v1/M/  /v1/tools")
+        r = mg_http_resp(200, mg_cstr("text/plain; charset=utf-8"), body, out, cap)
+        gebe_zurueck r
+    Ende
+
+    // ---- /v1/chat/completions (P1 stub，P2 接入推理引擎) ----
+    Wenn cstr_eq(path, mg_cstr("/v1/chat/completions")) == 1 dann
+        body = mg_cstr("{\"id\":\"chatcmpl-mgto1\",\"object\":\"chat.completion\",\"created\":0,\"model\":\"\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"MGTO1 P1 骨架在线：推理引擎将在 P2 接入\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}")
+        r = mg_http_resp(200, mg_cstr("application/json"), body, out, cap)
+        gebe_zurueck r
+    Ende
+
+    // ---- /v1/messages (Anthropic 协议，P1 stub，P2 接入推理引擎) ----
+    Wenn cstr_eq(path, mg_cstr("/v1/messages")) == 1 dann
+        body = mg_cstr("{\"id\":\"msg-mgto1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"\",\"content\":[{\"type\":\"text\",\"text\":\"MGTO1 P1 骨架在线：推理引擎将在 P2 接入\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}")
+        r = mg_http_resp(200, mg_cstr("application/json"), body, out, cap)
+        gebe_zurueck r
+    Ende
+
+    // ---- /v1/tools (P1 stub) ----
+    Wenn cstr_eq(path, mg_cstr("/v1/tools")) == 1 dann
+        body = mg_cstr("{\"object\":\"list\",\"data\":[]}")
+        r = mg_http_resp(200, mg_cstr("application/json"), body, out, cap)
+        gebe_zurueck r
+    Ende
+
+    // ---- /v1/M/ 多模态 (P5，先占位) ----
+    Wenn cstr_starts_with(path, mg_cstr("/v1/M/")) == 1 dann
+        body = mg_cstr("{\"error\":\"multimodal: P5 上线\",\"server\":\"MGTO1\"}")
+        r = mg_http_resp(501, mg_cstr("application/json"), body, out, cap)
+        gebe_zurueck r
+    Ende
+
+    // ---- 404 ----
+    body = mg_cstr("{\"error\":{\"message\":\"Not Found\",\"type\":\"invalid_request_error\",\"code\":\"not_found\"}}")
+    r = mg_http_resp(404, mg_cstr("application/json"), body, out, cap)
+    gebe_zurueck r
+Ende
+
+// 前缀判断（C 字符串 path 是否以 prefix 开头）
+Funktion cstr_starts_with(path, prefix)
+    i = 0
+    Solange 1 == 1
+        c = raw_byteat(prefix, i)
+        Wenn c == 0 dann
+            gebe_zurueck 1
+        Ende
+        Wenn raw_byteat(path, i) != c dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende

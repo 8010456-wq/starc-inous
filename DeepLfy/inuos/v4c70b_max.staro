@@ -1,0 +1,61 @@
+// ============================================================
+// v4c70b_max.staro — DeepSeek-V4-Flash-Code-70B-MAX 架构与量化目标
+// DeepLfy 框架 (S 系量化引擎, DeepPuTT 系列) — starc 第一个量化任务
+// 作者: Rue / 老板的总工程师   日期: 2026-11-02
+//
+// 精确架构 (见 ARCH_70B_MAX.md):
+//   总参数 69,897,093,120 = 69.9B ≈ 70B-MAX
+//   激活/token 9,297,788,928 ≈ 9.3B
+//   关键: moe_inter=2048 与教师 V4-Flash 完全一致 -> 蒸馏纯字节复制, 无需扩维
+//   92 路由专家 top6 (教师 256 -> 选 92), 28 层 (教师 43 -> 采 28)
+// ============================================================
+
+Funktion v4c70b_cfg(c)   // c: 参数表缓冲 (每项 8 字节)
+    // 通用
+    raw_set64(c, 0,   4096)      // hidden_size
+    raw_set64(c, 8,   28)        // num_hidden_layers (教师 43 -> 28)
+    raw_set64(c, 16,  64)        // num_attention_heads
+    raw_set64(c, 24,  512)       // head_dim
+    raw_set64(c, 32,  1)         // num_key_value_heads (MLA)
+    raw_set64(c, 40,  1024)      // q_lora_rank
+    raw_set64(c, 48,  1024)      // o_lora_rank
+    raw_set64(c, 56,  64)        // qk_rope_head_dim
+    // MoE (关键: moe_inter 与教师一致 2048)
+    raw_set64(c, 64,  2048)      // moe_intermediate_size (教师 2048, 直接复制)
+    raw_set64(c, 72,  92)        // n_routed_experts (教师 256 -> 选 92)
+    raw_set64(c, 80,  1)         // n_shared_experts
+    raw_set64(c, 88,  6)         // num_experts_per_tok (top6, 教师一致)
+    raw_set64(c, 96,  1)         // norm_topk_prob
+    // routed_scaling_factor(1.5) 存 f32 位模式于 c+104
+    raw_set32(c, 104, 1069547520) // 1.5f 位模式
+    raw_set32(c, 108, 0)
+    // 词表/上下文
+    raw_set64(c, 112, 129280)    // vocab_size
+    raw_set64(c, 120, 1048576)   // max_position_embeddings (设计 1M)
+    raw_set64(c, 128, 800000)    // 实跑上下文上限 800K
+    // 量化格式
+    raw_set64(c, 136, 1)         // expert_dtype: 0=fp8 1=fp4
+    raw_set64(c, 144, 0)         // quant_method: 0=ptq 1=qat
+    raw_set64(c, 152, 2)         // 混合精度: 2=attn/shared 4bit+fp8, 专家 fp4
+    // 校验值 (供对账)
+    raw_set64(c, 160, 1024)      // kv_lora_rank
+    raw_set64(c, 168, 117702656) // MLA/层 参数
+    raw_set64(c, 176, 25165824)  // 每专家(3矩阵) 参数
+    raw_set64(c, 184, 69897093120) // 总参数
+    raw_set64(c, 192, 9297788928)  // 激活/token
+    gebe_zurueck 1
+Ende
+
+// ---- 参数量核算 (权重无关, 供校验) ----
+// MLA/层  = q_a 4096x1024 + q_b 1024x32768 + kv_a 4096x1088 + kv_b 1024x36864
+//           + o_a 32768x1024 + o_b 1024x4096 = 117,702,656
+// 每专家  = 3 x 4096 x 2048 (w1+w2+w3) = 25,165,824
+// routed  = 92 x 28 x 25,165,824 = 64,827,162,624
+// shared  = 28 x 25,165,824 = 704,643,072
+// gate    = 28 x 4096 x 92 = 10,551,296
+// MLA总   = 28 x 117,702,656 = 3,295,674,368
+// embed+hd= 2 x 129280 x 4096 = 1,059,061,760
+// 总计    = 69,897,093,120 ≈ 69.9B
+// 激活/层 = 117,702,656 + 25,165,824 + 376,832 + 6x25,165,824 = 294,240,256
+// 激活/tok= 294,240,256 x 28 + 1,059,061,760 = 9,297,788,928 ≈ 9.3B
+// fp4体积 = 69.9B x 0.5B = 34.95GB (32.5GiB)

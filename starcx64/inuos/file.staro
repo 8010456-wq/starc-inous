@@ -1,0 +1,22 @@
+// inuos/file.staro - 文件写入 (输出 .asm 用)
+// 依赖: sys.staro, str.staro, 内置 cstr()
+linx "kernel32.dll!CreateFileA"
+linx "kernel32.dll!WriteFile"
+linx "kernel32.dll!CloseHandle"
+
+// 写 buf[0..len) 到文件 path (StarC 字符串), 返回 1 成功 0 失败
+Funktion file_write(path, buf, len)
+    // CreateFileA(path, GENERIC_WRITE=0x40000000, 0, 0, CREATE_ALWAYS=2, FILE_ATTRIBUTE_NORMAL=0x80, 0)
+    h = CreateFileA(cstr(path), 1073741824, 0, 0, 2, 128, 0)
+    Wenn h == -1 dann
+        gebe_zurueck 0
+    Ende
+    written = alloc(4)
+    raw_set32(written, 0, 0)
+    r = WriteFile(h, buf, len, written, 0)
+    CloseHandle(h)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende

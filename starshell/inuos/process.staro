@@ -1,0 +1,51 @@
+// ============================================================================
+//  starshell :: inuos/process.staro
+//  StarShell V5 能力库 · Prozess-Ausfuehrung (nativ, kein cmd/PowerShell)
+//  铁律 E：能力在此 .staro 实现，用 linx-o 调 WinAPI。
+//  Compiler-Aufruf (starcc.exe) laeuft ueber CreateProcessA, nicht system().
+// ============================================================================
+
+linx-o kernel32 CreateProcessA WaitForSingleObject GetExitCodeProcess CloseHandle
+linx-o kernel32 GetConsoleScreenBufferInfo FillConsoleOutputCharacterA SetConsoleCursorPosition
+linx-o kernel32 GetStdHandle
+
+// C-String-Befehl nativ ausfuehren (CreateProcessA, kein cmd.exe)
+// Rueckgabe: Exit-Code, -1 bei Fehler
+Funktion exec_process_nativ(cmd)
+    si = alloc(104)
+    pi = alloc(24)
+    r = CreateProcessA(0, cmd, 0, 0, 0, 0, 0, 0, si, pi)
+    Wenn r == 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    hproc = raw_byteat(pi, 0) + raw_byteat(pi, 1) * 256 + raw_byteat(pi, 2) * 65536 + raw_byteat(pi, 3) * 16777216
+    hproc = hproc + raw_byteat(pi, 4) * 4294967296 + raw_byteat(pi, 5) * 1099511627776
+    WaitForSingleObject(hproc, 0 - 1)
+    code = alloc(4)
+    GetExitCodeProcess(hproc, code)
+    c = raw_byteat(code, 0) + raw_byteat(code, 1) * 256 + raw_byteat(code, 2) * 65536 + raw_byteat(code, 3) * 16777216
+    CloseHandle(hproc)
+    hthread = raw_byteat(pi, 8) + raw_byteat(pi, 9) * 256 + raw_byteat(pi, 10) * 65536 + raw_byteat(pi, 11) * 16777216
+    hthread = hthread + raw_byteat(pi, 12) * 4294967296 + raw_byteat(pi, 13) * 1099511627776
+    CloseHandle(hthread)
+    gebe_zurueck c
+Ende
+
+// Bildschirm nativ leeren (kein system("cls"))
+Funktion bild_leeren_nativ()
+    h = GetStdHandle(0 - 11)
+    info = alloc(22)
+    GetConsoleScreenBufferInfo(h, info)
+    sx = raw_byteat(info, 4) + raw_byteat(info, 5) * 256
+    sy = raw_byteat(info, 6) + raw_byteat(info, 7) * 256
+    n = sx * sy
+    coord = alloc(4)
+    raw_setbyte(coord, 0, 0)
+    raw_setbyte(coord, 1, 0)
+    raw_setbyte(coord, 2, 0)
+    raw_setbyte(coord, 3, 0)
+    written = alloc(4)
+    FillConsoleOutputCharacterA(h, 32, n, coord, written)
+    SetConsoleCursorPosition(h, coord)
+    gebe_zurueck 0
+Ende

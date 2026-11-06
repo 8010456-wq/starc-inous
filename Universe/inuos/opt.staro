@@ -1,0 +1,74 @@
+// inuos/opt.staro - AdamW 优化器 (Universe 训练用, 纯 softfloat)
+// 依赖: tensor.staro (t_*), softfloat.staro (f32_*), sys.staro (raw_*)
+// 状态经全局缓冲 (opts) 传递: [0..7]=lr位, [8..15]=beta1, [16..23]=beta2, [24..31]=eps, [32..39]=wd
+// 因 StarC 无跨函数全局, 状态由调用方用 alloc 缓冲传入.
+
+// 初始化优化器状态缓冲: 存超参 (fp32 位模式)
+Funktion opt_init(opts, lr, beta1, beta2, eps, wd)
+    raw_set64(opts, 0, lr)
+    raw_set64(opts, 8, beta1)
+    raw_set64(opts, 16, beta2)
+    raw_set64(opts, 24, eps)
+    raw_set64(opts, 32, wd)
+    gebe_zurueck 0
+Ende
+
+// 一步 AdamW: 累积动量 + 偏差修正更新.
+//   m = beta1*m + (1-beta1)*grad
+//   v = beta2*v + (1-beta2)*grad^2
+//   mh = m/(1-beta1^step), vh = v/(1-beta2^step)
+//   param -= lr * (mh/(sqrt(vh)+eps) + wd*param)
+// param/m/v/grad: 缓冲, n: 元素数, step: 当前步数, opts: 超参缓冲
+Funktion adamw_step(param, m, v, grad, n, step, opts)
+    lr = raw_get64(opts, 0)
+    beta1 = raw_get64(opts, 8)
+    beta2 = raw_get64(opts, 16)
+    eps = raw_get64(opts, 24)
+    wd = raw_get64(opts, 32)
+    // 偏差修正: bc1 = 1 - beta1^step, bc2 = 1 - beta2^step
+    b1p = 1065353216  // 1.0
+    b2p = 1065353216
+    i = 0
+    Solange i < step
+        b1p = f32_mul(b1p, beta1)
+        b2p = f32_mul(b2p, beta2)
+        i = i + 1
+    Ende
+    bc1 = f32_sub(1065353216, b1p)
+    bc2 = f32_sub(1065353216, b2p)
+    // 1-beta1, 1-beta2
+    ob1 = f32_sub(1065353216, beta1)
+    ob2 = f32_sub(1065353216, beta2)
+    i = 0
+    Solange i < n
+        g = t_get(grad, i)
+        // m = b1*m + ob1*g
+        mn = f32_add(f32_mul(beta1, t_get(m, i)), f32_mul(ob1, g))
+        t_set(m, i, mn)
+        // v = b2*v + ob2*g^2
+        g2 = f32_mul(g, g)
+        vn = f32_add(f32_mul(beta2, t_get(v, i)), f32_mul(ob2, g2))
+        t_set(v, i, vn)
+        // mh = m/bc1, vh = v/bc2
+        mh = f32_div(mn, bc1)
+        vh = f32_div(vn, bc2)
+        // update = mh / (sqrt(vh) + eps)
+        sv = f32_sqrt(vh)
+        denom = f32_add(sv, eps)
+        upd = f32_div(mh, denom)
+        // weight decay
+        p = t_get(param, i)
+        wdterm = f32_mul(p, wd)
+        // param -= lr * (upd + wdterm)
+        newp = f32_sub(p, f32_mul(lr, f32_add(upd, wdterm)))
+        t_set(param, i, newp)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 零初始化 m/v 缓冲
+Funktion opt_zero(buf, n)
+    t_zero(buf, n)
+    gebe_zurueck 0
+Ende

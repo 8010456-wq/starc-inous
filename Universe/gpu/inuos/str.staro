@@ -1,0 +1,94 @@
+// inuos/str.staro - 字符串工具 (纯逻辑, 不 linx)
+// 移植自 backend 标准实现, deepPuTT 专用
+// StarC 字符串布局: 前 8 字节小端长度头, 数据从 offset 8 起, 末尾 \0
+// 原始缓冲区(alloc): 数据从 offset 0 起, 无长度头
+
+// StarC 字符串长度 (数据从 offset 8)
+Funktion str_len(str)
+    i = 0
+    Solange raw_byteat(str, 8 + i) != 0
+        i = i + 1
+    Ende
+    gebe_zurueck i
+Ende
+
+// 比较两个 StarC 字符串, 相等返回 1
+Funktion str_eq(s1, s2)
+    l1 = str_len(s1)
+    l2 = str_len(s2)
+    Wenn l1 != l2 dann
+        gebe_zurueck 0
+    Ende
+    Wenn l1 == 0 dann
+        gebe_zurueck 1
+    Ende
+    i = 0
+    Solange i < l1
+        Wenn raw_byteat(s1, 8 + i) != raw_byteat(s2, 8 + i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 整数转 StarC 字符串 (支持负数)
+Funktion int_to_str(num)
+    Wenn num == 0 dann
+        buf = alloc(11)
+        raw_setbyte(buf, 0, 1)
+        raw_setbyte(buf, 1, 0)
+        raw_setbyte(buf, 2, 0)
+        raw_setbyte(buf, 3, 0)
+        raw_setbyte(buf, 4, 0)
+        raw_setbyte(buf, 5, 0)
+        raw_setbyte(buf, 6, 0)
+        raw_setbyte(buf, 7, 0)
+        raw_setbyte(buf, 8, 48)
+        raw_setbyte(buf, 9, 0)
+        gebe_zurueck buf
+    Ende
+
+    neg = 0
+    Wenn num < 0 dann
+        neg = 1
+        num = 0 - num
+    Ende
+
+    digits = alloc(24)
+    di = 0
+    Solange num > 0
+        raw_setbyte(digits, di, num % 10)
+        di = di + 1
+        num = num / 10
+    Ende
+
+    pos = 0
+    Wenn neg == 1 dann
+        pos = pos + 1
+    Ende
+    total = pos + di
+    buf = alloc(8 + total + 1)
+    raw_setbyte(buf, 0, total % 256)
+    raw_setbyte(buf, 1, (total / 256) % 256)
+    raw_setbyte(buf, 2, 0)
+    raw_setbyte(buf, 3, 0)
+    raw_setbyte(buf, 4, 0)
+    raw_setbyte(buf, 5, 0)
+    raw_setbyte(buf, 6, 0)
+    raw_setbyte(buf, 7, 0)
+
+    p = 0
+    Wenn neg == 1 dann
+        raw_setbyte(buf, 8 + p, 45)
+        p = p + 1
+    Ende
+    i = di - 1
+    Solange i >= 0
+        raw_setbyte(buf, 8 + p, raw_byteat(digits, i) + 48)
+        p = p + 1
+        i = i - 1
+    Ende
+    raw_setbyte(buf, 8 + total, 0)
+    gebe_zurueck buf
+Ende

@@ -1,0 +1,183 @@
+// inuos/file.staro - 文件读写 (deepPuTT 推理引擎用)
+// 依赖: sys.staro (raw_set32/get32/set64/get64), str.staro (str_len), 内置 cstr()
+//
+// 提供:
+//   file_open(path, access, creation) -> h  (失败 -1)
+//   file_close(h)
+//   file_read(h, buf, len) -> 实际读到字节数 (0 失败)
+//   file_write(path, buf, len) -> 1 成功 0 失败
+//   file_read_at(h, buf, offset, len) -> 实际读到字节数 (SetFilePointer + ReadFile)
+//
+// access: GENERIC_READ=0x80000000, GENERIC_WRITE=0x40000000
+// creation: OPEN_EXISTING=3, CREATE_ALWAYS=2, CREATE_NEW=1
+
+linx "kernel32.dll!CreateFileA"
+linx "kernel32.dll!ReadFile"
+linx "kernel32.dll!WriteFile"
+linx "kernel32.dll!CloseHandle"
+linx "kernel32.dll!SetFilePointer"
+linx "kernel32.dll!GetFileSize"
+linx "kernel32.dll!CreateFileMappingA"
+linx "kernel32.dll!MapViewOfFile"
+linx "kernel32.dll!UnmapViewOfFile"
+
+// 打开文件, 返回句柄 (失败 -1)
+Funktion file_open(path, access, creation)
+    // CreateFileA(path, access, 0, 0, creation, 128, 0)  FILE_ATTRIBUTE_NORMAL=0x80
+    h = CreateFileA(cstr(path), access, 0, 0, creation, 128, 0)
+    gebe_zurueck h
+Ende
+
+// 打开文件并允许其他进程读 (FILE_SHARE_READ=1), 供"生成器写 + 训练读"并行场景
+Funktion file_open_sh(path, access, creation)
+    // CreateFileA(path, access, 1, 0, creation, 128, 0)
+    h = CreateFileA(cstr(path), access, 1, 0, creation, 128, 0)
+    gebe_zurueck h
+Ende
+
+// 获取文件大小(字节); 失败返回 0. 用 GENERIC_READ + 共享读写打开, 兼容"生成器写+训练读"并行
+Funktion file_size(path)
+    h = CreateFileA(cstr(path), 2147483648, 3, 0, 3, 128, 0)
+    Wenn h == -1 dann
+        gebe_zurueck 0
+    Ende
+    hi = alloc(4)
+    raw_set32(hi, 0, 0)
+    lo = GetFileSize(h, hi)
+    CloseHandle(h)
+    Wenn lo == 4294967295 dann
+        gebe_zurueck 0
+    Ende
+    hi32 = raw_get32(hi, 0)
+    gebe_zurueck lo + hi32 * 4294967296
+Ende
+
+// 关闭句柄
+Funktion file_close(h)
+    CloseHandle(h)
+    gebe_zurueck 0
+Ende
+
+// 从当前位置读 len 字节到原始缓冲 buf, 返回实际读到的字节数
+Funktion file_read(h, buf, len)
+    got = alloc(4)
+    raw_set32(got, 0, 0)
+    // ReadFile(h, buf, len, got, 0)
+    r = ReadFile(h, buf, len, got, 0)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    n = raw_get32(got, 0)
+    gebe_zurueck n
+Ende
+
+// 从指定偏移 offset 读 len 字节到原始缓冲 buf (SetFilePointer + ReadFile)
+Funktion file_read_at(h, buf, offset, len)
+    // SetFilePointer(h, offset低32位, &offset高32位, FILE_BEGIN=0)
+    hi = alloc(4)
+    raw_set32(hi, 0, 0)
+    p = SetFilePointer(h, offset, hi, 0)
+    Wenn p == -1 dann
+        gebe_zurueck 0
+    Ende
+    got = alloc(4)
+    raw_set32(got, 0, 0)
+    r = ReadFile(h, buf, len, got, 0)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    n = raw_get32(got, 0)
+    gebe_zurueck n
+Ende
+
+// 写 buf[0..len) 到文件 path (StarC 字符串), 返回 1 成功 0 失败
+Funktion file_write(path, buf, len)
+    h = CreateFileA(cstr(path), 1073741824, 0, 0, 2, 128, 0)
+    Wenn h == -1 dann
+        gebe_zurueck 0
+    Ende
+    written = alloc(4)
+    raw_set32(written, 0, 0)
+    r = WriteFile(h, buf, len, written, 0)
+    CloseHandle(h)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 写 buf[0..len) 到已打开句柄 h 的指定偏移 offset (SetFilePointer + WriteFile), 返回 1 成功 0 失败
+// 用于"边处理边写"断点续跑 (offset < 4GB, 与 file_read_at 同约定)
+Funktion file_write_at(h, buf, offset, len)
+    hi = alloc(4)
+    raw_set32(hi, 0, 0)
+    p = SetFilePointer(h, offset, hi, 0)
+    Wenn p == -1 dann
+        gebe_zurueck 0
+    Ende
+    written = alloc(4)
+    raw_set32(written, 0, 0)
+    r = WriteFile(h, buf, len, written, 0)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    n = raw_get32(written, 0)
+    Wenn n != len dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// ---- mmap: 零拷贝只读映射整个文件 ----
+// out_map 结构 (32 字节):
+//   [0]  base 基址指针   u64
+//   [8]  map_handle      u64
+//   [16] file_handle     u64
+//   [24] file_size       u64
+// 返回 1 成功 0 失败
+Funktion file_mmap(path, out_map)
+    // CreateFileA(GENERIC_READ=0x80000000, FILE_SHARE_READ|FILE_SHARE_WRITE=3, 0, OPEN_EXISTING=3, NORMAL=0x80, 0)
+    // share=3 (READ|WRITE): 允许其他进程(数据生成器)持写句柄时也能打开映射 —— 否则与写进程 access=WRITE 冲突 -> 打开失败
+    h = CreateFileA(cstr(path), 2147483648, 3, 0, 3, 128, 0)
+    Wenn h == -1 dann
+        gebe_zurueck 0
+    Ende
+    // 文件大小 (GetFileSize + 高位)
+    hi = alloc(4)
+    raw_set32(hi, 0, 0)
+    size_lo = GetFileSize(h, hi)
+    Wenn size_lo == 4294967295 dann
+        CloseHandle(h)
+        gebe_zurueck 0
+    Ende
+    size_hi = raw_get32(hi, 0)
+    size = size_lo + size_hi * 4294967296
+    // CreateFileMappingA(h, 0, PAGE_READONLY=2, 0, 0, 0)
+    mh = CreateFileMappingA(h, 0, 2, 0, 0, 0)
+    Wenn mh == 0 dann
+        CloseHandle(h)
+        gebe_zurueck 0
+    Ende
+    // MapViewOfFile(mh, FILE_MAP_READ=4, 0, 0, 0)
+    base = MapViewOfFile(mh, 4, 0, 0, 0)
+    Wenn base == 0 dann
+        CloseHandle(h)
+        gebe_zurueck 0
+    Ende
+    raw_set64(out_map, 0, base)
+    raw_set64(out_map, 8, mh)
+    raw_set64(out_map, 16, h)
+    raw_set64(out_map, 24, size)
+    gebe_zurueck 1
+Ende
+
+// 解除映射
+Funktion file_munmap(out_map)
+    base = raw_get64(out_map, 0)
+    mh = raw_get64(out_map, 8)
+    h = raw_get64(out_map, 16)
+    UnmapViewOfFile(base)
+    CloseHandle(mh)
+    CloseHandle(h)
+    gebe_zurueck 0
+Ende

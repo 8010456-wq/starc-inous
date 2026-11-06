@@ -1,0 +1,779 @@
+// inuos/pretok.staro - DeepSeek-V4 tokenizer pre-tokenizer (ByteLevel+BPE 前置)
+// 依赖: sys
+//
+// 权威语义 (2026-10-30 与 tokenizers 0.23.3 对齐, 14 向量全部验证):
+//   pre_tokenizer = Sequence[ S0, S1, S2 ] (3 个 Split, behavior=isolated, invert=False) + ByteLevel
+//   S0 = \p{N}{1,3}          (数字串按 1-3 位一组隔离)
+//   S1 = [一-龥\u3040-ゟ\u30A0-30FF]+ (CJK 块隔离)
+//   S2 = 词法正则 (6 分支交替, 见 pt_m_A..pt_m_F)
+//   BPE 在每个 piece 内独立, 不跨边界.
+//
+// 类别判定基于码点 (cp, u32). StarC 无位运算, 用乘除/取模模拟.
+//   UTF-8:  b0/32 -> 0..3 ASCII, 4..5 2字节, 6 3字节, 7 4字节
+//           b&0x1F=b%32, b&0x0F=b%16, b&0x07=b%8, b&0x3F=b%64
+
+// ---- 码点类别 (返回 1/0) ----
+Funktion pt_is_digit(cp)
+    Wenn (cp >= 48 und cp <= 57) dann
+        gebe_zurueck 1
+    Ende
+    // 全角数字 ０-９
+    Wenn (cp >= 65296 und cp <= 65305) dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion pt_is_letter(cp)
+    // ASCII 字母
+    Wenn (cp >= 65 und cp <= 90) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 97 und cp <= 122) dann
+        gebe_zurueck 1
+    Ende
+    // 拉丁扩展 / 希腊 / 西里尔 (常见)
+    Wenn (cp >= 192 und cp <= 591) dann
+        gebe_zurueck 1
+    Ende
+    // CJK 汉字 (Lo, \p{L}) - 虽被 S1 隔离, \p{L} 仍含
+    Wenn (cp >= 19968 und cp <= 40959) dann
+        gebe_zurueck 1
+    Ende
+    // 假名
+    Wenn (cp >= 12352 und cp <= 12447) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 12448 und cp <= 12543) dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion pt_is_mark(cp)
+    // 组合标记 (简化: 0x0300-0x036F 等)
+    Wenn (cp >= 768 und cp <= 879) dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion pt_is_punct(cp)
+    // ASCII 标点: 0x21-0x2F, 0x3A-0x40, 0x5B-0x60, 0x7B-0x7E
+    Wenn (cp >= 33 und cp <= 47) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 58 und cp <= 64) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 91 und cp <= 96) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 123 und cp <= 126) dann
+        gebe_zurueck 1
+    Ende
+    // CJK 标点/符号区
+    Wenn (cp >= 12289 und cp <= 12319) dann
+        gebe_zurueck 1
+    Ende
+    // 全角标点
+    Wenn (cp >= 65281 und cp <= 65295) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 65306 und cp <= 65312) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 65339 und cp <= 65344) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 65371 und cp <= 65381) dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion pt_is_symbol(cp)
+    // 数学/货币/杂项符号 (常见)
+    Wenn (cp >= 162 und cp <= 191) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 8192 und cp <= 8303) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 8592 und cp <= 8703) dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion pt_is_space(cp)
+    Wenn cp == 32 dann
+        gebe_zurueck 1
+    Ende
+    // \t \n \v \f \r
+    Wenn cp == 9 dann
+        gebe_zurueck 1
+    Ende
+    Wenn cp == 10 dann
+        gebe_zurueck 1
+    Ende
+    Wenn cp == 11 dann
+        gebe_zurueck 1
+    Ende
+    Wenn cp == 12 dann
+        gebe_zurueck 1
+    Ende
+    Wenn cp == 13 dann
+        gebe_zurueck 1
+    Ende
+    // 全角空格
+    Wenn cp == 12288 dann
+        gebe_zurueck 1
+    Ende
+    // 不换行空格
+    Wenn cp == 160 dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion pt_is_crlf(cp)
+    Wenn cp == 13 dann
+        gebe_zurueck 1
+    Ende
+    Wenn cp == 10 dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// S1 CJK 范围
+Funktion pt_is_cjk(cp)
+    Wenn (cp >= 19968 und cp <= 40365) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 12352 und cp <= 12415) dann
+        gebe_zurueck 1
+    Ende
+    Wenn (cp >= 12416 und cp <= 12511) dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- UTF-8 解码: 字节串 -> 码点数组 + 每码点的字节偏移 ----
+// s: 原始字节缓冲, slen: 字节数, cps: u32 码点输出, coffs: u32 字节偏移输出
+// 返回码点数
+Funktion pt_utf8_decode(s, slen, cps, coffs)
+    n = 0
+    i = 0
+    Solange i < slen
+        b0 = raw_byteat(s, i)
+        cp = 0
+        len = 1
+        Wenn b0 < 128 dann
+            cp = b0
+            len = 1
+        Sonst
+            Wenn b0 < 224 dann
+                // 2字节: 110xxxxx 10xxxxxx
+                b1 = raw_byteat(s, i + 1)
+                cp = (b0 % 32) * 64 + (b1 % 64)
+                len = 2
+            Sonst
+                Wenn b0 < 240 dann
+                    // 3字节: 1110xxxx 10xxxxxx 10xxxxxx
+                    b1 = raw_byteat(s, i + 1)
+                    b2 = raw_byteat(s, i + 2)
+                    cp = (b0 % 16) * 4096 + (b1 % 64) * 64 + (b2 % 64)
+                    len = 3
+                Sonst
+                    // 4字节: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+                    b1 = raw_byteat(s, i + 1)
+                    b2 = raw_byteat(s, i + 2)
+                    b3 = raw_byteat(s, i + 3)
+                    cp = (b0 % 8) * 262144 + (b1 % 64) * 4096 + (b2 % 64) * 64 + (b3 % 64)
+                    len = 4
+                Ende
+            Ende
+        Ende
+        raw_set32(cps, n * 4, cp)
+        raw_set32(coffs, n * 4, i)
+        n = n + 1
+        i = i + len
+    Ende
+    gebe_zurueck n
+Ende
+
+// ---- S2 分支匹配 (从码点索引 i 起, 返回匹配终点; -1 不匹配) ----
+// A: [punct][A-Za-z]+
+Funktion pt_m_A(cps, n, i)
+    Wenn i >= n dann
+        gebe_zurueck -1
+    Ende
+    p = raw_get32(cps, i * 4)
+    Wenn (p < 33 oder p > 126) dann
+        gebe_zurueck -1
+    Ende
+    // 必须是指定标点集
+    ok = 0
+    Wenn p == 33 dann
+        ok = 1
+    Ende
+    Wenn p == 34 dann
+        ok = 1
+    Ende
+    Wenn p == 35 dann
+        ok = 1
+    Ende
+    Wenn p == 36 dann
+        ok = 1
+    Ende
+    Wenn p == 37 dann
+        ok = 1
+    Ende
+    Wenn p == 38 dann
+        ok = 1
+    Ende
+    Wenn p == 39 dann
+        ok = 1
+    Ende
+    Wenn p == 40 dann
+        ok = 1
+    Ende
+    Wenn p == 41 dann
+        ok = 1
+    Ende
+    Wenn p == 42 dann
+        ok = 1
+    Ende
+    Wenn p == 43 dann
+        ok = 1
+    Ende
+    Wenn p == 44 dann
+        ok = 1
+    Ende
+    Wenn p == 45 dann
+        ok = 1
+    Ende
+    Wenn p == 46 dann
+        ok = 1
+    Ende
+    Wenn p == 47 dann
+        ok = 1
+    Ende
+    Wenn p == 58 dann
+        ok = 1
+    Ende
+    Wenn p == 59 dann
+        ok = 1
+    Ende
+    Wenn p == 60 dann
+        ok = 1
+    Ende
+    Wenn p == 61 dann
+        ok = 1
+    Ende
+    Wenn p == 62 dann
+        ok = 1
+    Ende
+    Wenn p == 63 dann
+        ok = 1
+    Ende
+    Wenn p == 64 dann
+        ok = 1
+    Ende
+    Wenn p == 91 dann
+        ok = 1
+    Ende
+    Wenn p == 92 dann
+        ok = 1
+    Ende
+    Wenn p == 93 dann
+        ok = 1
+    Ende
+    Wenn p == 94 dann
+        ok = 1
+    Ende
+    Wenn p == 95 dann
+        ok = 1
+    Ende
+    Wenn p == 96 dann
+        ok = 1
+    Ende
+    Wenn p == 123 dann
+        ok = 1
+    Ende
+    Wenn p == 124 dann
+        ok = 1
+    Ende
+    Wenn p == 125 dann
+        ok = 1
+    Ende
+    Wenn p == 126 dann
+        ok = 1
+    Ende
+    Wenn ok == 0 dann
+        gebe_zurueck -1
+    Ende
+    // 后跟至少一个 A-Za-z
+    Wenn i + 1 >= n dann
+        gebe_zurueck -1
+    Ende
+    c = raw_get32(cps, (i + 1) * 4)
+    Wenn (c < 65 oder c > 122) dann
+        gebe_zurueck -1
+    Ende
+    Wenn (c > 90 und c < 97) dann
+        gebe_zurueck -1
+    Ende
+    j = i + 2
+    stop = 0
+    Solange j < n und stop == 0
+        c = raw_get32(cps, j * 4)
+        Wenn (c >= 65 und c <= 90) dann
+            j = j + 1
+        Sonst
+            Wenn (c >= 97 und c <= 122) dann
+                j = j + 1
+            Sonst
+                stop = 1
+            Ende
+        Ende
+    Ende
+    gebe_zurueck j
+Ende
+
+// B: [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+Funktion pt_m_B(cps, n, i)
+    Wenn i >= n dann
+        gebe_zurueck -1
+    Ende
+    j = i
+    p = raw_get32(cps, j * 4)
+    // 可选前缀: 非CRLF 非字母 非标点 非符号
+    Wenn (pt_is_crlf(p) == 0) und (pt_is_letter(p) == 0) und (pt_is_punct(p) == 0) und (pt_is_symbol(p) == 0) dann
+        j = j + 1
+    Ende
+    // 至少一个 \p{L}\p{M}
+    Wenn j >= n dann
+        gebe_zurueck -1
+    Ende
+    p = raw_get32(cps, j * 4)
+    Wenn (pt_is_letter(p) == 0) und (pt_is_mark(p) == 0) dann
+        gebe_zurueck -1
+    Ende
+    j = j + 1
+    stop = 0
+    Solange j < n und stop == 0
+        p = raw_get32(cps, j * 4)
+        Wenn (pt_is_letter(p) == 1) oder (pt_is_mark(p) == 1) dann
+            j = j + 1
+        Sonst
+            stop = 1
+        Ende
+    Ende
+    gebe_zurueck j
+Ende
+
+// C:  ?[\p{P}\p{S}]+[\r\n]*
+Funktion pt_m_C(cps, n, i)
+    Wenn i >= n dann
+        gebe_zurueck -1
+    Ende
+    j = i
+    p = raw_get32(cps, j * 4)
+    Wenn p == 32 dann
+        j = j + 1
+    Ende
+    Wenn j >= n dann
+        gebe_zurueck -1
+    Ende
+    p = raw_get32(cps, j * 4)
+    Wenn (pt_is_punct(p) == 0) und (pt_is_symbol(p) == 0) dann
+        gebe_zurueck -1
+    Ende
+    stop = 0
+    Solange j < n und stop == 0
+        p = raw_get32(cps, j * 4)
+        Wenn (pt_is_punct(p) == 1) oder (pt_is_symbol(p) == 1) dann
+            j = j + 1
+        Sonst
+            stop = 1
+        Ende
+    Ende
+    stop = 0
+    Solange j < n und stop == 0
+        p = raw_get32(cps, j * 4)
+        Wenn pt_is_crlf(p) == 1 dann
+            j = j + 1
+        Sonst
+            stop = 1
+        Ende
+    Ende
+    gebe_zurueck j
+Ende
+
+// D: \s*[\r\n]+
+Funktion pt_m_D(cps, n, i)
+    Wenn i >= n dann
+        gebe_zurueck -1
+    Ende
+    j = i
+    stop = 0
+    Solange j < n und stop == 0
+        p = raw_get32(cps, j * 4)
+        Wenn pt_is_space(p) == 1 dann
+            j = j + 1
+        Sonst
+            stop = 1
+        Ende
+    Ende
+    // 需要至少一个 \r\n 在匹配内
+    k = i
+    has_crlf = 0
+    Solange k < j
+        p = raw_get32(cps, k * 4)
+        Wenn pt_is_crlf(p) == 1 dann
+            has_crlf = 1
+        Ende
+        k = k + 1
+    Ende
+    Wenn has_crlf == 1 dann
+        gebe_zurueck j
+    Sonst
+        gebe_zurueck -1
+    Ende
+Ende
+
+// E: \s+(?!\S)
+Funktion pt_m_E(cps, n, i)
+    Wenn i >= n dann
+        gebe_zurueck -1
+    Ende
+    p = raw_get32(cps, i * 4)
+    Wenn pt_is_space(p) == 0 dann
+        gebe_zurueck -1
+    Ende
+    j = i
+    stop = 0
+    Solange j < n und stop == 0
+        p = raw_get32(cps, j * 4)
+        Wenn pt_is_space(p) == 1 dann
+            j = j + 1
+        Sonst
+            stop = 1
+        Ende
+    Ende
+    // 后跟非空格 (或串尾): \s+(?!\S)
+    Wenn j == n dann
+        gebe_zurueck j
+    Ende
+    p = raw_get32(cps, j * 4)
+    Wenn pt_is_space(p) == 0 dann
+        gebe_zurueck j
+    Sonst
+        gebe_zurueck -1
+    Ende
+Ende
+
+// F: \s+
+Funktion pt_m_F(cps, n, i)
+    Wenn i >= n dann
+        gebe_zurueck -1
+    Ende
+    p = raw_get32(cps, i * 4)
+    Wenn pt_is_space(p) == 0 dann
+        gebe_zurueck -1
+    Ende
+    j = i
+    stop = 0
+    Solange j < n und stop == 0
+        p = raw_get32(cps, j * 4)
+        Wenn pt_is_space(p) == 1 dann
+            j = j + 1
+        Sonst
+            stop = 1
+        Ende
+    Ende
+    gebe_zurueck j
+Ende
+
+// ---- S2 迭代: 在 [lo,hi) 码点区间找所有匹配 span, 输出到 spst/spen ----
+// 交替 A..F, 贪婪最长; 返回匹配 span 数
+Funktion pt_s2_iter(cps, n, lo, hi, spst, spen)
+    cnt = 0
+    i = lo
+    Solange i < hi
+        // 尝试 A..F, 取第一个匹配的 (交替优先)
+        // 注意: 匹配上限是 hi (piece 终点), 不是 ncp (总长) - BPE 不跨 piece
+        end = -1
+        e = pt_m_A(cps, hi, i)
+        Wenn e > i dann
+            end = e
+        Sonst
+            e = pt_m_B(cps, hi, i)
+            Wenn e > i dann
+                end = e
+            Sonst
+                e = pt_m_C(cps, hi, i)
+                Wenn e > i dann
+                    end = e
+                Sonst
+                    e = pt_m_D(cps, hi, i)
+                    Wenn e > i dann
+                        end = e
+                    Sonst
+                        e = pt_m_E(cps, hi, i)
+                        Wenn e > i dann
+                            end = e
+                        Sonst
+                            e = pt_m_F(cps, hi, i)
+                            Wenn e > i dann
+                                end = e
+                            Ende
+                        Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+        Wenn end < 0 dann
+            i = i + 1
+        Sonst
+            raw_set32(spst, cnt * 4, i)
+            raw_set32(spen, cnt * 4, end)
+            cnt = cnt + 1
+            i = end
+        Ende
+    Ende
+    gebe_zurueck cnt
+Ende
+
+// ---- S0: \p{N}{1,3} 迭代 ----
+Funktion pt_s0_iter(cps, n, lo, hi, spst, spen)
+    cnt = 0
+    i = lo
+    Solange i < hi
+        p = raw_get32(cps, i * 4)
+        Wenn pt_is_digit(p) == 1 dann
+            j = i
+            stop = 0
+            Solange j < hi und (j - i) < 3 und stop == 0
+                p = raw_get32(cps, j * 4)
+                Wenn pt_is_digit(p) == 1 dann
+                    j = j + 1
+                Sonst
+                    stop = 1
+                Ende
+            Ende
+            raw_set32(spst, cnt * 4, i)
+            raw_set32(spen, cnt * 4, j)
+            cnt = cnt + 1
+            i = j
+        Sonst
+            i = i + 1
+        Ende
+    Ende
+    gebe_zurueck cnt
+Ende
+
+// ---- S1: CJK+ 迭代 ----
+Funktion pt_s1_iter(cps, n, lo, hi, spst, spen)
+    cnt = 0
+    i = lo
+    Solange i < hi
+        p = raw_get32(cps, i * 4)
+        Wenn pt_is_cjk(p) == 1 dann
+            j = i
+            stop = 0
+            Solange j < hi und stop == 0
+                p = raw_get32(cps, j * 4)
+                Wenn pt_is_cjk(p) == 1 dann
+                    j = j + 1
+                Sonst
+                    stop = 1
+                Ende
+            Ende
+            raw_set32(spst, cnt * 4, i)
+            raw_set32(spen, cnt * 4, j)
+            cnt = cnt + 1
+            i = j
+        Sonst
+            i = i + 1
+        Ende
+    Ende
+    gebe_zurueck cnt
+Ende
+
+// ---- 应用一个 split 到码点区间列表 ----
+// pst0/pen0: 输入 piece 码点区间列表, np0 个; 输出 pst1/pen1 (容量 cap), 返回新 piece 数
+// iter_fn: 0=S0, 1=S1, 2=S2
+Funktion pt_apply_split(cps, ncp, pst0, pen0, np0, iter_fn, pst1, pen1, spst, spen, cap)
+    cnt = 0
+    pi = 0
+    Solange pi < np0
+        lo = raw_get32(pst0, pi * 4)
+        hi = raw_get32(pen0, pi * 4)
+        // 找该 piece 内所有匹配 span
+        ns = 0
+        Wenn iter_fn == 0 dann
+            ns = pt_s0_iter(cps, ncp, lo, hi, spst, spen)
+        Sonst
+            Wenn iter_fn == 1 dann
+                ns = pt_s1_iter(cps, ncp, lo, hi, spst, spen)
+            Sonst
+                ns = pt_s2_iter(cps, ncp, lo, hi, spst, spen)
+            Ende
+        Ende
+        // isolated 语义: 匹配 span 保留 + 非匹配段保留, 依次输出
+        prev = lo
+        si = 0
+        Solange si < ns
+            a = raw_get32(spst, si * 4)
+            b = raw_get32(spen, si * 4)
+            Wenn a > prev dann
+                Wenn cnt < cap dann
+                    raw_set32(pst1, cnt * 4, prev)
+                    raw_set32(pen1, cnt * 4, a)
+                    cnt = cnt + 1
+                Ende
+            Ende
+            Wenn cnt < cap dann
+                raw_set32(pst1, cnt * 4, a)
+                raw_set32(pen1, cnt * 4, b)
+                cnt = cnt + 1
+            Ende
+            prev = b
+            si = si + 1
+        Ende
+        Wenn prev < hi dann
+            Wenn cnt < cap dann
+                raw_set32(pst1, cnt * 4, prev)
+                raw_set32(pen1, cnt * 4, hi)
+                cnt = cnt + 1
+            Ende
+        Ende
+        pi = pi + 1
+    Ende
+    gebe_zurueck cnt
+Ende
+
+// ---- 主入口: pre-tokenize ----
+// s: 原始字节缓冲, slen: 字节数
+// pst/pen: 容量 cap 的码点区间输出 (piece 码点范围)
+// 返回 piece 数 (码点区间), 每 piece 的字节范围 = [coffs[pst], coffs[pen]) (pen==ncp -> slen)
+Funktion pt_pretokenize(s, slen, cps, coffs, pst, pen, cap)
+    ncp = pt_utf8_decode(s, slen, cps, coffs)
+    // 临时缓冲 (容量 cap)
+    pst0 = alloc(cap * 4)
+    pen0 = alloc(cap * 4)
+    pst1 = alloc(cap * 4)
+    pen1 = alloc(cap * 4)
+    spst = alloc(cap * 4)
+    spen = alloc(cap * 4)
+    // 初始: 1 个 piece [0, ncp)
+    raw_set32(pst0, 0, 0)
+    raw_set32(pen0, 0, ncp)
+    np = 1
+    // S0
+    np = pt_apply_split(cps, ncp, pst0, pen0, np, 0, pst1, pen1, spst, spen, cap)
+    // S1
+    np = pt_apply_split(cps, ncp, pst1, pen1, np, 1, pst0, pen0, spst, spen, cap)
+    // S2
+    np = pt_apply_split(cps, ncp, pst0, pen0, np, 2, pst1, pen1, spst, spen, cap)
+    // 复制最终到 pst/pen
+    i = 0
+    Solange i < np
+        raw_set32(pst, i * 4, raw_get32(pst1, i * 4))
+        raw_set32(pen, i * 4, raw_get32(pen1, i * 4))
+        i = i + 1
+    Ende
+    gebe_zurueck np
+Ende
+
+// ---- 完整 tokenize (pre-tokenize + 逐piece BPE) ----
+// s: 原始字节缓冲, slen: 字节数
+// 返回 token 数, ids 输出
+Funktion tz_tokenize_pt(s, slen, hashbuf, rrankbuf, btc, ids, cps, coffs, pst, pen, cap)
+    ncp_tot = pt_utf8_decode(s, slen, cps, coffs)
+    npiece = pt_pretokenize(s, slen, cps, coffs, pst, pen, cap)
+    ntok = 0
+    pi = 0
+    Solange pi < npiece
+        a = raw_get32(pst, pi * 4)
+        b = raw_get32(pen, pi * 4)
+        ba = raw_get32(coffs, a * 4)
+        Wenn b == ncp_tot dann
+            bb = slen
+        Sonst
+            bb = raw_get32(coffs, b * 4)
+        Ende
+        plen = bb - ba
+        Wenn plen > 0 dann
+            // 复制 piece 字节到临时缓冲 (数据 offset 0 起)
+            pbuf = alloc(plen)
+            k = 0
+            Solange k < plen
+                raw_setbyte(pbuf, k, raw_byteat(s, ba + k))
+                k = k + 1
+            Ende
+            // 符号化
+            syms = alloc(plen * 4)
+            nsym = tz_encode(pbuf, plen, syms, btc)
+            // 逐piece BPE
+            Wenn nsym > 0 dann
+                st = alloc(nsym * 4)
+                en = alloc(nsym * 4)
+                i = 0
+                Solange i < nsym
+                    raw_set32(st, i * 4, i)
+                    raw_set32(en, i * 4, i + 1)
+                    i = i + 1
+                Ende
+                ntokk = nsym
+                again = 1
+                Solange again == 1
+                    again = 0
+                    best_rank = 2147483647
+                    best_i = -1
+                    ti = 0
+                    Solange ti < ntokk - 1
+                        la = raw_get32(en, ti * 4) - raw_get32(st, ti * 4)
+                        lb = raw_get32(en, (ti + 1) * 4) - raw_get32(st, (ti + 1) * 4)
+                        ap = syms + raw_get32(st, ti * 4) * 4
+                        bp = syms + raw_get32(st, (ti + 1) * 4) * 4
+                        rk = tz_rank(rrankbuf, ap, la, bp, lb)
+                        Wenn rk >= 0 dann
+                            Wenn rk < best_rank dann
+                                best_rank = rk
+                                best_i = ti
+                            Ende
+                        Ende
+                        ti = ti + 1
+                    Ende
+                    Wenn best_i >= 0 dann
+                        raw_set32(en, best_i * 4, raw_get32(en, (best_i + 1) * 4))
+                        k = best_i + 1
+                        Solange k < ntokk - 1
+                            raw_set32(st, k * 4, raw_get32(st, (k + 1) * 4))
+                            raw_set32(en, k * 4, raw_get32(en, (k + 1) * 4))
+                            k = k + 1
+                        Ende
+                        ntokk = ntokk - 1
+                        again = 1
+                    Ende
+                Ende
+                i = 0
+                Solange i < ntokk
+                    tlen = raw_get32(en, i * 4) - raw_get32(st, i * 4)
+                    tmp = syms + raw_get32(st, i * 4) * 4
+                    raw_set32(ids, ntok * 4, tz_lookup(hashbuf, tmp, tlen))
+                    ntok = ntok + 1
+                    i = i + 1
+                Ende
+            Ende
+        Ende
+        pi = pi + 1
+    Ende
+    gebe_zurueck ntok
+Ende

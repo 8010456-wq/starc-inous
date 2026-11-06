@@ -1,0 +1,3 @@
+Funktion dreifach(n)
+    gebe_zurueck n * 3
+Ende

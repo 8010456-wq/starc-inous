@@ -1,0 +1,154 @@
+// inuos/cuda.staro - CUDA Driver API 绑定 (逻辑文件, 允许 linx)
+// 目标: 验证 StarC 能绑 nvcuda.dll 并正确调用 CUDA Driver API
+// 策略: 以"副作用读回"为准 (CUDA 函数写内存缓冲, 读回验证),
+//       返回值 r 仅作诊断打印 (CUDA 全是 int 返回, linx 读取可能不可靠)
+// 依赖: sys.staro (raw_get32/get64), 本文件自包含所需封装
+
+linx "nvcuda.dll!cuInit"
+linx "nvcuda.dll!cuDeviceGetCount"
+linx "nvcuda.dll!cuDeviceGet"
+linx "nvcuda.dll!cuDeviceGetName"
+linx "nvcuda.dll!cuCtxCreate"
+linx "nvcuda.dll!cuCtxDestroy"
+linx "nvcuda.dll!cuMemAlloc"
+linx "nvcuda.dll!cuMemFree"
+linx "nvcuda.dll!cuMemGetInfo"
+linx "nvcuda.dll!cuModuleLoadData"
+linx "nvcuda.dll!cuModuleGetFunction"
+linx "nvcuda.dll!cuLaunchKernel"
+linx "nvcuda.dll!cuMemcpyDtoH"
+linx "nvcuda.dll!cuMemcpyHtoD"
+
+// CUDA 初始化 (flags=0), 返回 CUresult (0 = CUDA_SUCCESS)
+// 无指针参数, 返回值可靠
+Funktion cuda_init()
+    r = cuInit(0)
+    gebe_zurueck r
+Ende
+
+// 设备数量: cuDeviceGetCount(int*) 写 cnt, 读回副作用值
+// 失败返回 -1
+Funktion cuda_device_count()
+    cnt = alloc(4)
+    raw_set32(cnt, 0, 0)
+    r = cuDeviceGetCount(cnt)
+    Wenn r != 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    n = raw_get32(cnt, 0)
+    gebe_zurueck n
+Ende
+
+// 设备句柄: cuDeviceGet(CUdevice*, ordinal) 写 dev, 读回
+Funktion cuda_device(ordinal)
+    dev = alloc(4)
+    raw_set32(dev, 0, 0)
+    r = cuDeviceGet(dev, ordinal)
+    Wenn r != 0 dann
+        gebe_zurueck 0
+    Ende
+    d = raw_get32(dev, 0)
+    gebe_zurueck d
+Ende
+
+// 设备名: cuDeviceGetName(char*, len, dev) 写 buf (C 字符串, offset 0 起)
+// buf 是原始缓冲, 调用方用 raw_byteat 遍历到 \0
+Funktion cuda_device_name(dev, buf, buflen)
+    r = cuDeviceGetName(buf, buflen, dev)
+    gebe_zurueck r
+Ende
+
+// 创建 context: cuCtxCreate(CUcontext*, flags, dev) 写 ctx (64位), 读回句柄
+// 失败返回 0
+Funktion cuda_ctx_create(dev)
+    ctx = alloc(8)
+    raw_set64(ctx, 0, 0)
+    r = cuCtxCreate(ctx, 0, dev)
+    Wenn r != 0 dann
+        gebe_zurueck 0
+    Ende
+    h = raw_get64(ctx, 0)
+    gebe_zurueck h
+Ende
+
+// 销毁 context
+Funktion cuda_ctx_destroy(ctx)
+    cuCtxDestroy(ctx)
+    gebe_zurueck 0
+Ende
+
+// 显存分配: cuMemAlloc(CUdeviceptr*, size) 写 ptr (64位), 读回句柄
+// 失败返回 0
+Funktion cuda_mem_alloc(size)
+    ptr = alloc(8)
+    raw_set64(ptr, 0, 0)
+    r = cuMemAlloc(ptr, size)
+    Wenn r != 0 dann
+        gebe_zurueck 0
+    Ende
+    h = raw_get64(ptr, 0)
+    gebe_zurueck h
+Ende
+
+// 显存释放
+Funktion cuda_mem_free(ptr)
+    cuMemFree(ptr)
+    gebe_zurueck 0
+Ende
+
+// 显存信息: cuMemGetInfo(size_t* free, size_t* total)
+// 写入 16 字节诊断缓冲 res: [0..7]=free, [8..15]=total (小端 64 位)
+Funktion cuda_mem_info(res)
+    f = alloc(8)
+    t = alloc(8)
+    raw_set64(f, 0, 0)
+    raw_set64(t, 0, 0)
+    cuMemGetInfo(f, t)
+    raw_set64(res, 0, raw_get64(f, 0))
+    raw_set64(res, 8, raw_get64(t, 0))
+    gebe_zurueck 0
+Ende
+
+// ---- PTX 模块加载与内核执行 ----
+
+// cuModuleLoadData(CUmodule*, PTX字符串C指针) -> 加载 PTX, 写 out_mod
+// 返回 CUresult (0=成功, 非0=错误码)
+Funktion cuda_module_load(ptx_cstr, out_mod)
+    mod = alloc(8)
+    raw_set64(mod, 0, 0)
+    r = cuModuleLoadData(mod, ptx_cstr)
+    h = raw_get64(mod, 0)
+    raw_set64(out_mod, 0, h)
+    gebe_zurueck r
+Ende
+
+// cuModuleGetFunction(CUfunction*, mod, nameCStr) -> 写 out_func
+// 返回 CUresult (0=成功)
+Funktion cuda_func_get(mod, name_cstr, out_func)
+    func = alloc(8)
+    raw_set64(func, 0, 0)
+    r = cuModuleGetFunction(func, mod, name_cstr)
+    h = raw_get64(func, 0)
+    raw_set64(out_func, 0, h)
+    gebe_zurueck r
+Ende
+
+// cuLaunchKernel(func, gx,gy,gz, bx,by,bz, smem, stream, params, extra=0)
+// params: void** 内核参数指针数组 (每个元素指向参数值缓冲)
+// 返回 CUresult (0=成功)
+Funktion cuda_launch(func, gx, gy, gz, bx, by, bz, smem, stream, params)
+    r = cuLaunchKernel(func, gx, gy, gz, bx, by, bz, smem, stream, params, 0)
+    gebe_zurueck r
+Ende
+
+// cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t n) -> CUresult
+Funktion cuda_memcpy_dtoh(dst_host, src_dev, n)
+    r = cuMemcpyDtoH(dst_host, src_dev, n)
+    gebe_zurueck r
+Ende
+
+// cuMemcpyHtoD(CUdeviceptr dstDevice, void* srcHost, size_t n) -> CUresult
+Funktion cuda_memcpy_htod(dst_dev, src_host, n)
+    r = cuMemcpyHtoD(dst_dev, src_host, n)
+    gebe_zurueck r
+Ende

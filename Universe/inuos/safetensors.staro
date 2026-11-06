@@ -1,0 +1,471 @@
+// inuos/safetensors.staro - safetensors JSON 头解析器 (deepPuTT)
+// 依赖: sys.staro (raw_set32/get32/set64/get64), str.staro
+//
+// safetensors 文件布局:
+//   [0..8)    u64 小端 = JSON 元数据字节数 N
+//   [8..8+N)  JSON 元数据
+//   [8+N..)  二进制 tensor 数据 (tensor.data_offsets 相对此起点)
+//
+// JSON 元数据结构:
+//   { "__metadata__": {...}, "<name>": {"dtype":"BF16","shape":[...],"data_offsets":[b,e]}, ... }
+//
+// 解析结果结构 out (88 字节, 由调用者 alloc):
+//   [0]   found  (1/0)          u64
+//   [8]   name_start            u64  (buf 内偏移)
+//   [16]  name_len              u64
+//   [24]  dtype_start           u64  (buf 内偏移)
+//   [32]  dtype_len             u64
+//   [40]  shape_dim             u64
+//   [48]  shape0                u64
+//   [56]  shape1                u64
+//   [64]  shape2                u64
+//   [72]  data_offset_begin     u64
+//   [80]  data_offset_end       u64
+
+// 跳过空白 (空格32 换行10 回车13 制表9), 返回新位置
+Funktion st_skipws(buf, i, n)
+    Solange i < n
+        c = raw_byteat(buf, i)
+        Wenn c != 32 und c != 10 und c != 13 und c != 9 dann
+            gebe_zurueck i
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck i
+Ende
+
+// 读引号字符串 (buf[i]==34), 返回内容起始偏移(不含引号), 内容长度写 out_len(4字节)
+Funktion st_read_str(buf, i, n, out_len)
+    Wenn i >= n dann
+        raw_set32(out_len, 0, 0)
+        gebe_zurueck i
+    Ende
+    i = i + 1
+    start = i
+    Solange i < n
+        c = raw_byteat(buf, i)
+        Wenn c == 34 dann
+            raw_set32(out_len, 0, i - start)
+            gebe_zurueck start
+        Ende
+        Wenn c == 92 dann
+            i = i + 1
+        Ende
+        i = i + 1
+    Ende
+    raw_set32(out_len, 0, i - start)
+    gebe_zurueck start
+Ende
+
+// 读整数 (可负), 返回数值, 新位置写 out_pos(4字节)
+Funktion st_read_num(buf, i, n, out_pos)
+    i = st_skipws(buf, i, n)
+    neg = 0
+    Wenn i < n und raw_byteat(buf, i) == 45 dann
+        neg = 1
+        i = i + 1
+    Ende
+    v = 0
+    Solange i < n
+        c = raw_byteat(buf, i)
+        Wenn c >= 48 und c <= 57 dann
+            v = v * 10 + (c - 48)
+            i = i + 1
+        Sonst
+            raw_set32(out_pos, 0, i)
+            Wenn neg == 1 dann
+                v = 0 - v
+            Ende
+            gebe_zurueck v
+        Ende
+    Ende
+    raw_set32(out_pos, 0, i)
+    Wenn neg == 1 dann
+        v = 0 - v
+    Ende
+    gebe_zurueck v
+Ende
+
+// 跳过任意 JSON 值 (字符串/数字/数组/对象/字面量), 返回值后位置
+Funktion st_skip_value(buf, i, n)
+    i = st_skipws(buf, i, n)
+    Wenn i >= n dann
+        gebe_zurueck i
+    Ende
+    c = raw_byteat(buf, i)
+    Wenn c == 34 dann
+        l = alloc(4)
+        s = st_read_str(buf, i, n, l)
+        gebe_zurueck s + raw_get32(l, 0)
+    Ende
+    Wenn c == 91 dann  // '['
+        // 数组
+        i = i + 1
+        Solange i < n
+            i = st_skipws(buf, i, n)
+            Wenn i >= n dann
+                gebe_zurueck i
+            Ende
+            c2 = raw_byteat(buf, i)
+            Wenn c2 == 93 dann  // ']'
+                gebe_zurueck i + 1
+            Ende
+            p = alloc(4)
+            st_read_num(buf, i, n, p)
+            i = raw_get32(p, 0)
+            i = st_skipws(buf, i, n)
+            Wenn i < n und raw_byteat(buf, i) == 44 dann
+                i = i + 1
+            Ende
+        Ende
+        gebe_zurueck i
+    Ende
+    Wenn c == 123 dann  // '{'
+        // 对象
+        i = i + 1
+        Solange i < n
+            i = st_skipws(buf, i, n)
+            Wenn i >= n dann
+                gebe_zurueck i
+            Ende
+            c2 = raw_byteat(buf, i)
+            Wenn c2 == 125 dann  // '}'
+                gebe_zurueck i + 1
+            Ende
+            Wenn c2 == 34 dann
+                l = alloc(4)
+                s = st_read_str(buf, i, n, l)
+                i = s + raw_get32(l, 0) + 1
+            Ende
+            i = st_skipws(buf, i, n)
+            Wenn i < n und raw_byteat(buf, i) == 58 dann
+                i = i + 1
+            Ende
+            i = st_skip_value(buf, i, n)
+            i = st_skipws(buf, i, n)
+            Wenn i < n und raw_byteat(buf, i) == 44 dann
+                i = i + 1
+            Ende
+        Ende
+        gebe_zurueck i
+    Ende
+    // 数字或字面量
+    p = alloc(4)
+    st_read_num(buf, i, n, p)
+    gebe_zurueck raw_get32(p, 0)
+Ende
+
+// 解析 shape 数组 [a,b,c] 写入 out, 返回 ']' 后位置
+Funktion st_parse_shape(buf, i, n, out)
+    dim = 0
+    raw_set64(out, 40, 0)
+    raw_set64(out, 48, 0)
+    raw_set64(out, 56, 0)
+    raw_set64(out, 64, 0)
+    i = st_skipws(buf, i, n)
+    Wenn i < n und raw_byteat(buf, i) == 91 dann
+        i = i + 1
+        Solange i < n
+            i = st_skipws(buf, i, n)
+            Wenn i >= n dann
+                gebe_zurueck i
+            Ende
+            c = raw_byteat(buf, i)
+            Wenn c == 93 dann
+                raw_set64(out, 40, dim)
+                gebe_zurueck i + 1
+            Ende
+            p = alloc(4)
+            v = st_read_num(buf, i, n, p)
+            i = raw_get32(p, 0)
+            Wenn dim == 0 dann
+                raw_set64(out, 48, v)
+            Sonst
+                Wenn dim == 1 dann
+                    raw_set64(out, 56, v)
+                Sonst
+                    Wenn dim == 2 dann
+                        raw_set64(out, 64, v)
+                    Ende
+                Ende
+            Ende
+            dim = dim + 1
+            i = st_skipws(buf, i, n)
+            Wenn i < n und raw_byteat(buf, i) == 44 dann
+                i = i + 1
+            Ende
+        Ende
+    Ende
+    raw_set64(out, 40, dim)
+    gebe_zurueck i
+Ende
+
+// 解析 data_offsets [begin,end] 写入 out, 返回 ']' 后位置
+Funktion st_parse_offs(buf, i, n, out)
+    i = st_skipws(buf, i, n)
+    Wenn i < n und raw_byteat(buf, i) == 91 dann
+        i = i + 1
+        p = alloc(4)
+        v0 = st_read_num(buf, i, n, p)
+        i = raw_get32(p, 0)
+        raw_set64(out, 72, v0)
+        i = st_skipws(buf, i, n)
+        Wenn i < n und raw_byteat(buf, i) == 44 dann
+            i = i + 1
+        Ende
+        v1 = st_read_num(buf, i, n, p)
+        i = raw_get32(p, 0)
+        raw_set64(out, 80, v1)
+        i = st_skipws(buf, i, n)
+        Wenn i < n und raw_byteat(buf, i) == 93 dann
+            i = i + 1
+        Ende
+    Ende
+    gebe_zurueck i
+Ende
+
+// 解析一个 tensor 对象 (buf[j]=='{'), 填 out, 返回对象结束后的位置
+Funktion st_parse_tensor_obj(buf, j, n, out)
+    j = j + 1  // 跳过 '{'
+    Solange j < n
+        j = st_skipws(buf, j, n)
+        Wenn j >= n dann
+            gebe_zurueck j
+        Ende
+        c = raw_byteat(buf, j)
+        Wenn c == 125 dann  // '}' 对象结束
+            gebe_zurueck j + 1
+        Ende
+        // 读 field 名
+        fl = alloc(4)
+        fs = st_read_str(buf, j, n, fl)
+        flen = raw_get32(fl, 0)
+        j = st_skipws(buf, fs + flen + 1, n)
+        Wenn j < n und raw_byteat(buf, j) == 58 dann
+            j = j + 1
+        Ende
+        j = st_skipws(buf, j, n)
+        // 字段分派
+        // dtype:   flen==5  首字符 'd'(100)
+        // shape:   flen==5  首字符 's'(115)
+        // data_offsets: flen==12 首字符 'd'(100)
+        Wenn flen == 5 und raw_byteat(buf, fs) == 100 dann
+            dl = alloc(4)
+            ds = st_read_str(buf, j, n, dl)
+            raw_set64(out, 24, ds)
+            raw_set64(out, 32, raw_get32(dl, 0))
+            j = ds + raw_get32(dl, 0) + 1
+        Sonst
+            Wenn flen == 5 und raw_byteat(buf, fs) == 115 dann
+                j = st_parse_shape(buf, j, n, out)
+            Sonst
+                Wenn flen == 12 und raw_byteat(buf, fs) == 100 dann
+                    j = st_parse_offs(buf, j, n, out)
+                Sonst
+                    j = st_skip_value(buf, j, n)
+                Ende
+            Ende
+        Ende
+        j = st_skipws(buf, j, n)
+        Wenn j < n und raw_byteat(buf, j) == 44 dann
+            j = j + 1
+        Ende
+    Ende
+    gebe_zurueck j
+Ende
+
+// 顶层: 从 pos 找下一个 tensor 条目, 填 out, 返回下个扫描位置 (0 = 结束)
+Funktion st_next_tensor(buf, n, pos, out)
+    i = st_skipws(buf, pos, n)
+    Wenn i >= n dann
+        gebe_zurueck 0
+    Ende
+    c = raw_byteat(buf, i)
+    Wenn c != 34 dann  // 不是 '"', 顶层只可能是 '{' 或 '}'
+        Wenn c == 123 dann  // '{' 顶层开始, 进 1
+            i = i + 1
+        Sonst
+            Wenn c == 125 dann  // '}' 结束
+                gebe_zurueck 0
+            Sonst
+                gebe_zurueck 0
+            Ende
+        Ende
+    Ende
+    i = st_skipws(buf, i, n)
+    Wenn i >= n dann
+        gebe_zurueck 0
+    Ende
+    c = raw_byteat(buf, i)
+    Wenn c == 125 dann
+        gebe_zurueck 0
+    Ende
+    Wenn c != 34 dann
+        gebe_zurueck 0
+    Ende
+    // 读顶层 key
+    kl = alloc(4)
+    ks = st_read_str(buf, i, n, kl)
+    klen = raw_get32(kl, 0)
+    j = st_skipws(buf, ks + klen + 1, n)
+    Wenn j < n und raw_byteat(buf, j) == 58 dann
+        j = j + 1
+    Ende
+    j = st_skipws(buf, j, n)
+    // 值是 '{' 吗?
+    Wenn raw_byteat(buf, j) != 123 dann
+        // 非对象值, 跳过, 找下一个顶层条目
+        j = st_skip_value(buf, j, n)
+        j = st_skipws(buf, j, n)
+        Wenn j < n und raw_byteat(buf, j) == 44 dann
+            j = j + 1
+        Ende
+        gebe_zurueck st_next_tensor(buf, n, j, out)
+    Ende
+    // 是对象. 检查是否 __metadata__ (长度12)
+    Wenn klen == 12 dann
+        Wenn raw_byteat(buf, ks) == 95 und raw_byteat(buf, ks+1) == 95 und raw_byteat(buf, ks+2) == 109 und raw_byteat(buf, ks+3) == 101 und raw_byteat(buf, ks+4) == 116 und raw_byteat(buf, ks+5) == 97 und raw_byteat(buf, ks+6) == 100 und raw_byteat(buf, ks+7) == 97 und raw_byteat(buf, ks+8) == 116 und raw_byteat(buf, ks+9) == 97 und raw_byteat(buf, ks+10) == 95 und raw_byteat(buf, ks+11) == 95 dann
+            j = st_skip_value(buf, j, n)
+            j = st_skipws(buf, j, n)
+            Wenn j < n und raw_byteat(buf, j) == 44 dann
+                j = j + 1
+            Ende
+            gebe_zurueck st_next_tensor(buf, n, j, out)
+        Ende
+    Ende
+    // 是 tensor, 填 name 并解析对象
+    raw_set64(out, 0, 1)
+    raw_set64(out, 8, ks)
+    raw_set64(out, 16, klen)
+    raw_set64(out, 40, 0)
+    raw_set64(out, 48, 0)
+    raw_set64(out, 56, 0)
+    raw_set64(out, 64, 0)
+    raw_set64(out, 72, 0)
+    raw_set64(out, 80, 0)
+    j = st_parse_tensor_obj(buf, j, n, out)
+    j = st_skipws(buf, j, n)
+    Wenn j < n und raw_byteat(buf, j) == 44 dann
+        j = j + 1
+    Ende
+    gebe_zurueck j
+Ende
+
+// ---- dtype 解码表: dtype 字符串(buf[s..s+l)) -> 每元素位数 ----
+// 覆盖: BF16 F16 F32 F64 I8 U8 I16 U16 I32 U32 I64 U64 FP8_E4M3 FP8_E5M2 FP4 NF4
+Funktion st_dtype_bits(buf, s, l)
+    // BF16 (66 70 49 54)
+    Wenn l == 4 und raw_byteat(buf, s) == 66 und raw_byteat(buf, s+1) == 70 und raw_byteat(buf, s+2) == 49 und raw_byteat(buf, s+3) == 54 dann
+        gebe_zurueck 16
+    Ende
+    // F16 (70 49 54)
+    Wenn l == 3 und raw_byteat(buf, s) == 70 und raw_byteat(buf, s+1) == 49 und raw_byteat(buf, s+2) == 54 dann
+        gebe_zurueck 16
+    Ende
+    // F32 (70 51 50)
+    Wenn l == 3 und raw_byteat(buf, s) == 70 und raw_byteat(buf, s+1) == 51 und raw_byteat(buf, s+2) == 50 dann
+        gebe_zurueck 32
+    Ende
+    // F64 (70 54 52)
+    Wenn l == 3 und raw_byteat(buf, s) == 70 und raw_byteat(buf, s+1) == 54 und raw_byteat(buf, s+2) == 52 dann
+        gebe_zurueck 64
+    Ende
+    // I8 (73 56)
+    Wenn l == 2 und raw_byteat(buf, s) == 73 und raw_byteat(buf, s+1) == 56 dann
+        gebe_zurueck 8
+    Ende
+    // U8 (85 56)
+    Wenn l == 2 und raw_byteat(buf, s) == 85 und raw_byteat(buf, s+1) == 56 dann
+        gebe_zurueck 8
+    Ende
+    // I16 (73 49 54)
+    Wenn l == 3 und raw_byteat(buf, s) == 73 und raw_byteat(buf, s+1) == 49 und raw_byteat(buf, s+2) == 54 dann
+        gebe_zurueck 16
+    Ende
+    // U16 (85 49 54)
+    Wenn l == 3 und raw_byteat(buf, s) == 85 und raw_byteat(buf, s+1) == 49 und raw_byteat(buf, s+2) == 54 dann
+        gebe_zurueck 16
+    Ende
+    // I32 (73 51 50)
+    Wenn l == 3 und raw_byteat(buf, s) == 73 und raw_byteat(buf, s+1) == 51 und raw_byteat(buf, s+2) == 50 dann
+        gebe_zurueck 32
+    Ende
+    // U32 (85 51 50)
+    Wenn l == 3 und raw_byteat(buf, s) == 85 und raw_byteat(buf, s+1) == 51 und raw_byteat(buf, s+2) == 50 dann
+        gebe_zurueck 32
+    Ende
+    // I64 (73 54 52)
+    Wenn l == 3 und raw_byteat(buf, s) == 73 und raw_byteat(buf, s+1) == 54 und raw_byteat(buf, s+2) == 52 dann
+        gebe_zurueck 64
+    Ende
+    // U64 (85 54 52)
+    Wenn l == 3 und raw_byteat(buf, s) == 85 und raw_byteat(buf, s+1) == 54 und raw_byteat(buf, s+2) == 52 dann
+        gebe_zurueck 64
+    Ende
+    // FP8_E4M3 (70 80 56 95 69 52 77 51)
+    Wenn l == 8 und raw_byteat(buf, s) == 70 und raw_byteat(buf, s+1) == 80 und raw_byteat(buf, s+2) == 56 und raw_byteat(buf, s+3) == 95 und raw_byteat(buf, s+4) == 69 und raw_byteat(buf, s+5) == 52 und raw_byteat(buf, s+6) == 77 und raw_byteat(buf, s+7) == 51 dann
+        gebe_zurueck 8
+    Ende
+    // FP8_E5M2 (70 80 56 95 69 53 77 50)
+    Wenn l == 8 und raw_byteat(buf, s) == 70 und raw_byteat(buf, s+1) == 80 und raw_byteat(buf, s+2) == 56 und raw_byteat(buf, s+3) == 95 und raw_byteat(buf, s+4) == 69 und raw_byteat(buf, s+5) == 53 und raw_byteat(buf, s+6) == 77 und raw_byteat(buf, s+7) == 50 dann
+        gebe_zurueck 8
+    Ende
+    // FP4 (70 80 52)
+    Wenn l == 3 und raw_byteat(buf, s) == 70 und raw_byteat(buf, s+1) == 80 und raw_byteat(buf, s+2) == 52 dann
+        gebe_zurueck 4
+    Ende
+    // NF4 (78 70 52)
+    Wenn l == 3 und raw_byteat(buf, s) == 78 und raw_byteat(buf, s+1) == 70 und raw_byteat(buf, s+2) == 52 dann
+        gebe_zurueck 4
+    Ende
+    // 未知
+    gebe_zurueck 0
+Ende
+
+// 每元素字节数 (FP4/NF4 返回 0, 用 st_dtype_bits/8 或特殊处理)
+Funktion st_dtype_bytes(buf, s, l)
+    bits = st_dtype_bits(buf, s, l)
+    Wenn bits == 0 dann
+        gebe_zurueck 0
+    Ende
+    b = bits / 8
+    Wenn bits % 8 != 0 dann
+        b = 1
+    Ende
+    gebe_zurueck b
+Ende
+
+// ---- 按名字查找 tensor ----
+// head_buf: JSON 头缓冲, n: 头长度
+// want_buf/want_s/want_l: 目标 tensor 名 (ASCII)
+// out: 找到则填 88 字节结构并返回 1, 否则 0
+Funktion wi_find_tensor(head_buf, n, want_buf, want_s, want_l, out)
+    pos = 0
+    o2 = alloc(88)
+    pos = st_next_tensor(head_buf, n, pos, o2)
+    Solange pos != 0
+        name_s = raw_get64(o2, 8)
+        name_l = raw_get64(o2, 16)
+        Wenn name_l == want_l dann
+            match = 1
+            k = 0
+            Solange k < want_l
+                Wenn raw_byteat(head_buf, name_s + k) != raw_byteat(want_buf, want_s + k) dann
+                    match = 0
+                Ende
+                k = k + 1
+            Ende
+            Wenn match == 1 dann
+                // 复制 o2 (88 字节) 到 out
+                k = 0
+                Solange k < 88
+                    raw_setbyte(out, k, raw_byteat(o2, k))
+                    k = k + 1
+                Ende
+                gebe_zurueck 1
+            Ende
+        Ende
+        pos = st_next_tensor(head_buf, n, pos, o2)
+    Ende
+    gebe_zurueck 0
+Ende

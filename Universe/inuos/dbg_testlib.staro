@@ -1,0 +1,9 @@
+// inuos/dbg_testlib.staro - 测试用库: 提供 add1
+Funktion lib_add1(a)
+    a = a + 1
+    gebe_zurueck a
+Ende
+Funktion lib_mul2(a)
+    b = a * 2
+    gebe_zurueck b
+Ende

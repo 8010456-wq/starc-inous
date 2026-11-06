@@ -1,0 +1,274 @@
+// ============================================================================
+//  MGTO1 :: mg_http.staro —— HTTP/1.1 解析 + 响应组装（建立在 mg_sys socket 之上）
+//  请求解析：请求行(METHOD SP PATH SP HTTP/1.1 CRLF) + 头(Key: Value CRLF) + 体(Content-Length)
+//  响应组装：状态行 + 头(Content-Type/Content-Length/Connection) + 空行 + 体
+//  输出统一用 C 字符串；body 直接指向请求缓冲内（不拷贝）。
+// ============================================================================
+
+// 请求解析结果布局（out 缓冲，caller 提供 ≥256 字节）:
+//   out+0   i64 method_len
+//   out+8   i64 path_len
+//   out+16  i64 body_off  （相对请求 buf）
+//   out+24  i64 body_len
+//   out+32  method C 字符串（≤64 字节，含 NUL）
+//   out+96  path  C 字符串（≤160 字节，含 NUL）
+Funktion mg_http_parse(buf, n, out)
+    // ---- 找到请求行末尾（第一个 "\r\n" 或 "\n"）----
+    line_end = 0
+    gefunden = 0
+    i = 0
+    Solange gefunden == 0 und i < n
+        c = raw_byteat(buf, i)
+        Wenn c == 10 dann
+            line_end = i
+            gefunden = 1
+        Ende
+        i = i + 1
+    Ende
+    Wenn gefunden == 0 dann
+        gebe_zurueck 0
+    Ende
+    // 去掉可能的前导 '\r'
+    le = line_end
+    Wenn le > 0 dann
+        Wenn raw_byteat(buf, le - 1) == 13 dann
+            le = le - 1
+        Ende
+    Ende
+
+    // ---- 解析 method（第一个空格前）----
+    i = 0
+    gf = 0
+    Solange gf == 0 und i < le
+        Wenn raw_byteat(buf, i) == 32 dann
+            gf = 1
+        Sonst
+            i = i + 1
+        Ende
+    Ende
+    mlen = i
+    Wenn mlen > 63 dann
+        mlen = 63
+    Ende
+    j = 0
+    Solange j < mlen
+        raw_setbyte(out, 32 + j, raw_byteat(buf, j))
+        j = j + 1
+    Ende
+    raw_setbyte(out, 32 + mlen, 0)
+    raw_set64(out, 0, mlen)
+
+    // ---- 跳过空格，解析 path（到下一个空格或 '?'）----
+    pstart = mlen + 1
+    // 跳过连续空格
+    Solange pstart < le und raw_byteat(buf, pstart) == 32
+        pstart = pstart + 1
+    Ende
+    pend = pstart
+    gpd = 0
+    Solange gpd == 0 und pend < le
+        c = raw_byteat(buf, pend)
+        Wenn c == 32 dann
+            gpd = 1
+        Sonst
+            Wenn c == 63 dann
+                gpd = 1
+            Sonst
+                pend = pend + 1
+            Ende
+        Ende
+    Ende
+    plen = pend - pstart
+    Wenn plen > 159 dann
+        plen = 159
+    Ende
+    j = 0
+    Solange j < plen
+        raw_setbyte(out, 96 + j, raw_byteat(buf, pstart + j))
+        j = j + 1
+    Ende
+    raw_setbyte(out, 96 + plen, 0)
+    raw_set64(out, 8, plen)
+
+    // ---- 找 body：跳过请求行后逐行扫头，找 Content-Length；体起点 = 空行之后 ----
+    clen = 0
+    haben = 0
+    pos = line_end + 1
+    // 逐行
+    lauf = 1
+    Solange lauf == 1
+        // 找本行末尾
+        line_end2 = pos
+        g2 = 0
+        Solange g2 == 0 und line_end2 < n
+            Wenn raw_byteat(buf, line_end2) == 10 dann
+                g2 = 1
+            Sonst
+                line_end2 = line_end2 + 1
+            Ende
+        Ende
+        Wenn line_end2 >= n dann
+            lauf = 0
+        Sonst
+            le2 = line_end2
+            Wenn le2 > pos dann
+                Wenn raw_byteat(buf, le2 - 1) == 13 dann
+                    le2 = le2 - 1
+                Ende
+            Ende
+            // 空行 -> body 起点
+            Wenn le2 <= pos dann
+                lauf = 0
+            Sonst
+                // 解析 "Key: Value"
+                colon = pos
+                gc = 0
+                Solange gc == 0 und colon < le2
+                    Wenn raw_byteat(buf, colon) == 58 dann
+                        gc = 1
+                    Sonst
+                        colon = colon + 1
+                    Ende
+                Ende
+                Wenn gc == 1 dann
+                    // key 小写化判断 "content-length"
+                    // key 区间 [pos, colon)，跳过空格后值
+                    vstart = colon + 1
+                    Solange vstart < le2 und raw_byteat(buf, vstart) == 32
+                        vstart = vstart + 1
+                    Ende
+                    klen = colon - pos
+                    Wenn klen == 14 dann
+                        // 逐字节比较 "content-length"（大小写不敏感）
+                        ok = 1
+                        kk = 0
+                        Solange kk < 14
+                            kb = raw_byteat(buf, pos + kk)
+                            Wenn kb >= 65 und kb <= 90 dann
+                                kb = kb + 32
+                            Ende
+                            Wenn kb != raw_byteat(mg_http_cl_key(), kk) dann
+                                ok = 0
+                            Ende
+                            kk = kk + 1
+                        Ende
+                        Wenn ok == 1 dann
+                            // 值 -> clen（数字）
+                            v = 0
+                            vv = vstart
+                            Solange vv < le2
+                                c = raw_byteat(buf, vv)
+                                Wenn c >= 48 und c <= 57 dann
+                                    v = v * 10 + (c - 48)
+                                Ende
+                                vv = vv + 1
+                            Ende
+                            clen = v
+                            haben = 1
+                        Ende
+                    Ende
+                Ende
+                pos = line_end2 + 1
+            Ende
+        Ende
+    Ende
+
+    // ---- body 起点 = 空行后（即 pos，此时 pos 已越过空行）----
+    // 重新计算：body 起点在空行 \r\n 之后
+    body_off = 0
+    // 从请求行末尾起找第一个空行
+    p2 = line_end + 1
+    gb = 0
+    Solange gb == 0 und p2 + 1 < n
+        a = raw_byteat(buf, p2)
+        b = raw_byteat(buf, p2 + 1)
+        Wenn a == 13 und b == 10 dann
+            body_off = p2 + 2
+            gb = 1
+        Sonst
+            Wenn a == 10 dann
+                body_off = p2 + 1
+                gb = 1
+            Sonst
+                p2 = p2 + 1
+            Ende
+        Ende
+    Ende
+    raw_set64(out, 16, body_off)
+    raw_set64(out, 24, clen)
+    gebe_zurueck 1
+Ende
+
+// "content-length" 常量（14 字节小写，供头比较）
+Funktion mg_http_cl_key()
+    // 返回一个静态 C 字符串（每次重建）
+    k = alloc(15)
+    raw_setbyte(k, 0, 99)   // c
+    raw_setbyte(k, 1, 111)  // o
+    raw_setbyte(k, 2, 110)  // n
+    raw_setbyte(k, 3, 116)  // t
+    raw_setbyte(k, 4, 101)  // e
+    raw_setbyte(k, 5, 110)  // n
+    raw_setbyte(k, 6, 116)  // t
+    raw_setbyte(k, 7, 45)   // -
+    raw_setbyte(k, 8, 108)  // l
+    raw_setbyte(k, 9, 101)  // e
+    raw_setbyte(k, 10, 110) // n
+    raw_setbyte(k, 11, 103) // g
+    raw_setbyte(k, 12, 116) // t
+    raw_setbyte(k, 13, 104) // h
+    raw_setbyte(k, 14, 0)
+    gebe_zurueck k
+Ende
+
+// ---------------- 响应组装 ----------------
+// 组装 HTTP 响应到 out（cap 容量），body 为 C 字符串。
+// 返回响应总长度（不含 NUL），失败 0。
+Funktion mg_http_resp(code, ctype, body, out, cap)
+    status = mg_http_status_text(code)
+    p = 0
+    // "HTTP/1.1 <code> <status>\r\n"
+    p = cstr_append(out, p, mg_cstr("HTTP/1.1 "))
+    p = cstr_append(out, p, cstr_from_int(code))
+    p = cstr_append(out, p, mg_cstr(" "))
+    p = cstr_append(out, p, status)
+    p = cstr_append(out, p, mg_cstr("\r\n"))
+    // "Content-Type: <ctype>\r\n"
+    p = cstr_append(out, p, mg_cstr("Content-Type: "))
+    p = cstr_append(out, p, ctype)
+    p = cstr_append(out, p, mg_cstr("\r\n"))
+    // "Content-Length: <blen>\r\n"
+    blen = cstr_len(body)
+    p = cstr_append(out, p, mg_cstr("Content-Length: "))
+    p = cstr_append(out, p, cstr_from_int(blen))
+    p = cstr_append(out, p, mg_cstr("\r\n"))
+    // "Connection: close\r\n\r\n"
+    p = cstr_append(out, p, mg_cstr("Connection: close\r\n\r\n"))
+    // body
+    p = cstr_append(out, p, body)
+    p = cstr_append(out, p, mg_cstr("\r\n"))
+    Wenn p > cap dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck p
+Ende
+
+// 状态码文本（返回 C 字符串）
+Funktion mg_http_status_text(code)
+    Wenn code == 200 dann
+        gebe_zurueck mg_cstr("OK")
+    Ende
+    Wenn code == 404 dann
+        gebe_zurueck mg_cstr("Not Found")
+    Ende
+    Wenn code == 400 dann
+        gebe_zurueck mg_cstr("Bad Request")
+    Ende
+    Wenn code == 500 dann
+        gebe_zurueck mg_cstr("Internal Server Error")
+    Ende
+    Wenn code == 405 dann
+        gebe_zurueck mg_cstr("Method Not Allowed")
+    Ende
+    gebe_zurueck mg_cstr("OK")
+Ende

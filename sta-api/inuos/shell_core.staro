@@ -1,0 +1,314 @@
+// shell_core.staro - StarShell v2.0 核心模块
+// 零内建函数，全部使用 Windows API + 运行时原语
+// 可用: alloc, raw_setbyte, raw_byteat, linx-o
+// 不可用: Ausgeben, i2s, byteat, liste_launge, as_str
+
+linx-o kernel32 GetStdHandle WriteFile GetCommandLineA
+
+// ============ 控制台输出 ============
+
+// 获取 stdout 句柄
+Funktion get_stdout()
+    h = GetStdHandle(-11)
+    gebe_zurueck h
+Ende
+
+// ============ 字符串操作 ============
+
+// 字符串长度 (StarC 字符串)
+Funktion str_len(str)
+    i = 0
+    Solange raw_byteat(str, 8 + i) != 0
+        i = i + 1
+    Ende
+   gebe_zurueck i
+Ende
+
+// 字符串字符访问
+Funktion str_at(str, pos)
+    ch = raw_byteat(str, 8 + pos)
+   gebe_zurueck ch
+Ende
+
+// 写字符串到 stdout
+Funktion write_str(str)
+    len = str_len(str)
+    h = get_stdout()
+    WriteFile(h, str + 8, len, 0, 0)
+   gebe_zurueck 0
+Ende
+
+// 写换行
+Funktion write_newline()
+    write_str("\n")
+   gebe_zurueck 0
+Ende
+
+// 字符串比较 (StarC 字符串)
+Funktion str_eq(s1, s2)
+    len1 = str_len(s1)
+    len2 = str_len(s2)
+    Wenn len1 != len2 dann
+        gebe_zurueck 0
+    Ende
+    Wenn len1 == 0 dann
+       gebe_zurueck 1
+    Ende
+    i = 0
+    Solange i < len1
+        Wenn str_at(s1, i) != str_at(s2, i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 比较 C 字符串子串与 StarC 字符串
+Funktion str_eq_at(cstr, pos, starc_str)
+    len = str_len(starc_str)
+    i = 0
+    Solange i < len
+        Wenn raw_byteat(cstr, pos + i) != str_at(starc_str, i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    next_char = raw_byteat(cstr, pos + len)
+    Wenn next_char != 32 dann
+        Wenn next_char != 0 dann
+            gebe_zurueck 0
+        Ende
+    Ende
+   gebe_zurueck 1
+Ende
+
+// ============ 命令行 ============
+
+// 获取命令行 (C 字符串指针)
+Funktion get_cmdline_cstr()
+    cmd = GetCommandLineA()
+   gebe_zurueck cmd
+Ende
+
+// 从 C 字符串提取参数 (返回 StarC 字符串)
+Funktion extract_arg(cstr, start)
+    // 跳过空格
+    Solange raw_byteat(cstr, start) == 32
+        start = start + 1
+    Ende
+    
+    // 找到结束位置
+    end = start
+    end_found = 0
+    ch = raw_byteat(cstr, end)
+    Solange end_found == 0
+        Wenn ch == 32 dann
+            end_found = 1
+        Sonst
+            Wenn ch == 0 dann
+                end_found = 1
+            Sonst
+                end = end + 1
+                ch = raw_byteat(cstr, end)
+            Ende
+        Ende
+    Ende
+    
+    len = end - start
+    
+    // 分配缓冲区
+    buf = alloc(8 + len + 1)
+    
+    // 写入长度头
+    raw_setbyte(buf, 0, len % 256)
+    raw_setbyte(buf, 1, (len / 256) % 256)
+    raw_setbyte(buf, 2, (len / 65536) % 256)
+    raw_setbyte(buf, 3, (len / 16777216) % 256)
+    raw_setbyte(buf, 4, 0)
+    raw_setbyte(buf, 5, 0)
+    raw_setbyte(buf, 6, 0)
+    raw_setbyte(buf, 7, 0)
+    
+    // 复制数据
+    i = 0
+    Solange i < len
+        raw_setbyte(buf, 8 + i, raw_byteat(cstr, start + i))
+        i = i + 1
+    Ende
+    
+    // 空终止符
+    raw_setbyte(buf, 8 + len, 0)
+    
+   gebe_zurueck buf
+Ende
+
+// 复制 C 字符串到 StarC 字符串
+Funktion cstr_to_starc(cstr)
+    len = 0
+    Solange raw_byteat(cstr, len) != 0
+        len = len + 1
+    Ende
+    
+    buf = alloc(8 + len + 1)
+    raw_setbyte(buf, 0, len % 256)
+    raw_setbyte(buf, 1, (len / 256) % 256)
+    raw_setbyte(buf, 2, (len / 65536) % 256)
+    raw_setbyte(buf, 3, (len / 16777216) % 256)
+    raw_setbyte(buf, 4, 0)
+    raw_setbyte(buf, 5, 0)
+    raw_setbyte(buf, 6, 0)
+    raw_setbyte(buf, 7, 0)
+    
+    i = 0
+    Solange i < len
+        raw_setbyte(buf, 8 + i, raw_byteat(cstr, i))
+        i = i + 1
+    Ende
+    
+    raw_setbyte(buf, 8 + len, 0)
+    
+   gebe_zurueck buf
+Ende
+
+// 拼接两个 C 字符串 (返回 C 字符串指针)
+Funktion concat_cstr(s1, s2)
+    len1 = 0
+    Solange raw_byteat(s1, len1) != 0
+        len1 = len1 + 1
+    Ende
+    
+    len2 = 0
+    Solange raw_byteat(s2, len2) != 0
+        len2 = len2 + 1
+    Ende
+    
+    buf = alloc(len1 + len2 + 1)
+    
+    i = 0
+    Solange i < len1
+        raw_setbyte(buf, i, raw_byteat(s1, i))
+        i = i + 1
+    Ende
+    
+    j = 0
+    Solange j < len2
+        raw_setbyte(buf, len1 + j, raw_byteat(s2, j))
+        j = j + 1
+    Ende
+    
+    raw_setbyte(buf, len1 + len2, 0)
+    
+   gebe_zurueck buf
+Ende
+
+// 拼接 StarC 字符串 + C 字符串 (返回 C 字符串指针)
+Funktion concat_starc_cstr(starc_str, cstr)
+    // 将 StarC 字符串转换为 C 字符串格式
+    len1 = str_len(starc_str)
+    len2 = 0
+    Solange raw_byteat(cstr, len2) != 0
+        len2 = len2 + 1
+    Ende
+    
+    buf = alloc(len1 + len2 + 1)
+    
+    i = 0
+    Solange i < len1
+        raw_setbyte(buf, i, str_at(starc_str, i))
+        i = i + 1
+    Ende
+    
+    j = 0
+    Solange j < len2
+        raw_setbyte(buf, len1 + j, raw_byteat(cstr, j))
+        j = j + 1
+    Ende
+    
+    raw_setbyte(buf, len1 + len2, 0)
+    
+   gebe_zurueck buf
+Ende
+
+// 整数转字符串 (StarC 字符串)
+Funktion int_to_str(num)
+    Wenn num == 0 dann
+        buf = alloc(11)
+        raw_setbyte(buf, 0, 1)
+        raw_setbyte(buf, 1, 0)
+        raw_setbyte(buf, 2, 0)
+        raw_setbyte(buf, 3, 0)
+        raw_setbyte(buf, 4, 0)
+        raw_setbyte(buf, 5, 0)
+        raw_setbyte(buf, 6, 0)
+        raw_setbyte(buf, 7, 0)
+        raw_setbyte(buf, 8, 48)
+        raw_setbyte(buf, 9, 0)
+        raw_setbyte(buf, 10, 0)
+        gebe_zurueck buf
+    Ende
+    
+    neg = 0
+    Wenn num < 0 dann
+        neg = 1
+        num = num * -1
+    Ende
+    
+    buf = alloc(30)
+    digits = alloc(20)
+    di = 0
+    
+    Solange num > 0
+        digit = num % 10
+        raw_setbyte(digits, di, digit)
+        di = di + 1
+        num = num / 10
+    Ende
+    
+    pos = 0
+    Wenn neg == 1 dann
+        raw_setbyte(buf, 8 + pos, 45)
+        pos = pos + 1
+    Ende
+    
+    i = di - 1
+    Solange i >= 0
+        ch = raw_byteat(digits, i) + 48
+        raw_setbyte(buf, 8 + pos, ch)
+        pos = pos + 1
+        i = i - 1
+    Ende
+    
+    raw_setbyte(buf, 0, pos % 256)
+    raw_setbyte(buf, 1, (pos / 256) % 256)
+    raw_setbyte(buf, 2, (pos / 65536) % 256)
+    raw_setbyte(buf, 3, (pos / 16777216) % 256)
+    raw_setbyte(buf, 4, 0)
+    raw_setbyte(buf, 5, 0)
+    raw_setbyte(buf, 6, 0)
+    raw_setbyte(buf, 7, 0)
+    
+    raw_setbyte(buf, 8 + pos, 0)
+    
+   gebe_zurueck buf
+Ende
+
+// 写整数到 stdout
+Funktion write_int(num)
+    s = int_to_str(num)
+    write_str(s)
+   gebe_zurueck 0
+Ende
+
+// 转换为 C 字符串 (返回 C 字符串指针)
+Funktion starc_to_cstr(starc_str)
+    len = str_len(starc_str)
+    buf = alloc(len + 1)
+    i = 0
+    Solange i < len
+        raw_setbyte(buf, i, str_at(starc_str, i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, len, 0)
+   gebe_zurueck buf
+Ende

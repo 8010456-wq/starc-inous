@@ -1,0 +1,26 @@
+// open_dir.staro - 打开目录函数实现
+// 使用 StarC 语法，通过 linx-o 调用 Windows API
+
+linx-o kernel32 FindFirstFileA FindNextFileA FindClose
+
+// 内部状态：存储当前查找句柄
+// 使用全局变量模拟状态（StarC 不支持全局变量，这里用参数传递）
+
+// open_dir(path) - 打开目录，返回查找句柄
+// 参数：path - 目录路径字符串
+// 返回：句柄（0 表示失败）
+Funktion open_dir(path)
+    // 需要 WIN32_FIND_DATAA 结构体
+    // 使用 alloc 分配内存
+    find_data = alloc(460)  // WIN32_FIND_DATAA 大小约 460 字节
+    
+    // 调用 FindFirstFileA
+    handle = FindFirstFileA(path, find_data)
+    
+    // 如果句柄无效，返回 0
+    Wenn handle == -1 dann
+        gebe_zurueck 0
+    Sonst
+        gebe_zurueck handle
+    Ende
+Ende

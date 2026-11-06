@@ -1,0 +1,330 @@
+// ============================================================================
+//  SUT1 :: inuos/net.staro —— 网络核心库（Winsock 封装）
+//  仅依赖 kernel32 / msvcrt / ws2_32（自研，零第三方）
+//  参照 yuyao/00_core.starc 与 moue-http/net.starc 的已验证写法
+// ============================================================================
+
+linx "ws2_32.dll!WSAStartup"
+linx "ws2_32.dll!WSACleanup"
+linx "ws2_32.dll!socket"
+linx "ws2_32.dll!bind"
+linx "ws2_32.dll!listen"
+linx "ws2_32.dll!accept"
+linx "ws2_32.dll!connect"
+linx "ws2_32.dll!recv"
+linx "ws2_32.dll!send"
+linx "ws2_32.dll!closesocket"
+linx "ws2_32.dll!setsockopt"
+linx "ws2_32.dll!inet_addr"
+linx "ws2_32.dll!WSAGetLastError"
+
+linx "kernel32.dll!GetProcessHeap"
+linx "kernel32.dll!HeapAlloc"
+linx "kernel32.dll!HeapFree"
+
+linx "msvcrt.dll!memset"
+linx "msvcrt.dll!memcpy"
+linx "msvcrt.dll!strlen"
+
+// 常量一律用字面量（starcc v1.1 不支持 Konstant 关键字，参照 yuyao）
+
+// ---------------- 基础 ----------------
+
+Funktion sut_wsa()
+    wsa = HeapAlloc(GetProcessHeap(), 0, 512)
+    memset(wsa, 0, 512)
+    r = WSAStartup(514, wsa)
+    HeapFree(GetProcessHeap(), 0, wsa)
+    gebe_zurueck r
+Ende
+
+Funktion sut_cleanup()
+    WSACleanup()
+    gebe_zurueck 0
+Ende
+
+Funktion sut_err()
+    gebe_zurueck WSAGetLastError()
+Ende
+
+// ---------------- 服务端 ----------------
+
+// 创建并绑定监听 socket；port 为十进制端口。返回 srv（<0 失败）
+Funktion sut_listen(port)
+    h = GetProcessHeap()
+    srv = socket(2, 1, 6)
+    Wenn srv < 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    addr = HeapAlloc(h, 0, 16)
+    memset(addr, 0, 16)
+    memset(addr, 2, 1)                  // AF_INET
+    hi = port / 256
+    lo = port - hi * 256
+    memset(addr + 2, hi, 1)             // port 高字节（网络序）
+    memset(addr + 3, lo, 1)             // port 低字节
+    // 字节 4-7 = 0.0.0.0（绑全网卡）
+    r = bind(srv, addr, 16)
+    HeapFree(h, 0, addr)
+    Wenn r != 0 dann
+        closesocket(srv)
+        gebe_zurueck 0 - 2
+    Ende
+    r = listen(srv, 32)
+    Wenn r != 0 dann
+        closesocket(srv)
+        gebe_zurueck 0 - 3
+    Ende
+    gebe_zurueck srv
+Ende
+
+Funktion sut_accept(srv)
+    c = accept(srv, 0, 0)
+    gebe_zurueck c
+Ende
+
+// ---------------- 客户端 ----------------
+
+// 连接 ip:port；ip 为点分十进制字符串（如 "125.25.71.69"）。返回 s（<0 失败）
+Funktion sut_connect(ip, port)
+    h = GetProcessHeap()
+    addr = HeapAlloc(h, 0, 16)
+    memset(addr, 0, 16)
+    memset(addr, 2, 1)
+    hi = port / 256
+    lo = port - hi * 256
+    memset(addr + 2, hi, 1)
+    memset(addr + 3, lo, 1)
+    ok = ipv4_set(addr, ip)
+    Wenn ok != 1 dann
+        HeapFree(h, 0, addr)
+        gebe_zurueck 0 - 1
+    Ende
+    s = socket(2, 1, 6)
+    Wenn s < 0 dann
+        HeapFree(h, 0, addr)
+        gebe_zurueck 0 - 2
+    Ende
+    r = connect(s, addr, 16)
+    HeapFree(h, 0, addr)
+    Wenn r != 0 dann
+        closesocket(s)
+        gebe_zurueck 0 - 3
+    Ende
+    gebe_zurueck s
+Ende
+
+// 把点分十进制 IP 解析进 addr 缓冲的字节 4-7（网络序）。返回 1 成功 / 0 失败
+Funktion ipv4_set(addr, ip)
+    i = 0
+    n = strlen(cstr(ip))
+    Wenn n < 7 dann
+        gebe_zurueck 0
+    Ende
+    pos = 0
+    oct = 0
+    val = 0
+    Solange pos <= n
+        // 结束条件：到串尾
+        EndeLoop = 0
+        Wenn pos == n dann
+            EndeLoop = 1
+        Ende
+        c = 0
+        Wenn EndeLoop == 0 dann
+            c = byteat(ip, pos)
+        Ende
+        Wenn EndeLoop == 1 oder c == 46 dann     // '.' = 46
+            Wenn oct > 3 dann
+                gebe_zurueck 0
+            Ende
+            Wenn val > 255 dann
+                gebe_zurueck 0
+            Ende
+            memset(addr + 4 + oct, val, 1)
+            oct = oct + 1
+            val = 0
+            Wenn oct == 4 dann
+                Wenn EndeLoop == 1 dann
+                    gebe_zurueck 1
+                Sonst
+                    gebe_zurueck 0
+                Ende
+            Ende
+        Sonst
+            Wenn c >= 48 und c <= 57 dann
+                val = val * 10 + (c - 48)
+            Sonst
+                gebe_zurueck 0
+            Ende
+        Ende
+        pos = pos + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------------- 收发 ----------------
+
+Funktion sut_recv(s, buf, max)
+    n = recv(s, buf, max, 0)
+    gebe_zurueck n
+Ende
+
+Funktion sut_send(s, ptr, len)
+    n = send(s, ptr, len, 0)
+    gebe_zurueck n
+Ende
+
+Funktion sut_close(s)
+    Wenn s >= 0 dann
+        closesocket(s)
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 设置收发超时（毫秒）；timeout 为整数毫秒
+Funktion sut_timeout(s, ms)
+    tv = HeapAlloc(GetProcessHeap(), 0, 8)
+    memset(tv, 0, 8)
+    lo = ms
+    hi = ms / 256
+    memset(tv, lo % 256, 1)
+    memset(tv + 1, (lo / 256) % 256, 1)
+    memset(tv + 2, (lo / 65536) % 256, 1)
+    memset(tv + 3, (lo / 16777216) % 256, 1)
+    memset(tv + 4, hi % 256, 1)
+    memset(tv + 5, (hi / 256) % 256, 1)
+    memset(tv + 6, (hi / 65536) % 256, 1)
+    memset(tv + 7, (hi / 16777216) % 256, 1)
+    r1 = setsockopt(s, 65535, 8198, tv, 8)
+    r2 = setsockopt(s, 65535, 8199, tv, 8)
+    HeapFree(GetProcessHeap(), 0, tv)
+    Wenn r1 != 0 oder r2 != 0 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 读完整一帧：[4字节大端长度][负载]。buf 为 raw 缓冲，cap 为容量。
+// 返回负载长度（>=0）；0=连接关闭；-1=超时；-2=错误/超容
+Funktion sut_recv_frame(s, buf, cap)
+    n = recv(s, buf, 4, 0)
+    Wenn n == 0 dann
+        gebe_zurueck 0
+    Ende
+    Wenn n < 0 dann
+        e = WSAGetLastError()
+        Wenn e == 10060 dann
+            gebe_zurueck 0 - 1
+        Ende
+        gebe_zurueck 0 - 2
+    Ende
+    Wenn n < 4 dann
+        gebe_zurueck 0 - 2
+    Ende
+    // 长度 = 4 字节大端
+    len = 0
+    len = byteat_raw(buf, 0) * 16777216 + byteat_raw(buf, 1) * 65536 + byteat_raw(buf, 2) * 256 + byteat_raw(buf, 3)
+    Wenn len < 0 dann
+        len = 0
+    Ende
+    Wenn len > cap dann
+        gebe_zurueck 0 - 2
+    Ende
+    got = 0
+    Solange got < len
+        r = recv(s, buf + got, len - got, 0)
+        Wenn r == 0 dann
+            gebe_zurueck 0
+        Ende
+        Wenn r < 0 dann
+            e = WSAGetLastError()
+            Wenn e == 10060 dann
+                gebe_zurueck 0 - 1
+            Ende
+            gebe_zurueck 0 - 2
+        Ende
+        got = got + r
+    Ende
+    gebe_zurueck len
+Ende
+
+// 写完整一帧：[4字节大端长度][负载]。返回 1 成功 / 0 失败
+Funktion sut_send_frame(s, ptr, len)
+    hd = HeapAlloc(GetProcessHeap(), 0, 4)
+    memset(hd, 0, 4)
+    memset(hd, (len / 16777216) % 256, 1)
+    memset(hd + 1, (len / 65536) % 256, 1)
+    memset(hd + 2, (len / 256) % 256, 1)
+    memset(hd + 3, len % 256, 1)
+    r = send(s, hd, 4, 0)
+    Wenn r != 4 dann
+        HeapFree(GetProcessHeap(), 0, hd)
+        gebe_zurueck 0
+    Ende
+    HeapFree(GetProcessHeap(), 0, hd)
+    sent = 0
+    Solange sent < len
+        r = send(s, ptr + sent, len - sent, 0)
+        Wenn r <= 0 dann
+            gebe_zurueck 0
+        Ende
+        sent = sent + r
+    Ende
+    gebe_zurueck 1
+Ende
+
+// raw 缓冲取字节（用于帧头解析）—— raw_byteat 读原始偏移
+Funktion byteat_raw(p, i)
+    gebe_zurueck raw_byteat(p, i)
+Ende
+
+// ---------------- 双向中继（SO_RCVTIMEO 交替轮询） ----------------
+// 网关与客户端共用。c、t 两个 socket 互相转发，直到任一方关闭/出错。
+Funktion sut_relay(c, t)
+    h = GetProcessHeap()
+    cbuf = HeapAlloc(h, 0, 65536)
+    tbuf = HeapAlloc(h, 0, 65536)
+    sut_timeout(c, 30)
+    sut_timeout(t, 30)
+    dauer = 1
+    Solange dauer == 1
+        n = recv(c, cbuf, 65536, 0)
+        Wenn n > 0 dann
+            r = send(t, cbuf, n, 0)
+            Wenn r != n dann
+                dauer = 0
+            Ende
+        Ende
+        Wenn n == 0 dann
+            dauer = 0
+        Ende
+        Wenn n < 0 dann
+            e = WSAGetLastError()
+            Wenn e != 10060 dann
+                dauer = 0
+            Ende
+        Ende
+        Wenn dauer == 1 dann
+            m = recv(t, tbuf, 65536, 0)
+            Wenn m > 0 dann
+                r = send(c, tbuf, m, 0)
+                Wenn r != m dann
+                    dauer = 0
+                Ende
+            Ende
+            Wenn m == 0 dann
+                dauer = 0
+            Ende
+            Wenn m < 0 dann
+                e = WSAGetLastError()
+                Wenn e != 10060 dann
+                    dauer = 0
+                Ende
+            Ende
+        Ende
+    Ende
+    HeapFree(h, 0, cbuf)
+    HeapFree(h, 0, tbuf)
+    gebe_zurueck 0
+Ende

@@ -1,0 +1,72 @@
+// inuos/kernel.staro - 最小 kernel32 绑定
+linx "kernel32.dll!GetTickCount"
+linx "kernel32.dll!GetSystemTimeAsFileTime"
+Funktion kernel_tick()
+    t = GetTickCount()
+    gebe_zurueck t
+Ende
+
+// 对照: 带指针参数函数, 缓冲预填已知模式, 读回判断函数是否写入
+Funktion kernel_stft()
+    ft = alloc(8)
+    raw_set32(ft, 0, 286331153)  // 0x11111111
+    raw_set32(ft, 4, 572662306)  // 0x22222222
+    GetSystemTimeAsFileTime(ft)
+    v0 = raw_get32(ft, 0)
+    gebe_zurueck v0
+Ende
+
+// 对照: 单指针参数 + 32位返回 (GetFileAttributesA)
+linx "kernel32.dll!GetFileAttributesA"
+Funktion kernel_fattrs()
+    // "C:\" 原始缓冲 (无长度头, C 字符串)
+    p = alloc(4)
+    raw_setbyte(p, 0, 67)   // 'C'
+    raw_setbyte(p, 1, 58)   // ':'
+    raw_setbyte(p, 2, 92)   // '\'
+    raw_setbyte(p, 3, 0)    // null
+    v = GetFileAttributesA(p)
+    gebe_zurueck v
+Ende
+
+// linx-o 语法绑定同一函数, 测试是否规避 linx bug
+linx-o kernel32 GetFileAttributesA
+Funktion kernel_fattrs_o()
+    p = alloc(4)
+    raw_setbyte(p, 0, 67)   // 'C'
+    raw_setbyte(p, 1, 58)   // ':'
+    raw_setbyte(p, 2, 92)   // '\'
+    raw_setbyte(p, 3, 0)    // null
+    v = GetFileAttributesA(p)
+    gebe_zurueck v
+Ende
+
+// 绕开bug: 多传一个哑参数 (DLL 只读第1个, StarC 走多参数路径)
+Funktion kernel_fattrs_2()
+    p = alloc(4)
+    raw_setbyte(p, 0, 67)   // 'C'
+    raw_setbyte(p, 1, 58)   // ':'
+    raw_setbyte(p, 2, 92)   // '\'
+    raw_setbyte(p, 3, 0)    // null
+    v = GetFileAttributesA(p, 0)
+    gebe_zurueck v
+Ende
+
+// 测试套件: 0参数+int返回
+linx "kernel32.dll!GetCurrentProcessId"
+Funktion kernel_pid()
+    p = GetCurrentProcessId()
+    gebe_zurueck p
+Ende
+
+// 测试套件: 2参数(int+指针)+int返回
+linx "kernel32.dll!GetTempPathA"
+Funktion kernel_tmp()
+    buf = alloc(300)
+    n = GetTempPathA(300, buf)
+    // 检查副作用: buf[0] 是否被写成 'C'(67) 或路径首字符
+    c0 = raw_byteat(buf, 0)
+    c1 = raw_byteat(buf, 1)
+    // 返回 首字符 和 长度 编码: 返回 c0 为主
+    gebe_zurueck c0
+Ende

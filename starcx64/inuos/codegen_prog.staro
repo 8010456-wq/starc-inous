@@ -1,0 +1,622 @@
+// inuos/codegen_prog.staro - 内核 DSL AST -> PTX (多参数/循环/数组访存/线程索引/整数运算)
+// 依赖: emit.staro(emit_str/emit_int), sys.staro(raw_get32), codegen_ptx.staro(ptx_emit_reg/ptx_nl/ptx_instr/ptx_line)
+//
+// 寄存器约定 (内核内):
+//   %f0..%f15   浮点表达式临时   %r0..%r15  整数表达式临时   %rd0..%rd15 地址/基址临时
+//   %f16+       浮点变量        %r16+      整数变量        %rd16+      数组基址(参数)
+//   %p0         谓词 (比较/分支)
+//   %rd15       返回值输出指针 (ret/print, param_count==0 时 = out)
+//
+// 参数: param_count>0 -> .param .u64 p{j}(数组) / .param .u32 p{j}(int), j 按签名顺序
+//       param_count==0 -> .param .u64 out (兼容标量)
+//
+// codegen_prog(name, ast, ast_count, frpn, irpn, sym_count, out, off) -> 新 off
+
+// ---- 寄存器/标签发射原语 ----
+
+Funktion ptx_emit_rreg(out, off, reg)  // %r{reg}
+    off = emit_str(out, off, "%r")
+    off = emit_int(out, off, reg)
+    gebe_zurueck off
+Ende
+
+Funktion ptx_emit_rdreg(out, off, reg)  // %rd{reg}
+    off = emit_str(out, off, "%rd")
+    off = emit_int(out, off, reg)
+    gebe_zurueck off
+Ende
+
+Funktion ptx_label(out, off, idx)  // $L{idx}:
+    off = emit_str(out, off, "$L")
+    off = emit_int(out, off, idx)
+    off = emit_str(out, off, ":")
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+Funktion ptx_label_s(out, off, idx, sfx)  // $L{idx}{sfx}:
+    off = emit_str(out, off, "$L")
+    off = emit_int(out, off, idx)
+    off = emit_str(out, off, sfx)
+    off = emit_str(out, off, ":")
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+Funktion ptx_bra_s(out, off, idx, sfx)  // bra $L{idx}{sfx};
+    off = emit_str(out, off, "bra $L")
+    off = emit_int(out, off, idx)
+    off = emit_str(out, off, sfx)
+    off = emit_str(out, off, ";")
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+Funktion ptx_bra_pred_s(out, off, idx, sfx)  // @%p0 bra $L{idx}{sfx};
+    off = emit_str(out, off, "@%p0 bra $L")
+    off = emit_int(out, off, idx)
+    off = emit_str(out, off, sfx)
+    off = emit_str(out, off, ";")
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+// 发射 PTX 十六进制浮点字面量 0f{8位hex} (fp32 位模式, 无符号除法安全)
+Funktion ptx_emit_f32hex(out, off, bits)
+    off = emit_str(out, off, "0f")
+    shift = 28
+    k = 0
+    Solange k < 8
+        nb = bits / p2(shift)
+        nb = nb - (nb / 16) * 16
+        Wenn nb < 10 dann
+            raw_setbyte(out, off, 48 + nb)
+        Sonst
+            raw_setbyte(out, off, 55 + nb)
+        Ende
+        off = off + 1
+        shift = shift - 4
+        k = k + 1
+    Ende
+    gebe_zurueck off
+Ende
+
+// ---- 寄存器声明 ----
+
+Funktion codegen_reg_decl(out, off, reg)  // .reg .f32 %f{reg};
+    off = emit_str(out, off, ".reg .f32 %f")
+    off = emit_int(out, off, reg)
+    off = emit_str(out, off, ";")
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+Funktion codegen_rreg_decl(out, off, reg)  // .reg .u32 %r{reg};
+    off = emit_str(out, off, ".reg .u32 %r")
+    off = emit_int(out, off, reg)
+    off = emit_str(out, off, ";")
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+Funktion codegen_rdreg_decl(out, off, reg)  // .reg .u64 %rd{reg};
+    off = emit_str(out, off, ".reg .u64 %rd")
+    off = emit_int(out, off, reg)
+    off = emit_str(out, off, ";")
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+// ---- 浮点 RPN -> PTX (结果 %f0), 支持数组装载 ----
+
+Funktion codegen_float_rpn_at(frpn, irpn, start, len, out, off)
+    sp = 0
+    i = 0
+    Solange i < len
+        item = (start + i) * 16
+        t = raw_get32(frpn, item)
+        Wenn t == 1 dann  // 数字 (fp32 位模式)
+            off = emit_str(out, off, "mov.f32 ")
+            off = ptx_emit_reg(out, off, sp)
+            off = emit_str(out, off, ", ")
+            off = ptx_emit_f32hex(out, off, raw_get32(frpn, item + 4))
+            off = emit_str(out, off, ";")
+            off = ptx_nl(out, off)
+            sp = sp + 1
+        Sonst
+            Wenn t == 2 dann  // 浮点变量
+                off = emit_str(out, off, "mov.f32 ")
+                off = ptx_emit_reg(out, off, sp)
+                off = emit_str(out, off, ", %f")
+                off = emit_int(out, off, raw_get32(frpn, item + 4))
+                off = emit_str(out, off, ";")
+                off = ptx_nl(out, off)
+                sp = sp + 1
+            Sonst
+                Wenn t == 5 dann  // 数组装载 A[idx]
+                    arrreg = raw_get32(frpn, item + 4)
+                    idx_start = raw_get32(frpn, item + 8)
+                    idx_len = raw_get32(frpn, item + 12)
+                    off = codegen_addr(irpn, idx_start, idx_len, arrreg, out, off)
+                    off = emit_str(out, off, "ld.global.f32 ")
+                    off = ptx_emit_reg(out, off, sp)
+                    off = emit_str(out, off, ", [%rd0];")
+                    off = ptx_nl(out, off)
+                    sp = sp + 1
+                Sonst
+                    Wenn t == 7 dann  // relu(x): max.f32 %f{sp-1}, %f{sp-1}, 0.0 (原地, 参数在栈顶)
+                        off = emit_str(out, off, "max.f32 ")
+                        off = ptx_emit_reg(out, off, sp - 1)
+                        off = emit_str(out, off, ", ")
+                        off = ptx_emit_reg(out, off, sp - 1)
+                        off = emit_str(out, off, ", 0.0;")
+                        off = ptx_nl(out, off)
+                    Sonst
+                        Wenn t == 8 dann  // exp(x): %f{sp-1} *= log2e; ex2.approx.f32 (2^(x*log2e)=e^x)
+                            off = emit_str(out, off, "mul.f32 ")
+                            off = ptx_emit_reg(out, off, sp - 1)
+                            off = emit_str(out, off, ", ")
+                            off = ptx_emit_reg(out, off, sp - 1)
+                            off = emit_str(out, off, ", 0f3FB8AA3B;")  // log2(e)=1.4426950408889634
+                            off = ptx_nl(out, off)
+                            off = emit_str(out, off, "ex2.approx.f32 ")
+                            off = ptx_emit_reg(out, off, sp - 1)
+                            off = emit_str(out, off, ", ")
+                            off = ptx_emit_reg(out, off, sp - 1)
+                            off = emit_str(out, off, ";")
+                            off = ptx_nl(out, off)
+                        Sonst
+                            Wenn t == 9 dann  // pos(x): x>0 ? 1.0 : 0.0 (relu 导数, 输出位模式)
+                                off = emit_str(out, off, "setp.gt.f32 %p0, ")
+                                off = ptx_emit_reg(out, off, sp - 1)
+                                off = emit_str(out, off, ", 0f00000000;")
+                                off = ptx_nl(out, off)
+                                off = emit_str(out, off, "selp.f32 ")
+                                off = ptx_emit_reg(out, off, sp - 1)
+                                off = emit_str(out, off, ", 0f3F800000, 0f00000000, %p0;")
+                                off = ptx_nl(out, off)
+                Sonst
+                    Wenn t == 10 dann  // sqrt(x): sqrt.rn.f32 %f{sp-1}, %f{sp-1} (原地, 参数在栈顶)
+                        off = emit_str(out, off, "sqrt.rn.f32 ")
+                        off = ptx_emit_reg(out, off, sp - 1)
+                        off = emit_str(out, off, ", ")
+                        off = ptx_emit_reg(out, off, sp - 1)
+                        off = emit_str(out, off, ";")
+                        off = ptx_nl(out, off)
+                    Sonst
+                        Wenn t == 4 dann  // 浮点运算符
+                        sp = sp - 2
+                        c = raw_get32(frpn, item + 4)
+                        Wenn c == 43 dann
+                            off = emit_str(out, off, "add.f32 ")
+                        Sonst
+                            Wenn c == 45 dann
+                                off = emit_str(out, off, "sub.f32 ")
+                            Sonst
+                                Wenn c == 42 dann
+                                    off = emit_str(out, off, "mul.f32 ")
+                                Sonst
+                                    Wenn c == 47 dann
+                                        off = emit_str(out, off, "div.rn.f32 ")
+                                    Ende
+                                Ende
+                            Ende
+                        Ende
+                        off = ptx_emit_reg(out, off, sp)
+                        off = emit_str(out, off, ", ")
+                        off = ptx_emit_reg(out, off, sp)
+                        off = emit_str(out, off, ", ")
+                        off = ptx_emit_reg(out, off, sp + 1)
+                        off = emit_str(out, off, ";")
+                        off = ptx_nl(out, off)
+                        sp = sp + 1
+                    Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+        Ende
+        Ende
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck off
+Ende
+
+// ---- 整数 RPN -> PTX (结果 %r0), 含内置线程索引与比较 ----
+
+Funktion codegen_int_rpn_at(irpn, start, len, out, off)
+    sp = 0
+    i = 0
+    Solange i < len
+        item = (start + i) * 8
+        t = raw_get32(irpn, item)
+        Wenn t == 1 dann  // 整数常量
+            off = emit_str(out, off, "mov.u32 ")
+            off = ptx_emit_rreg(out, off, sp)
+            off = emit_str(out, off, ", ")
+            off = emit_int(out, off, raw_get32(irpn, item + 4))
+            off = emit_str(out, off, ";")
+            off = ptx_nl(out, off)
+            sp = sp + 1
+        Sonst
+            Wenn t == 2 dann  // 整数变量
+                off = emit_str(out, off, "mov.u32 ")
+                off = ptx_emit_rreg(out, off, sp)
+                off = emit_str(out, off, ", %r")
+                off = emit_int(out, off, raw_get32(irpn, item + 4))
+                off = emit_str(out, off, ";")
+                off = ptx_nl(out, off)
+                sp = sp + 1
+            Sonst
+                Wenn t == 6 dann  // 线程索引内置
+                    bid = raw_get32(irpn, item + 4)
+                    off = emit_str(out, off, "mov.u32 ")
+                    off = ptx_emit_rreg(out, off, sp)
+                    off = emit_str(out, off, ", %")
+                    Wenn bid == 0 dann
+                        off = emit_str(out, off, "tid.x")
+                    Sonst
+                        Wenn bid == 1 dann
+                            off = emit_str(out, off, "tid.y")
+                        Sonst
+                            Wenn bid == 2 dann
+                                off = emit_str(out, off, "ctaid.x")
+                            Sonst
+                                Wenn bid == 3 dann
+                                    off = emit_str(out, off, "ctaid.y")
+                                Sonst
+                                    Wenn bid == 4 dann
+                                        off = emit_str(out, off, "ntid.x")
+                                    Sonst
+                                        Wenn bid == 5 dann
+                                            off = emit_str(out, off, "ntid.y")
+                                        Sonst
+                                            Wenn bid == 6 dann
+                                                off = emit_str(out, off, "tid.z")
+                                            Sonst
+                                                Wenn bid == 7 dann
+                                                    off = emit_str(out, off, "ctaid.z")
+                                                Sonst
+                                                    off = emit_str(out, off, "ntid.z")
+                                                Ende
+                                            Ende
+                                        Ende
+                                    Ende
+                                Ende
+                            Ende
+                        Ende
+                    Ende
+                    off = emit_str(out, off, ";")
+                    off = ptx_nl(out, off)
+                    sp = sp + 1
+                Sonst
+                    Wenn t == 4 dann  // 整数运算符
+                        sp = sp - 2
+                        c = raw_get32(irpn, item + 4)
+                        Wenn c == 43 dann  // +
+                            off = emit_str(out, off, "add.u32 ")
+                            off = ptx_emit_rreg(out, off, sp)
+                            off = emit_str(out, off, ", ")
+                            off = ptx_emit_rreg(out, off, sp)
+                            off = emit_str(out, off, ", ")
+                            off = ptx_emit_rreg(out, off, sp + 1)
+                            off = emit_str(out, off, ";")
+                            off = ptx_nl(out, off)
+                            sp = sp + 1
+                        Sonst
+                            Wenn c == 45 dann  // -
+                                off = emit_str(out, off, "sub.u32 ")
+                                off = ptx_emit_rreg(out, off, sp)
+                                off = emit_str(out, off, ", ")
+                                off = ptx_emit_rreg(out, off, sp)
+                                off = emit_str(out, off, ", ")
+                                off = ptx_emit_rreg(out, off, sp + 1)
+                                off = emit_str(out, off, ";")
+                                off = ptx_nl(out, off)
+                                sp = sp + 1
+                            Sonst
+                                Wenn c == 42 dann  // *
+                                    off = emit_str(out, off, "mul.lo.u32 ")
+                                    off = ptx_emit_rreg(out, off, sp)
+                                    off = emit_str(out, off, ", ")
+                                    off = ptx_emit_rreg(out, off, sp)
+                                    off = emit_str(out, off, ", ")
+                                    off = ptx_emit_rreg(out, off, sp + 1)
+                                    off = emit_str(out, off, ";")
+                                    off = ptx_nl(out, off)
+                                    sp = sp + 1
+                                Sonst
+                                    Wenn c == 47 dann  // /
+                                        off = emit_str(out, off, "div.u32 ")
+                                        off = ptx_emit_rreg(out, off, sp)
+                                        off = emit_str(out, off, ", ")
+                                        off = ptx_emit_rreg(out, off, sp)
+                                        off = emit_str(out, off, ", ")
+                                        off = ptx_emit_rreg(out, off, sp + 1)
+                                        off = emit_str(out, off, ";")
+                                        off = ptx_nl(out, off)
+                                        sp = sp + 1
+                                    Sonst
+                                        Wenn c == 0 dann  // und (逻辑与, 0/1)
+                                            off = emit_str(out, off, "and.b32 ")
+                                            off = ptx_emit_rreg(out, off, sp)
+                                            off = emit_str(out, off, ", ")
+                                            off = ptx_emit_rreg(out, off, sp)
+                                            off = emit_str(out, off, ", ")
+                                            off = ptx_emit_rreg(out, off, sp + 1)
+                                            off = emit_str(out, off, ";")
+                                            off = ptx_nl(out, off)
+                                            sp = sp + 1
+                                        Sonst
+                                            // 比较 < > <= >= ==
+                                            Wenn c == 60 dann  // <
+                                                off = emit_str(out, off, "setp.lt.s32 %p0, ")
+                                            Sonst
+                                                Wenn c == 61 dann  // ==
+                                                    off = emit_str(out, off, "setp.eq.s32 %p0, ")
+                                                Sonst
+                                                    Wenn c == 64 dann  // >=
+                                                        off = emit_str(out, off, "setp.ge.s32 %p0, ")
+                                                    Sonst
+                                                        Wenn c == 65 dann  // <=
+                                                            off = emit_str(out, off, "setp.le.s32 %p0, ")
+                                                        Sonst
+                                                            off = emit_str(out, off, "setp.gt.s32 %p0, ")  // >
+                                                        Ende
+                                                    Ende
+                                                Ende
+                                            Ende
+                                            off = ptx_emit_rreg(out, off, sp)
+                                            off = emit_str(out, off, ", ")
+                                            off = ptx_emit_rreg(out, off, sp + 1)
+                                            off = emit_str(out, off, ";")
+                                            off = ptx_nl(out, off)
+                                            off = emit_str(out, off, "selp.u32 ")
+                                            off = ptx_emit_rreg(out, off, sp)
+                                            off = emit_str(out, off, ", 1, 0, %p0;")
+                                            off = ptx_nl(out, off)
+                                            sp = sp + 1
+                                        Ende
+                                    Ende
+                                Ende
+                            Ende
+                        Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck off
+Ende
+
+// ---- 数组地址: %rd0 = %rd{arr_reg} + idx*4 (idx 由 irpn[start..start+len) 求值到 %r0) ----
+
+Funktion codegen_addr(irpn, start, len, arr_reg, out, off)
+    off = codegen_int_rpn_at(irpn, start, len, out, off)
+    off = emit_str(out, off, "mov.u32 %r15, 4;")
+    off = ptx_nl(out, off)
+    off = emit_str(out, off, "mul.wide.u32 %rd0, %r0, %r15;")
+    off = ptx_nl(out, off)
+    off = emit_str(out, off, "add.u64 %rd0, %rd")
+    off = emit_int(out, off, arr_reg)
+    off = emit_str(out, off, ", %rd0;")
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+// ---- 语句序列 -> PTX (递归, 支持嵌套循环) ----
+
+Funktion codegen_stmts(ast, start, count, frpn, irpn, out, off)
+    k = 0
+    Solange k < count
+        node = (start + k) * 32
+        st = raw_get32(ast, node)
+        Wenn st == 1 dann  // 浮点赋值
+            varid = raw_get32(ast, node + 4)
+            rpnoff = raw_get32(ast, node + 8)
+            rpn_len = raw_get32(ast, node + 12)
+            off = codegen_float_rpn_at(frpn, irpn, rpnoff, rpn_len, out, off)
+            off = emit_str(out, off, "mov.f32 %f")
+            off = emit_int(out, off, varid)
+            off = emit_str(out, off, ", %f0;")
+            off = ptx_nl(out, off)
+        Sonst
+            Wenn st == 2 dann  // 返回
+                rpnoff = raw_get32(ast, node + 8)
+                rpn_len = raw_get32(ast, node + 12)
+                off = codegen_float_rpn_at(frpn, irpn, rpnoff, rpn_len, out, off)
+                off = ptx_instr(out, off, "st.global.f32 [%rd15], %f0")
+                off = ptx_instr(out, off, "ret")
+            Sonst
+                Wenn st == 3 dann  // 输出
+                    rpnoff = raw_get32(ast, node + 8)
+                    rpn_len = raw_get32(ast, node + 12)
+                    off = codegen_float_rpn_at(frpn, irpn, rpnoff, rpn_len, out, off)
+                    off = ptx_instr(out, off, "st.global.f32 [%rd15], %f0")
+                Sonst
+                    Wenn st == 5 dann  // 整数赋值
+                        varid = raw_get32(ast, node + 4)
+                        rpnoff = raw_get32(ast, node + 8)
+                        rpn_len = raw_get32(ast, node + 12)
+                        off = codegen_int_rpn_at(irpn, rpnoff, rpn_len, out, off)
+                        off = emit_str(out, off, "mov.u32 %r")
+                        off = emit_int(out, off, varid)
+                        off = emit_str(out, off, ", %r0;")
+                        off = ptx_nl(out, off)
+                    Sonst
+                        Wenn st == 6 dann  // 数组存储
+                            arrreg = raw_get32(ast, node + 4)
+                            idx_start = raw_get32(ast, node + 8)
+                            idx_len = raw_get32(ast, node + 12)
+                            valoff = raw_get32(ast, node + 16)
+                            vlen = raw_get32(ast, node + 20)
+                            off = codegen_addr(irpn, idx_start, idx_len, arrreg, out, off)
+                            off = codegen_float_rpn_at(frpn, irpn, valoff, vlen, out, off)
+                            off = emit_str(out, off, "st.global.f32 [%rd0], %f0;")
+                            off = ptx_nl(out, off)
+                        Sonst
+                            Wenn st == 7 dann  // 循环
+                                cond_start = raw_get32(ast, node + 4)
+                                cond_len = raw_get32(ast, node + 8)
+                                body_start = raw_get32(ast, node + 12)
+                                body_count = raw_get32(ast, node + 16)
+                                l = start + k  // 标签索引 = 节点索引 (全局唯一)
+                                // $L{l}: (条件)
+                                off = ptx_label_s(out, off, l, "")
+                                off = codegen_int_rpn_at(irpn, cond_start, cond_len, out, off)
+                                off = ptx_instr(out, off, "setp.ne.s32 %p0, %r0, 0")
+                                off = ptx_bra_pred_s(out, off, l, "_b")  // 真 -> 循环体
+                                off = ptx_bra_s(out, off, l, "_e")        // 假 -> 退出
+                                // $L{l}_b: (循环体)
+                                off = ptx_label_s(out, off, l, "_b")
+                                off = codegen_stmts(ast, body_start, body_count, frpn, irpn, out, off)
+                                off = ptx_bra_s(out, off, l, "")          // 回到条件
+                                // $L{l}_e: (结束)
+                                off = ptx_label_s(out, off, l, "_e")
+                                k = k + body_count  // 跳过子节点 (前序, 父不重复迭代)
+                            Sonst
+                                Wenn st == 8 dann  // 条件 Wenn
+                                    cond_start = raw_get32(ast, node + 4)
+                                    cond_len = raw_get32(ast, node + 8)
+                                    then_start = raw_get32(ast, node + 12)
+                                    then_count = raw_get32(ast, node + 16)
+                                    else_start = raw_get32(ast, node + 20)
+                                    else_count = raw_get32(ast, node + 24)
+                                    l = start + k  // 标签索引 = 节点索引 (全局唯一)
+                                    // $L{l}: (条件)
+                                    off = ptx_label_s(out, off, l, "")
+                                    off = codegen_int_rpn_at(irpn, cond_start, cond_len, out, off)
+                                    off = ptx_instr(out, off, "setp.ne.s32 %p0, %r0, 0")
+                                    Wenn else_count > 0 dann
+                                        off = ptx_bra_pred_s(out, off, l, "_t")  // 真 -> then
+                                        off = ptx_bra_s(out, off, l, "_e")        // 假 -> else
+                                        off = ptx_label_s(out, off, l, "_t")
+                                        off = codegen_stmts(ast, then_start, then_count, frpn, irpn, out, off)
+                                        off = ptx_bra_s(out, off, l, "_end")      // 跳过 else
+                                        off = ptx_label_s(out, off, l, "_e")
+                                        off = codegen_stmts(ast, else_start, else_count, frpn, irpn, out, off)
+                                        off = ptx_label_s(out, off, l, "_end")
+                                    Sonst
+                                        off = ptx_bra_pred_s(out, off, l, "_t")  // 真 -> then
+                                        off = ptx_bra_s(out, off, l, "_e")        // 假 -> 结束
+                                        off = ptx_label_s(out, off, l, "_t")
+                                        off = codegen_stmts(ast, then_start, then_count, frpn, irpn, out, off)
+                                        off = ptx_label_s(out, off, l, "_e")
+                                    Ende
+                                    k = k + then_count + else_count  // 跳过子节点
+                                Ende
+                            Ende
+                        Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+        k = k + 1
+    Ende
+    gebe_zurueck off
+Ende
+
+// ---- 主: AST -> PTX 完整内核 ----
+
+Funktion codegen_prog(name, ast, ast_count, frpn, irpn, symtab, sym_count, out, off)
+    off = ptx_line(out, off, ".version 7.0")
+    off = ptx_line(out, off, ".target sm_75")
+    off = ptx_line(out, off, ".address_size 64")
+    off = emit_str(out, off, ".visible .entry ")
+    off = emit_str(out, off, name)
+    off = emit_str(out, off, "(")
+    // func 节点 (最后)
+    func_node = ast_count - 1
+    param_count = raw_get32(ast, func_node * 32 + 4)
+    // 参数签名
+    Wenn param_count == 0 dann
+        off = emit_str(out, off, ".param .u64 out")
+    Sonst
+        j = 0
+        Solange j < param_count
+            kind = raw_get32(symtab, j * 16 + 8)
+            Wenn j != 0 dann
+                off = emit_str(out, off, ", ")
+            Ende
+            Wenn kind == 2 dann  // 数组指针
+                off = emit_str(out, off, ".param .u64 p")
+            Sonst
+                off = emit_str(out, off, ".param .u32 p")
+            Ende
+            off = emit_int(out, off, j)
+            j = j + 1
+        Ende
+    Ende
+    off = emit_str(out, off, ") {")
+    off = ptx_nl(out, off)
+    // 声明临时 %f0..%f15
+    k = 0
+    Solange k < 16
+        off = codegen_reg_decl(out, off, k)
+        k = k + 1
+    Ende
+    // 声明临时 %r0..%r15
+    k = 0
+    Solange k < 16
+        off = codegen_rreg_decl(out, off, k)
+        k = k + 1
+    Ende
+    // 声明临时 %rd0..%rd15
+    k = 0
+    Solange k < 16
+        off = codegen_rdreg_decl(out, off, k)
+        k = k + 1
+    Ende
+    off = ptx_instr(out, off, ".reg .pred %p0")
+    // 声明全部符号 %f16+ / %r16+ / %rd16+ (含参数寄存器)
+    j = 0
+    Solange j < sym_count
+        kind = raw_get32(symtab, j * 16 + 8)
+        aux = raw_get32(symtab, j * 16 + 12)
+        Wenn kind == 0 dann
+            off = codegen_reg_decl(out, off, aux)
+        Sonst
+            Wenn kind == 1 dann
+                off = codegen_rreg_decl(out, off, aux)
+            Sonst
+                off = codegen_rdreg_decl(out, off, aux)
+            Ende
+        Ende
+        j = j + 1
+    Ende
+    // 加载参数
+    Wenn param_count == 0 dann
+        off = ptx_instr(out, off, "ld.param.u64 %rd15, [out]")
+    Sonst
+        j = 0
+        Solange j < param_count
+            kind = raw_get32(symtab, j * 16 + 8)
+            aux = raw_get32(symtab, j * 16 + 12)
+            Wenn kind == 2 dann  // 数组 -> %rd{aux}
+                off = emit_str(out, off, "ld.param.u64 %rd")
+                off = emit_int(out, off, aux)
+                off = emit_str(out, off, ", [p")
+                off = emit_int(out, off, j)
+                off = emit_str(out, off, "];")
+                off = ptx_nl(out, off)
+            Sonst  // int -> %r{aux}
+                off = emit_str(out, off, "ld.param.u32 %r")
+                off = emit_int(out, off, aux)
+                off = emit_str(out, off, ", [p")
+                off = emit_int(out, off, j)
+                off = emit_str(out, off, "];")
+                off = ptx_nl(out, off)
+            Ende
+            j = j + 1
+        Ende
+    Ende
+    // 函数体
+    body_start = raw_get32(ast, func_node * 32 + 8)
+    body_count = raw_get32(ast, func_node * 32 + 12)
+    off = codegen_stmts(ast, body_start, body_count, frpn, irpn, out, off)
+    off = ptx_instr(out, off, "ret")
+    off = ptx_line(out, off, "}")
+    gebe_zurueck off
+Ende

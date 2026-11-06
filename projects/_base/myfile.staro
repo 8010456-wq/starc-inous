@@ -1,0 +1,104 @@
+// ============================================================================
+//  myfile.staro :: 自研项目文件库（零第三方，linx-o 直调 WinAPI）
+//  修正 starshell file.staro 的追加语义（用 FILE_APPEND_DATA，写指针落末尾）
+//  并去掉对冒号等非法字符的依赖。所有项目统一复用本库。
+// ============================================================================
+
+linx-o kernel32 CreateFileA ReadFile WriteFile GetFileSize CloseHandle
+linx-o kernel32 GetFileAttributesA MoveFileA DeleteFileA
+linx-o kernel32 SetFilePointerEx
+
+// 读整个文件 -> StarC 字符串；失败返回 0
+Funktion mf_read(path)
+    c = starc_to_cstr(path)
+    h = CreateFileA(c, 2147483648, 1, 0, 3, 128, 0)
+    Wenn h == 0 - 1 dann
+        gebe_zurueck 0
+    Ende
+    size = GetFileSize(h, 0)
+    Wenn size == 4294967295 dann
+        CloseHandle(h)
+        gebe_zurueck 0
+    Ende
+    buf = alloc(8 + size + 1)
+    nb = alloc(4)
+    ok = ReadFile(h, buf + 8, size, nb, 0)
+    CloseHandle(h)
+    raw_setbyte(buf, 0, size % 256)
+    raw_setbyte(buf, 1, (size / 256) % 256)
+    raw_setbyte(buf, 2, (size / 65536) % 256)
+    raw_setbyte(buf, 3, (size / 16777216) % 256)
+    raw_setbyte(buf, 8 + size, 0)
+    gebe_zurueck buf
+Ende
+
+// 覆盖写
+Funktion mf_write(path, data)
+    c = starc_to_cstr(path)
+    n = str_len(data)
+    h = CreateFileA(c, 1073741824, 1, 0, 2, 128, 0)
+    Wenn h == 0 - 1 dann
+        gebe_zurueck 0
+    Ende
+    nb = alloc(4)
+    ok = WriteFile(h, data + 8, n, nb, 0)
+    CloseHandle(h)
+    gebe_zurueck n
+Ende
+
+// 追加写（FILE_APPEND_DATA=0x4 -> 写指针恒在文件末尾）
+Funktion mf_append(path, data)
+    c = starc_to_cstr(path)
+    n = str_len(data)
+    h = CreateFileA(c, 1073741828, 1, 0, 4, 128, 0)
+    Wenn h == 0 - 1 dann
+        gebe_zurueck 0
+    Ende
+    nb = alloc(4)
+    ok = WriteFile(h, data + 8, n, nb, 0)
+    CloseHandle(h)
+    gebe_zurueck n
+Ende
+
+// 是否存在
+Funktion mf_exists(path)
+    c = starc_to_cstr(path)
+    attr = GetFileAttributesA(c)
+    Wenn attr == 4294967295 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 文件大小（字节）；不存在返回 -1
+Funktion mf_size(path)
+    c = starc_to_cstr(path)
+    h = CreateFileA(c, 2147483648, 1, 0, 3, 128, 0)
+    Wenn h == 0 - 1 dann
+        gebe_zurueck 0 - 1
+    Ende
+    size = GetFileSize(h, 0)
+    CloseHandle(h)
+    gebe_zurueck size
+Ende
+
+// 移动/改名
+Funktion mf_move(quelle, ziel)
+    q = starc_to_cstr(quelle)
+    z = starc_to_cstr(ziel)
+    r = MoveFileA(q, z)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 删除
+Funktion mf_delete(path)
+    c = starc_to_cstr(path)
+    r = DeleteFileA(c)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende

@@ -1,0 +1,62 @@
+// ============================================================================
+//  starshell :: inuos/eng_umgebung.staro
+//  Selbst implementierte Umgebungsvariablen-Befehle (kernel32 direkt)
+//  args = C-String des Befehlsrests.
+// ============================================================================
+
+linx-o kernel32 GetEnvironmentStringsA FreeEnvironmentStringsA
+
+// Alle Umgebungsvariablen ausgeben
+Funktion umgebung_alle()
+    block = GetEnvironmentStringsA()
+    pos = 0
+    Solange raw_byteat(block, pos) != 0
+        write_cstr(block + pos)
+        write_newline()
+        Solange raw_byteat(block, pos) != 0
+            pos = pos + 1
+        Ende
+        pos = pos + 1
+    Ende
+    FreeEnvironmentStringsA(block)
+    gebe_zurueck 1
+Ende
+
+// Umgebungsvariable ausgeben (Name=Wert)
+Funktion umgebung_zeigen(args)
+    name = extract_arg(args, 0)
+    Wenn str_len(name) == 0 dann
+        umgebung_alle()
+        gebe_zurueck 1
+    Ende
+    w = umgebung_get(name)
+    write_str(name)
+    write_str("=")
+    write_str(w)
+    write_newline()
+    gebe_zurueck 1
+Ende
+
+// Umgebungsvariable setzen
+Funktion umgebung_setzen(args)
+    name = extract_arg(args, 0)
+    wert = argument_n(args, 0, 2)
+    Wenn str_len(name) == 0 dann
+        write_str("set <Name> <Wert>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    r = umgebung_set(name, wert)
+    Wenn r == 0 dann
+        write_str("Fehler beim Setzen: ")
+        write_str(name)
+        write_newline()
+    Sonst
+        write_str("gesetzt: ")
+        write_str(name)
+        write_str("=")
+        write_str(wert)
+        write_newline()
+    Ende
+    gebe_zurueck 1
+Ende

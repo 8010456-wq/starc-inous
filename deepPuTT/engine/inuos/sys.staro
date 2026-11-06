@@ -1,0 +1,102 @@
+// inuos/sys.staro - 系统与内存工具 (逻辑文件, 允许 linx)
+// 移植自 backend 标准实现, deepPuTT 专用
+// 提供: raw_set32/get32/set64/get64 小端内存读写, sleep_ms, tick_ms
+
+linx "kernel32.dll!Sleep"
+linx "kernel32.dll!GetTickCount"
+linx "kernel32.dll!GetCurrentThreadId"
+linx-o msvcrt system
+
+// StarC 字符串 -> C 字符串 (裸指针, null 结尾, 仅临时用)
+Funktion starc_to_cstr(s)
+    n = str_len(s)
+    buf = alloc(n + 1)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, n, 0)
+    gebe_zurueck buf
+Ende
+
+// 调用系统命令 (外部进程), 返回退出码 (老板令: linx 只能在 staro 内部实现)
+Funktion run_cmd(cmd)
+    c = starc_to_cstr(cmd)
+    r = system(c)
+    gebe_zurueck r
+Ende
+
+// 毫秒睡眠
+Funktion sleep_ms(ms)
+    Sleep(ms)
+    gebe_zurueck 0
+Ende
+
+// 系统运行毫秒数 (GetTickCount)
+Funktion tick_ms()
+    t = GetTickCount()
+    gebe_zurueck t
+Ende
+
+// 当前线程 ID
+Funktion cur_thread_id()
+    t = GetCurrentThreadId()
+    gebe_zurueck t
+Ende
+
+// ---- 小端 32/64 位原始内存读写 (结构体构造用) ----
+
+// 小端 32 位写 (offset 起 4 字节)
+Funktion raw_set32(ptr, off, val)
+    raw_setbyte(ptr, off, val % 256)
+    raw_setbyte(ptr, off + 1, (val / 256) % 256)
+    raw_setbyte(ptr, off + 2, (val / 65536) % 256)
+    raw_setbyte(ptr, off + 3, (val / 16777216) % 256)
+    gebe_zurueck 0
+Ende
+
+// 小端 32 位读
+Funktion raw_get32(ptr, off)
+    v = raw_byteat(ptr, off)
+    v = v + raw_byteat(ptr, off + 1) * 256
+    v = v + raw_byteat(ptr, off + 2) * 65536
+    v = v + raw_byteat(ptr, off + 3) * 16777216
+    gebe_zurueck v
+Ende
+
+// 小端 64 位写 (offset 起 8 字节)
+Funktion raw_set64(ptr, off, val)
+    raw_setbyte(ptr, off, val % 256)
+    raw_setbyte(ptr, off + 1, (val / 256) % 256)
+    raw_setbyte(ptr, off + 2, (val / 65536) % 256)
+    raw_setbyte(ptr, off + 3, (val / 16777216) % 256)
+    raw_setbyte(ptr, off + 4, (val / 4294967296) % 256)
+    raw_setbyte(ptr, off + 5, (val / 1099511627776) % 256)
+    raw_setbyte(ptr, off + 6, (val / 274877906944) % 256)
+    raw_setbyte(ptr, off + 7, (val / 70368744177664) % 256)
+    gebe_zurueck 0
+Ende
+
+// 小端 64 位读
+Funktion raw_get64(ptr, off)
+    v = raw_byteat(ptr, off)
+    v = v + raw_byteat(ptr, off + 1) * 256
+    v = v + raw_byteat(ptr, off + 2) * 65536
+    v = v + raw_byteat(ptr, off + 3) * 16777216
+    v = v + raw_byteat(ptr, off + 4) * 4294967296
+    v = v + raw_byteat(ptr, off + 5) * 1099511627776
+    v = v + raw_byteat(ptr, off + 6) * 274877906944
+    v = v + raw_byteat(ptr, off + 7) * 70368744177664
+    gebe_zurueck v
+Ende
+
+// 清零 n 字节
+Funktion mem_zero(ptr, n)
+    i = 0
+    Solange i < n
+        raw_setbyte(ptr, i, 0)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende

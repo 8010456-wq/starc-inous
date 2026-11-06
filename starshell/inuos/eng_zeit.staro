@@ -1,0 +1,109 @@
+// ============================================================================
+//  starshell :: inuos/eng_zeit.staro
+//  Selbst implementierte Zeit-Befehle (WinAPI direkt, keine Weiterleitung)
+//  args = C-String des Befehlsrests.
+// ============================================================================
+
+linx-o kernel32 GetLocalTime GetTickCount
+
+Funktion eng_zeit_jahr()
+    st = alloc(16)
+    GetLocalTime(st)
+    gebe_zurueck raw_byteat(st, 0) + raw_byteat(st, 1) * 256
+Ende
+
+Funktion eng_zeit_monat()
+    st = alloc(16)
+    GetLocalTime(st)
+    gebe_zurueck raw_byteat(st, 2) + raw_byteat(st, 3) * 256
+Ende
+
+Funktion eng_zeit_tag()
+    st = alloc(16)
+    GetLocalTime(st)
+    gebe_zurueck raw_byteat(st, 6) + raw_byteat(st, 7) * 256
+Ende
+
+Funktion eng_zeit_stunde()
+    st = alloc(16)
+    GetLocalTime(st)
+    gebe_zurueck raw_byteat(st, 8) + raw_byteat(st, 9) * 256
+Ende
+
+Funktion eng_zeit_minute()
+    st = alloc(16)
+    GetLocalTime(st)
+    gebe_zurueck raw_byteat(st, 10) + raw_byteat(st, 11) * 256
+Ende
+
+Funktion eng_zeit_sekunde()
+    st = alloc(16)
+    GetLocalTime(st)
+    gebe_zurueck raw_byteat(st, 12) + raw_byteat(st, 13) * 256
+Ende
+
+Funktion eng_zeit_wochentag()
+    st = alloc(16)
+    GetLocalTime(st)
+    gebe_zurueck raw_byteat(st, 4) + raw_byteat(st, 5) * 256
+Ende
+
+Funktion eng_zeit(op, args)
+    Wenn str_eq(op, "jetzt") dann
+        write_str(zeit_stamp())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "datum") dann
+        write_str(str_slice(zeit_stamp(), 0, 10))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "uhr") dann
+        write_str(str_slice(zeit_stamp(), 11, 8))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "jahr") dann
+        write_int(eng_zeit_jahr())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "monat") dann
+        write_int(eng_zeit_monat())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "tag") dann
+        write_int(eng_zeit_tag())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "stunde") dann
+        write_int(eng_zeit_stunde())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "minute") dann
+        write_int(eng_zeit_minute())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "sekunde") dann
+        write_int(eng_zeit_sekunde())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "wochentag") dann
+        write_int(eng_zeit_wochentag())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "uptime") dann
+        write_int(GetTickCount() / 1000)
+        write_str(" s")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende

@@ -1,0 +1,99 @@
+// ============================================================================
+//  fannkuch.staro —— language-bench 考题「Fannkuch-redux」能力层
+//  铁律 E：能力全在 .staro。纯整数置换 + 煎饼翻转，精确复现 lbgen ref_fannkuch。
+//  数组用 8 字节 int64 元素（StarC 无数组类型，用 alloc 缓冲区）。
+//  fannkuch_run(n) -> 返回 alloc(16)：[checksum, maxflips] 各 8 字节小端。
+// ============================================================================
+
+Funktion fannkuch_run(n)
+    // 三个 int64 数组：perm1/perm/count，各 n 个元素（8 字节/个）+ 余量
+    perm1 = alloc(n * 8 + 64)
+    perm  = alloc(n * 8 + 64)
+    count = alloc(n * 8 + 64)
+
+    // 初始化 perm1[i] = i；count 清零（StarC alloc 不保证清零）
+    i = 0
+    Solange i < n
+        write_u64(perm1, i * 8, i)
+        write_u64(count, i * 8, 0)
+        i = i + 1
+    Ende
+
+    maxflips = 0
+    permcount = 0
+    checksum = 0
+    r = n
+    done = 0
+
+    // 主循环：每个排列
+    Solange done == 0
+        // while r != 1: count[r-1] = r; r--
+        Solange r != 1
+            write_u64(count, (r - 1) * 8, r)
+            r = r - 1
+        Ende
+
+        // copy perm1 -> perm
+        i = 0
+        Solange i < n
+            write_u64(perm, i * 8, read_u64(perm1, i * 8))
+            i = i + 1
+        Ende
+
+        // 煎饼翻转：while perm[0] != 0: reverse perm[0..perm[0]]; flips++
+        flips = 0
+        k = read_u64(perm, 0)
+        Solange k != 0
+            ii = 0
+            jj = k
+            Solange ii < jj
+                t = read_u64(perm, ii * 8)
+                write_u64(perm, ii * 8, read_u64(perm, jj * 8))
+                write_u64(perm, jj * 8, t)
+                ii = ii + 1
+                jj = jj - 1
+            Ende
+            flips = flips + 1
+            k = read_u64(perm, 0)
+        Ende
+
+        Wenn flips > maxflips dann
+            maxflips = flips
+        Ende
+        Wenn permcount % 2 == 0 dann
+            checksum = checksum + flips
+        Sonst
+            checksum = checksum - flips
+        Ende
+
+        // 生成下一个排列（fannkuch 特有旋转方案）
+        nxt = 0
+        Solange nxt == 0
+            Wenn r == n dann
+                done = 1
+                nxt = 1
+            Sonst
+                p0 = read_u64(perm1, 0)
+                i2 = 0
+                Solange i2 < r
+                    write_u64(perm1, i2 * 8, read_u64(perm1, (i2 + 1) * 8))
+                    i2 = i2 + 1
+                Ende
+                write_u64(perm1, r * 8, p0)
+                cv = read_u64(count, r * 8) - 1
+                write_u64(count, r * 8, cv)
+                Wenn cv > 0 dann
+                    nxt = 1
+                Sonst
+                    r = r + 1
+                Ende
+            Ende
+        Ende
+        permcount = permcount + 1
+    Ende
+
+    out = alloc(16)
+    write_u64(out, 0, checksum)
+    write_u64(out, 8, maxflips)
+    gebe_zurueck out
+Ende

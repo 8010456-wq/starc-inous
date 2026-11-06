@@ -1,0 +1,274 @@
+// ============================================================================
+//  MGTO1 :: mg_u.staro —— MGTO1-UWF1 权重格式（共享布局助手 + BF16→FP32）
+//  转换器与推理引擎共用同一套张量布局公式，避免两端不一致。
+//  布局顺序（每层）：
+//    ln1, attn_q_w, attn_q_b, attn_k_w, attn_k_b, attn_v_w, attn_v_b,
+//    attn_o, ln2, ffn_gate, ffn_up, ffn_down
+//  全局： wte, [per layer...], lnf, [lm_head 若未绑定]
+// ============================================================================
+
+// ---- UWF1 常量 ----
+// magic "M1UF" LE = 0x4655314D
+// 布局：Header 32B + Meta 48B = 80B，然后 FP32 权重段
+
+// ---- 每张量元素数（FP32 个数）----
+Funktion u_el(vocab, hidden, kv, inter, n_heads)
+    dim = hidden / n_heads
+    gebe_zurueck 0
+Ende
+
+Funktion u_ln1_el(hidden)
+    gebe_zurueck hidden
+Ende
+
+Funktion u_qw_el(hidden)
+    gebe_zurueck hidden * hidden
+Ende
+
+Funktion u_qb_el(hidden)
+    gebe_zurueck hidden
+Ende
+
+Funktion u_kw_el(kv, hidden, n_heads)
+    dim = hidden / n_heads
+    gebe_zurueck kv * dim * hidden
+Ende
+
+Funktion u_kb_el(kv, hidden, n_heads)
+    dim = hidden / n_heads
+    gebe_zurueck kv * dim
+Ende
+
+Funktion u_vw_el(kv, hidden, n_heads)
+    dim = hidden / n_heads
+    gebe_zurueck kv * dim * hidden
+Ende
+
+Funktion u_vb_el(kv, hidden, n_heads)
+    dim = hidden / n_heads
+    gebe_zurueck kv * dim
+Ende
+
+Funktion u_ow_el(hidden)
+    gebe_zurueck hidden * hidden
+Ende
+
+Funktion u_ln2_el(hidden)
+    gebe_zurueck hidden
+Ende
+
+Funktion u_gate_el(inter, hidden)
+    gebe_zurueck inter * hidden
+Ende
+
+Funktion u_up_el(inter, hidden)
+    gebe_zurueck inter * hidden
+Ende
+
+Funktion u_down_el(inter, hidden)
+    gebe_zurueck hidden * inter
+Ende
+
+Funktion u_lnf_el(hidden)
+    gebe_zurueck hidden
+Ende
+
+// ---- 单个权重张量的元素数（kind 编号：0=wte 1=ln1 2=qw 3=qb 4=kw 5=kb
+//      6=vw 7=vb 8=ow 9=ln2 10=gate 11=up 12=down 13=lnf 14=lm_head）----
+Funktion u_tensor_el(kind, vocab, hidden, kv, inter, n_heads)
+    Wenn kind == 0 dann
+        gebe_zurueck vocab * hidden
+    Sonst
+        Wenn kind == 1 dann
+            gebe_zurueck hidden
+        Sonst
+            Wenn kind == 2 dann
+                gebe_zurueck hidden * hidden
+            Sonst
+                Wenn kind == 3 dann
+                    gebe_zurueck hidden
+                Sonst
+                    Wenn kind == 4 dann
+                        gebe_zurueck u_kw_el(kv, hidden, n_heads)
+                    Sonst
+                        Wenn kind == 5 dann
+                            gebe_zurueck u_kb_el(kv, hidden, n_heads)
+                        Sonst
+                            Wenn kind == 6 dann
+                                gebe_zurueck u_vw_el(kv, hidden, n_heads)
+                            Sonst
+                                Wenn kind == 7 dann
+                                    gebe_zurueck u_vb_el(kv, hidden, n_heads)
+                                Sonst
+                                    Wenn kind == 8 dann
+                                        gebe_zurueck hidden * hidden
+                                    Sonst
+                                        Wenn kind == 9 dann
+                                            gebe_zurueck hidden
+                                        Sonst
+                                            Wenn kind == 10 dann
+                                                gebe_zurueck inter * hidden
+                                            Sonst
+                                                Wenn kind == 11 dann
+                                                    gebe_zurueck inter * hidden
+                                                Sonst
+                                                    Wenn kind == 12 dann
+                                                        gebe_zurueck hidden * inter
+                                                    Sonst
+                                                        Wenn kind == 13 dann
+                                                            gebe_zurueck hidden
+                                                        Sonst
+                                                            gebe_zurueck vocab * hidden
+                                                        Ende
+                                                    Ende
+                                                Ende
+                                            Ende
+                                        Ende
+                                    Ende
+                                Ende
+                            Ende
+                        Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+    Ende
+Ende
+
+// ---- 总权重元素数（FP32 个数）----
+Funktion u_total_elems(vocab, hidden, kv, inter, n_heads, layers, tied)
+    tot = vocab * hidden          // wte
+    l = 0
+    Solange l < layers
+        tot = tot + hidden                    // ln1
+        tot = tot + hidden * hidden           // qw
+        tot = tot + hidden                    // qb
+        tot = tot + u_kw_el(kv, hidden, n_heads)   // kw
+        tot = tot + u_kb_el(kv, hidden, n_heads)   // kb
+        tot = tot + u_vw_el(kv, hidden, n_heads)   // vw
+        tot = tot + u_vb_el(kv, hidden, n_heads)   // vb
+        tot = tot + hidden * hidden           // ow
+        tot = tot + hidden                    // ln2
+        tot = tot + inter * hidden            // gate
+        tot = tot + inter * hidden            // up
+        tot = tot + hidden * inter            // down
+        l = l + 1
+    Ende
+    tot = tot + hidden            // lnf
+    Wenn tied == 0 dann
+        tot = tot + vocab * hidden   // lm_head
+    Ende
+    gebe_zurueck tot
+Ende
+
+// ---- BF16 → FP32：src 裸指针（BF16 数组，n 个），写 FP32 到 dst ----
+// BF16 就是 FP32 的高 16 位：FP32 = [0,0,lo,hi]（小端），无需乘法。
+// ★ 不用 b*65536：编译器对大常数乘法有 bug（实测 b*65536 错值），
+//   直接字节放置 100% 正确。
+Funktion u_bf16_to_f32(src, dst, n)
+    i = 0
+    Solange i < n
+        lo = raw_byteat(src, i * 2)
+        hi = raw_byteat(src, i * 2 + 1)
+        raw_setbyte(dst, i * 4, 0)
+        raw_setbyte(dst, i * 4 + 1, 0)
+        raw_setbyte(dst, i * 4 + 2, lo)
+        raw_setbyte(dst, i * 4 + 3, hi)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 写 UWF1 头（32B Header + 56B Meta = 88B），fh 为已打开的文件句柄 ----
+// eps_bits / theta_bits 为 double 位模式（u64，来自 atof）
+Funktion u_write_header(fh, vocab, hidden, layers, n_heads, kv, inter, max_pos, head_dim, eps_bits, theta_bits, tied, total_elems)
+    h = alloc(88)
+    mem_zero(h, 88)
+    // Header 32B
+    raw_setbyte(h, 0, 77)        // 'M'
+    raw_setbyte(h, 1, 49)        // '1'
+    raw_setbyte(h, 2, 85)        // 'U'
+    raw_setbyte(h, 3, 70)        // 'F'
+    raw_setbyte(h, 4, 1)         // version=1
+    // [8..12) 权重张量数（固定布局：wte + 13*L + lnf [+lm_head]）
+    n_t = 1 + 13 * layers + 1
+    Wenn tied == 0 dann
+        n_t = n_t + 1
+    Ende
+    raw_setbyte(h, 8, n_t - (n_t / 256) * 256)
+    raw_setbyte(h, 9, (n_t / 256) - (n_t / 65536) * 256)
+    raw_setbyte(h, 10, (n_t / 65536) - (n_t / 16777216) * 256)
+    raw_setbyte(h, 11, n_t / 16777216)
+    // [12..16) total_elems
+    te = total_elems
+    raw_setbyte(h, 12, te - (te / 256) * 256)
+    raw_setbyte(h, 13, (te / 256) - (te / 65536) * 256)
+    raw_setbyte(h, 14, (te / 65536) - (te / 16777216) * 256)
+    raw_setbyte(h, 15, te / 16777216)
+    // Meta 56B @32
+    u32w(h, 32, vocab)
+    u32w(h, 36, hidden)
+    u32w(h, 40, layers)
+    u32w(h, 44, n_heads)
+    u32w(h, 48, kv)
+    u32w(h, 52, inter)
+    u32w(h, 56, max_pos)
+    u32w(h, 60, head_dim)
+    u32w(h, 64, tied)
+    // [72..80) eps double bits (u64)
+    raw_set64(h, 72, eps_bits)
+    // [80..88) theta double bits (u64)
+    raw_set64(h, 80, theta_bits)
+    nb = alloc(8)
+    mem_zero(nb, 8)
+    WriteFile(fh, h, 88, nb, 0)
+    gebe_zurueck 0
+Ende
+
+// ---- 写 u32 到 buf 偏移 off（小端）----
+Funktion u32w(buf, off, v)
+    raw_setbyte(buf, off + 0, v - (v / 256) * 256)
+    raw_setbyte(buf, off + 1, (v / 256) - (v / 65536) * 256)
+    raw_setbyte(buf, off + 2, (v / 65536) - (v / 16777216) * 256)
+    raw_setbyte(buf, off + 3, v / 16777216)
+    gebe_zurueck 0
+Ende
+
+// ---- 读 u32（小端）----
+Funktion u32r(buf, off)
+    v = raw_byteat(buf, off + 0)
+    v = v + raw_byteat(buf, off + 1) * 256
+    v = v + raw_byteat(buf, off + 2) * 65536
+    v = v + raw_byteat(buf, off + 3) * 16777216
+    gebe_zurueck v
+Ende
+
+// ---- 写一段 FP32 到文件（fh 已打开，位置自动前进）----
+Funktion u_write_f32(fh, src, n)
+    nb = alloc(8)
+    mem_zero(nb, 8)
+    WriteFile(fh, src, n * 4, nb, 0)
+    gebe_zurueck 0
+Ende
+
+// ---- 复制一个张量（BF16→FP32）并写入文件 ----
+// 参数：fh, stf(safetensors 文件缓冲), hdr(safetensors header 起始), tname_c, n(元素数)
+Funktion u_emit(fh, stf, hdr, tname_c, n)
+    o0 = alloc(8)
+    o1 = alloc(8)
+    r = js_tensor_offsets(hdr, tname_c, o0, o1)
+    Wenn r != 0 dann
+        mg_write_str("!! missing tensor: ")
+        mg_write_cstr(tname_c)
+        mg_newline()
+        gebe_zurueck 0 - 1
+    Ende
+    // 数据区起始 = 8 + header_len；张量数据偏移 = data_region + o0
+    hlen = raw_get64(stf, 0)
+    src = stf + 8 + hlen + raw_get64(o0, 0)
+    // BF16 → FP32 到临时缓冲（n 个 → n*4 字节）
+    tmp = alloc(n * 4)
+    u_bf16_to_f32(src, tmp, n)
+    u_write_f32(fh, tmp, n)
+    gebe_zurueck 0
+Ende

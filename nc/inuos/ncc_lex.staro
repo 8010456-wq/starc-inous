@@ -1,0 +1,312 @@
+// ============================================================================
+//  nc :: inuos/ncc_lex.staro
+//  词法分析器（能力实现层，仅用 ncc_lib 函数 + 原语）
+//  把源码字节流切成 token 流。
+//  Token 表示：alloc 结构 { type(int), text(StarC串), num(int), line(int) }
+//  type 常量：0=EOF 1=Ident 2=Zahl 3=String 4=KlammerAuf 5=KlammerZu
+//             6=Komma 7=Plus 8=Minus 9=Stern 10=Slash 11=Gleich 12=DoppelGleich
+//             13=Ungleich 14=Kleiner 15=Groesser 16=KleinerGleich 17=GroesserGleich
+//             18=Wenn 19=Sonst 20=Ende 21=Funktion 22=Solange 23=gebe_zurueck
+//             24=und 25=oder 26=nicht 27=Doppelpunkt 28=PlusGleich 29=MinusGleich
+//             30=Semikolon 31=Zeile
+// ============================================================================
+
+// ---------- Token 构造 ----------
+
+Funktion tok_new(ttype, text, num, line)
+    t = alloc(32)
+    ptr_set32(t, 0, ttype)
+    ptr_set64(t, 8, text)
+    ptr_set32(t, 16, num)
+    ptr_set32(t, 24, line)
+    gebe_zurueck t
+Ende
+
+Funktion tok_type(t)
+    gebe_zurueck ptr_get32(t, 0)
+Ende
+
+Funktion tok_text(t)
+    gebe_zurueck ptr_get64(t, 8)
+Ende
+
+Funktion tok_num(t)
+    gebe_zurueck ptr_get32(t, 16)
+Ende
+
+Funktion tok_line(t)
+    gebe_zurueck ptr_get32(t, 24)
+Ende
+
+// 把 token 指针存入 token 数组（每个槽 8 字节）
+Funktion tok_store(toks, idx, t)
+    ptr_set64(toks, idx * 8, t)
+    gebe_zurueck 0
+Ende
+
+// ---------- 关键字判断 ----------
+
+Funktion is_kw(s, kw)
+    gebe_zurueck str_eq(s, kw)
+Ende
+
+// 标识符 -> 关键字类型，非关键字返回 0
+Funktion kw_type(s)
+    Wenn is_kw(s, "Wenn") == 1 dann
+        gebe_zurueck 18
+    Ende
+    Wenn is_kw(s, "Sonst") == 1 dann
+        gebe_zurueck 19
+    Ende
+    Wenn is_kw(s, "Ende") == 1 dann
+        gebe_zurueck 20
+    Ende
+    Wenn is_kw(s, "Funktion") == 1 dann
+        gebe_zurueck 21
+    Ende
+    Wenn is_kw(s, "Solange") == 1 dann
+        gebe_zurueck 22
+    Ende
+    Wenn is_kw(s, "gebe_zurueck") == 1 dann
+        gebe_zurueck 23
+    Ende
+    Wenn is_kw(s, "und") == 1 dann
+        gebe_zurueck 24
+    Ende
+    Wenn is_kw(s, "oder") == 1 dann
+        gebe_zurueck 25
+    Ende
+    Wenn is_kw(s, "nicht") == 1 dann
+        gebe_zurueck 26
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------- 字符判断 ----------
+
+Funktion is_digit(ch)
+    Wenn ch >= 48 dann
+        Wenn ch <= 57 dann
+            gebe_zurueck 1
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion is_alpha(ch)
+    Wenn ch >= 65 dann
+        Wenn ch <= 90 dann
+            gebe_zurueck 1
+        Ende
+    Ende
+    Wenn ch >= 97 dann
+        Wenn ch <= 122 dann
+            gebe_zurueck 1
+        Ende
+    Ende
+    Wenn ch == 95 dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------- 词法主循环 ----------
+
+// src: StarC 字符串（源码）；token 数组指针在 toks，返回 token 个数；tok_count 返回
+// toks: 预分配数组（每个元素 8 字节存 token 指针）
+Funktion lex_all(src, toks, maxn)
+    n = str_len(src)
+    pos = 0
+    line = 1
+    count = 0
+    fertig = 0
+    Solange fertig == 0
+        // 跳过空白
+        Solange pos < n
+            ch = raw_byteat(src, 8 + pos)
+            Wenn ch == 32 dann
+                pos = pos + 1
+            Sonst
+                Wenn ch == 9 dann
+                    pos = pos + 1
+                Sonst
+                    Wenn ch == 10 dann
+                        line = line + 1
+                        pos = pos + 1
+                    Sonst
+                        Wenn ch == 13 dann
+                            pos = pos + 1
+                        Sonst
+                            // 非空白，跳出
+                            pos = pos + 100000000
+                        Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+        Wenn pos >= n + 100000000 dann
+            pos = pos - 100000000
+        Ende
+        // 检查结束
+        Wenn pos >= n dann
+            t = tok_new(0, 0, 0, line)
+            tok_store(toks, count, t)
+            count = count + 1
+            fertig = 1
+        Sonst
+            ch = raw_byteat(src, 8 + pos)
+            // 注释 // 跳过到行尾
+            Wenn ch == 47 dann
+                Wenn raw_byteat(src, 8 + pos + 1) == 47 dann
+                    Solange pos < n
+                        Wenn raw_byteat(src, 8 + pos) == 10 dann
+                            line = line + 1
+                            pos = pos + 1
+                            pos = pos + 100000000
+                        Sonst
+                            pos = pos + 1
+                        Ende
+                    Ende
+                    Wenn pos >= n + 100000000 dann
+                        pos = pos - 100000000
+                    Ende
+                Sonst
+                    // 单个 / 是除号
+                    t = tok_new(10, 0, 0, line)
+                    tok_store(toks, count, t)
+                    count = count + 1
+                    pos = pos + 1
+                Ende
+            Sonst
+                // 数字
+                Wenn is_digit(ch) == 1 dann
+                    start = pos
+                    Solange pos < n
+                        Wenn is_digit(raw_byteat(src, 8 + pos)) == 1 dann
+                            pos = pos + 1
+                        Sonst
+                            pos = pos + 100000000
+                        Ende
+                    Ende
+                    Wenn pos >= n + 100000000 dann
+                        pos = pos - 100000000
+                    Ende
+                    digitstr = str_slice(src, start, pos - start)
+                    num = 0
+                    i = 0
+                    dl = str_len(digitstr)
+                    Solange i < dl
+                        num = num * 10 + (raw_byteat(digitstr, 8 + i) - 48)
+                        i = i + 1
+                    Ende
+                    t = tok_new(2, digitstr, num, line)
+                    tok_store(toks, count, t)
+                    count = count + 1
+                Sonst
+                    // 字符串字面量 "..."
+                    Wenn ch == 34 dann
+                        pos = pos + 1
+                        sstart = pos
+                        Solange pos < n
+                            Wenn raw_byteat(src, 8 + pos) == 34 dann
+                                pos = pos + 100000000
+                            Sonst
+                                pos = pos + 1
+                            Ende
+                        Ende
+                        Wenn pos >= n + 100000000 dann
+                            pos = pos - 100000000
+                        Ende
+                        sstr = str_slice(src, sstart, pos - sstart)
+                        pos = pos + 1
+                        t = tok_new(3, sstr, 0, line)
+                        tok_store(toks, count, t)
+                        count = count + 1
+                    Sonst
+                        // 标识符
+                        Wenn is_alpha(ch) == 1 dann
+                            start = pos
+                            Solange pos < n
+                                c2 = raw_byteat(src, 8 + pos)
+                                Wenn is_alpha(c2) == 1 dann
+                                    pos = pos + 1
+                                Sonst
+                                    Wenn is_digit(c2) == 1 dann
+                                        pos = pos + 1
+                                    Sonst
+                                        pos = pos + 100000000
+                                    Ende
+                                Ende
+                            Ende
+                            Wenn pos >= n + 100000000 dann
+                                pos = pos - 100000000
+                            Ende
+                            idstr = str_slice(src, start, pos - start)
+                            kt = kw_type(idstr)
+                            Wenn kt != 0 dann
+                                t = tok_new(kt, idstr, 0, line)
+                            Sonst
+                                t = tok_new(1, idstr, 0, line)
+                            Ende
+                            tok_store(toks, count, t)
+                            count = count + 1
+                        Sonst
+                            // 运算符/符号
+                            tt = 0
+                            Wenn ch == 40 dann
+                                tt = 4
+                            Sonst
+                                Wenn ch == 41 dann
+                                    tt = 5
+                                Sonst
+                                    Wenn ch == 44 dann
+                                        tt = 6
+                                    Sonst
+                                        Wenn ch == 43 dann
+                                            tt = 7
+                                        Sonst
+                                            Wenn ch == 45 dann
+                                                tt = 8
+                                            Sonst
+                                                Wenn ch == 42 dann
+                                                    tt = 9
+                                                Sonst
+                                                    Wenn ch == 61 dann
+                                                        tt = 11
+                                                    Sonst
+                                                        Wenn ch == 60 dann
+                                                            tt = 14
+                                                        Sonst
+                                                            Wenn ch == 62 dann
+                                                                tt = 15
+                                                            Sonst
+                                                                Wenn ch == 58 dann
+                                                                    tt = 27
+                                                                Sonst
+                                                                    Wenn ch == 59 dann
+                                                                        tt = 30
+                                                                    Sonst
+                                                                        tt = 31
+                                                                    Ende
+                                                                Ende
+                                                            Ende
+                                                        Ende
+                                                    Ende
+                                                Ende
+                                            Ende
+                                        Ende
+                                    Ende
+                                Ende
+                            Ende
+                            t = tok_new(tt, 0, 0, line)
+                            tok_store(toks, count, t)
+                            count = count + 1
+                            pos = pos + 1
+                        Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+    Ende
+    gebe_zurueck count
+Ende

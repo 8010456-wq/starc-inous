@@ -1,0 +1,143 @@
+// ============================================================================
+//  starshell :: inuos/eng_disk.staro
+//  Selbst implementierte Datentraeger-Befehle (WinAPI direkt, keine Weiterleitung)
+//  args = C-String des Befehlsrests.
+// ============================================================================
+
+linx-o kernel32 GetLogicalDrives GetDiskFreeSpaceExA GetDriveTypeA
+
+Funktion eng_disk_typname(t)
+    Wenn t == 2 dann
+        gebe_zurueck cstr_to_starc("Wechseldatentraeger")
+    Ende
+    Wenn t == 3 dann
+        gebe_zurueck cstr_to_starc("Festplatte")
+    Ende
+    Wenn t == 4 dann
+        gebe_zurueck cstr_to_starc("Netzwerk")
+    Ende
+    Wenn t == 5 dann
+        gebe_zurueck cstr_to_starc("CD-ROM")
+    Ende
+    Wenn t == 6 dann
+        gebe_zurueck cstr_to_starc("RAM-Disk")
+    Ende
+    gebe_zurueck cstr_to_starc("unbekannt")
+Ende
+
+Funktion eng_disk_liste()
+    mask = GetLogicalDrives()
+    i = 0
+    Solange i < 26
+        bit = 1
+        j = 0
+        Solange j < i
+            bit = bit * 2
+            j = j + 1
+        Ende
+        Wenn mask - (mask / bit) * bit >= bit dann
+            root = alloc(8)
+            raw_setbyte(root, 0, 3)
+            raw_setbyte(root, 1, 0)
+            raw_setbyte(root, 2, 0)
+            raw_setbyte(root, 3, 0)
+            raw_setbyte(root, 8, 65 + i)
+            raw_setbyte(root, 9, 58)
+            raw_setbyte(root, 10, 92)
+            raw_setbyte(root, 11, 0)
+            frei = alloc(8)
+            gesamt = alloc(8)
+            totalfrei = alloc(8)
+            rc = GetDiskFreeSpaceExA(root, frei, gesamt, totalfrei)
+            write_cstr(root)
+            write_str("  ")
+            write_str(eng_disk_typname(GetDriveTypeA(root)))
+            Wenn rc != 0 dann
+                gl = raw_byteat(gesamt, 0) + raw_byteat(gesamt, 1) * 256 + raw_byteat(gesamt, 2) * 65536 + raw_byteat(gesamt, 3) * 16777216
+                gh = raw_byteat(gesamt, 4) + raw_byteat(gesamt, 5) * 256
+                fl = raw_byteat(frei, 0) + raw_byteat(frei, 1) * 256 + raw_byteat(frei, 2) * 65536 + raw_byteat(frei, 3) * 16777216
+                fh = raw_byteat(frei, 4) + raw_byteat(frei, 5) * 256
+                gt = gl + gh * 4294967296
+                ft = fl + fh * 4294967296
+                write_str("  ")
+                write_int(ft / 1073741824)
+                write_str(" GB frei / ")
+                write_int(gt / 1073741824)
+                write_str(" GB")
+            Ende
+            write_newline()
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+Funktion eng_disk_frei_mb(la)
+    frei = alloc(8)
+    gesamt = alloc(8)
+    totalfrei = alloc(8)
+    rc = GetDiskFreeSpaceExA(la, frei, gesamt, totalfrei)
+    Wenn rc == 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    fl = raw_byteat(frei, 0) + raw_byteat(frei, 1) * 256 + raw_byteat(frei, 2) * 65536 + raw_byteat(frei, 3) * 16777216
+    fh = raw_byteat(frei, 4) + raw_byteat(frei, 5) * 256
+    ft = fl + fh * 4294967296
+    gebe_zurueck ft / 1048576
+Ende
+
+Funktion eng_disk_gesamt_mb(la)
+    frei = alloc(8)
+    gesamt = alloc(8)
+    totalfrei = alloc(8)
+    rc = GetDiskFreeSpaceExA(la, frei, gesamt, totalfrei)
+    Wenn rc == 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    gl = raw_byteat(gesamt, 0) + raw_byteat(gesamt, 1) * 256 + raw_byteat(gesamt, 2) * 65536 + raw_byteat(gesamt, 3) * 16777216
+    gh = raw_byteat(gesamt, 4) + raw_byteat(gesamt, 5) * 256
+    gt = gl + gh * 4294967296
+    gebe_zurueck gt / 1048576
+Ende
+
+Funktion eng_disk(op, args)
+    Wenn str_eq(op, "liste") dann
+        eng_disk_liste()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "frei") dann
+        la = extract_arg(args, 0)
+        m = eng_disk_frei_mb(la)
+        Wenn m == 0 - 1 dann
+            write_str("Laufwerk nicht gefunden: ")
+            write_str(la)
+        Sonst
+            write_int(m)
+            write_str(" MB frei auf ")
+            write_str(la)
+        Ende
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "gesamt") dann
+        la = extract_arg(args, 0)
+        m = eng_disk_gesamt_mb(la)
+        Wenn m == 0 - 1 dann
+            write_str("Laufwerk nicht gefunden: ")
+            write_str(la)
+        Sonst
+            write_int(m)
+            write_str(" MB gesamt auf ")
+            write_str(la)
+        Ende
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "typ") dann
+        la = extract_arg(args, 0)
+        write_str(eng_disk_typname(GetDriveTypeA(la)))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende

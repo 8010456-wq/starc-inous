@@ -1,0 +1,140 @@
+// inuos/cuda.staro - CUDA Driver API 绑定
+// 验证 StarC 能用 linx 绑 nvcuda.dll (CUDA Driver API) 并调用
+// 铁律: 逻辑文件 .staro 允许 linx; 正文 .starc 禁止 linx
+
+linx "nvcuda.dll!cuInit"
+linx "nvcuda.dll!cuDeviceGetCount"
+linx "nvcuda.dll!cuDeviceGet"
+linx "nvcuda.dll!cuDeviceGetName"
+linx "nvcuda.dll!cuCtxCreate"
+linx "nvcuda.dll!cuCtxDestroy"
+linx "nvcuda.dll!cuMemAlloc"
+linx "nvcuda.dll!cuMemFree"
+
+// 整数转 StarC 字符串 (支持负数)
+Funktion int_to_str(num)
+    Wenn num == 0 dann
+        buf = alloc(11)
+        raw_setbyte(buf, 0, 1)
+        raw_setbyte(buf, 1, 0)
+        raw_setbyte(buf, 2, 0)
+        raw_setbyte(buf, 3, 0)
+        raw_setbyte(buf, 4, 0)
+        raw_setbyte(buf, 5, 0)
+        raw_setbyte(buf, 6, 0)
+        raw_setbyte(buf, 7, 0)
+        raw_setbyte(buf, 8, 48)
+        raw_setbyte(buf, 9, 0)
+        gebe_zurueck buf
+    Ende
+    neg = 0
+    Wenn num < 0 dann
+        neg = 1
+        num = 0 - num
+    Ende
+    digits = alloc(24)
+    di = 0
+    Solange num > 0
+        raw_setbyte(digits, di, num % 10)
+        di = di + 1
+        num = num / 10
+    Ende
+    pos = 0
+    Wenn neg == 1 dann
+        pos = pos + 1
+    Ende
+    total = pos + di
+    buf = alloc(8 + total + 1)
+    raw_setbyte(buf, 0, total % 256)
+    raw_setbyte(buf, 1, (total / 256) % 256)
+    raw_setbyte(buf, 2, 0)
+    raw_setbyte(buf, 3, 0)
+    raw_setbyte(buf, 4, 0)
+    raw_setbyte(buf, 5, 0)
+    raw_setbyte(buf, 6, 0)
+    raw_setbyte(buf, 7, 0)
+    p = 0
+    Wenn neg == 1 dann
+        raw_setbyte(buf, 8 + p, 45)
+        p = p + 1
+    Ende
+    i = di - 1
+    Solange i >= 0
+        raw_setbyte(buf, 8 + p, raw_byteat(digits, i) + 48)
+        p = p + 1
+        i = i - 1
+    Ende
+    raw_setbyte(buf, 8 + total, 0)
+    gebe_zurueck buf
+Ende
+
+// CUDA 初始化, 返回 CUresult (0 = CUDA_SUCCESS)
+Funktion cuda_init()
+    r = cuInit(0)
+    gebe_zurueck r
+Ende
+
+// 设备数, 失败返回 -1
+Funktion cuda_device_count()
+    cnt = alloc(4)
+    raw_set32(cnt, 0, 0)
+    r = cuDeviceGetCount(cnt)
+    Wenn r != 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    n = raw_get32(cnt, 0)
+    gebe_zurueck n
+Ende
+
+// 设备名写入原始缓冲 buf (offset 0 起), 返回 CUresult
+Funktion cuda_device_name(dev_idx, buf, buf_len)
+    dev = alloc(4)
+    raw_set32(dev, 0, 0)
+    r = cuDeviceGet(dev, dev_idx)
+    Wenn r != 0 dann
+        gebe_zurueck r
+    Ende
+    d = raw_get32(dev, 0)
+    r2 = cuDeviceGetName(buf, buf_len, d)
+    gebe_zurueck r2
+Ende
+
+// 创建 context, 返回 handle (0 = 失败)
+Funktion cuda_ctx_create(dev_idx)
+    dev = alloc(4)
+    raw_set32(dev, 0, 0)
+    r = cuDeviceGet(dev, dev_idx)
+    Wenn r != 0 dann
+        gebe_zurueck 0
+    Ende
+    d = raw_get32(dev, 0)
+    ctx = alloc(8)
+    raw_set64(ctx, 0, 0)
+    r2 = cuCtxCreate(ctx, 0, d)
+    Wenn r2 != 0 dann
+        gebe_zurueck 0
+    Ende
+    h = raw_get64(ctx, 0)
+    gebe_zurueck h
+Ende
+
+// 诊断: cuDeviceGetCount 是否真正写入 cnt (初始 0x12345678, 读回对比)
+// 返回 16 字节诊断缓冲: [0..3]=r, [4..7]=读回 cnt 值
+Funktion cuda_diag_count()
+    res = alloc(16)
+    cnt = alloc(4)
+    raw_set32(cnt, 0, 305419896)  // 0x12345678
+    r = cuDeviceGetCount(cnt)
+    raw_set32(res, 0, r)
+    raw_set32(res, 4, raw_get32(cnt, 0))
+    gebe_zurueck res
+Ende
+
+// 只读副作用: 忽略返回值, 直接读 cnt (判断写内存副作用是否可靠)
+Funktion cuda_count_side()
+    cnt = alloc(4)
+    raw_set32(cnt, 0, 999)   // 预填 999
+    cuDeviceGetCount(cnt)
+    n = raw_get32(cnt, 0)
+    gebe_zurueck n
+Ende

@@ -1,0 +1,81 @@
+// ============================================================================
+//  binary_trees.staro —— language-bench 考题「Binary Trees」能力层
+//  铁律 E：能力全在 .staro。用 alloc 建完美二叉树（节点=16 字节：left,right 指针）。
+//  递归 make_tree / check，精确复现 lbgen ref_binary_trees。
+//  bt_run() -> 返回 alloc(128)：按顺序写入
+//    [stretch_check, it_d4, sum_d4, it_d6, sum_d6, ..., it_d14, sum_d14, longlived_check]
+//  （每个 8 字节小端；共 1 + 6*2 + 1 = 14 个值）
+// ============================================================================
+
+Funktion make_tree(d)
+    n = alloc(16)
+    Wenn d == 0 dann
+        write_u64(n, 0, 0)
+        write_u64(n, 8, 0)
+    Sonst
+        l = make_tree(d - 1)
+        r = make_tree(d - 1)
+        write_u64(n, 0, l)
+        write_u64(n, 8, r)
+    Ende
+    gebe_zurueck n
+Ende
+
+Funktion bt_check(n)
+    l = read_u64(n, 0)
+    Wenn l == 0 dann
+        gebe_zurueck 1
+    Sonst
+        r = read_u64(n, 8)
+        gebe_zurueck 1 + bt_check(l) + bt_check(r)
+    Ende
+Ende
+
+Funktion pow2(e)
+    v = 1
+    i = 0
+    Solange i < e
+        v = v * 2
+        i = i + 1
+    Ende
+    gebe_zurueck v
+Ende
+
+Funktion bt_run()
+    min_depth = 4
+    max_depth = 14
+    stretch = max_depth + 1
+    out = alloc(128)
+    oi = 0
+
+    // stretch tree
+    st = make_tree(stretch)
+    write_u64(out, oi * 8, bt_check(st))
+    oi = oi + 1
+
+    // long-lived tree
+    long_lived = make_tree(max_depth)
+
+    // 各深度
+    depth = min_depth
+    Solange depth <= max_depth
+        iterations = pow2(max_depth - depth + min_depth)
+        sum = 0
+        i = 0
+        Solange i < iterations
+            tt = make_tree(depth)
+            sum = sum + bt_check(tt)
+            i = i + 1
+        Ende
+        write_u64(out, oi * 8, iterations)
+        oi = oi + 1
+        write_u64(out, oi * 8, sum)
+        oi = oi + 1
+        depth = depth + 2
+    Ende
+
+    write_u64(out, oi * 8, bt_check(long_lived))
+    oi = oi + 1
+
+    gebe_zurueck out
+Ende

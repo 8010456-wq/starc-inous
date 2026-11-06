@@ -1,0 +1,645 @@
+// inuos/softfloat.staro - StarC 软浮点库 (deepPuTT, 纯整数实现 IEEE754 fp32)
+// 依赖: sys.staro (raw_* 不需要, 纯算术)
+// 用途: CPU oracle 参考 (GPU 内核的独立对照)
+// 所有函数以 fp32 位模式 (u32 整数) 输入输出, StarC 无原生浮点, 位模式即值
+//
+// 关键约束: StarC 的 64 位"比较"(>=, < 等) 只比较低 32 位, 不可靠!
+//   -> 凡涉及 >32 位值的比较, 一律用 ge64() (高/低 32 位分段比较)
+//   64 位 加减乘除 是正确的 (已验证: 2^46/2=2^45 正确), 仅比较有坑
+//
+// 精度目标: 相对误差 ~1e-6 (round-to-nearest, 近似 IEEE; 用作 oracle 足够)
+// 注意: 不处理 NaN/Inf/次正规完整语义, 但零/符号正确
+
+// ---- 位字段提取/合成 ----
+Funktion fs_sign(b)
+    gebe_zurueck b / 2147483648
+Ende
+Funktion fs_exp(b)
+    gebe_zurueck (b / 8388608) % 256
+Ende
+Funktion fs_mant(b)
+    gebe_zurueck b % 8388608
+Ende
+Funktion fs_pack(s, e, m)
+    gebe_zurueck s * 2147483648 + e * 8388608 + m
+Ende
+Funktion fs_iszero(b)
+    Wenn (b % 2147483648) == 0 dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+Funktion fs_abs(b)
+    // 清符号位: b % 2^31 (可靠; b - 2^31 有 StarC bug)
+    gebe_zurueck b % 2147483648
+Ende
+Funktion fs_neg(b)
+    Wenn fs_sign(b) == 1 dann
+        // 负 -> 正: 清符号位 (b % 2^31 可靠)
+        gebe_zurueck b % 2147483648
+    Ende
+    // 正 -> 负: 置符号位 (加 2^30 两次; 直接 +2^31 有 StarC bug)
+    gebe_zurueck b + 1073741824 + 1073741824
+Ende
+
+// ---- 整数右移 (逻辑, 无内建 >>) ----
+Funktion lsr(v, n)
+    i = 0
+    Solange i < n
+        v = v / 2
+        i = i + 1
+    Ende
+    gebe_zurueck v
+Ende
+Funktion p2(n)
+    v = 1
+    i = 0
+    Solange i < n
+        v = v * 2
+        i = i + 1
+    Ende
+    gebe_zurueck v
+Ende
+// 64 位非负值的高 32 位 / 低 32 位 (除法/乘法 64 位正确, 仅比较有坑)
+Funktion hi32(v)
+    gebe_zurueck v / 4294967296
+Ende
+Funktion lo32(v)
+    h = v / 4294967296
+    gebe_zurueck v - h * 4294967296
+Ende
+// 64 位非负比较 a >= b (高/低分段, 规避 32 位比较 bug)
+Funktion ge64(a, b)
+    ha = a / 4294967296
+    hb = b / 4294967296
+    Wenn ha > hb dann
+        gebe_zurueck 1
+    Ende
+    Wenn ha < hb dann
+        gebe_zurueck 0
+    Ende
+    la = a - ha * 4294967296
+    lb = b - hb * 4294967296
+    Wenn la >= lb dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- fp32 乘法 ----
+Funktion f32_mul(a, b)
+    Wenn fs_iszero(a) == 1 oder fs_iszero(b) == 1 dann
+        s = fs_sign(a) + fs_sign(b)
+        // IEEE 754: 积的符号 = 两符号异或. 原实现 s>=2 时取 1, 使 (-0)*(-0)、(-0)*负 错得 -0;
+        // 修正为 s>=2 时取 0 (即符号异或), 得 +0.
+        Wenn s >= 2 dann
+            s = 0
+        Ende
+        gebe_zurueck s * 2147483648
+    Ende
+    s = fs_sign(a) + fs_sign(b)
+    Wenn s >= 2 dann
+        s = 0
+    Ende
+    ea = fs_exp(a)
+    eb = fs_exp(b)
+    ma = fs_mant(a) + 8388608
+    mb = fs_mant(b) + 8388608
+    prod = ma * mb              // [2^46, 2^48), 64 位正确
+    e = ea + eb - 127
+    shift = 23
+    Wenn ge64(prod, 140737488355328) dann  // >= 2^47 -> 结果在 [2,4)
+        shift = 24
+        e = e + 1
+    Ende
+    mres = lsr(prod, shift)
+    rbit = lsr(prod, shift - 1) % 2
+    sticky = 0
+    // sticky 只含 round 位(bit shift-1)以下的位, 即低 (shift-1) 位
+    // 修正: 原代码 % p2(shift) 把 round 位本身算入, 使 rbit=1 时 sticky 恒 1,
+    //       精确 tie 情形总是向上舍入, 违反 ties-to-even (±1 ULP 错)
+    Wenn (lo32(prod) % p2(shift - 1)) != 0 dann
+        sticky = 1
+    Ende
+    Wenn rbit == 1 dann
+        Wenn sticky == 1 dann
+            mres = mres + 1
+        Sonst
+            // 恰好 tie (rbit=1, sticky=0): ties-to-even
+            Wenn (mres % 2) == 1 dann
+                mres = mres + 1
+            Ende
+        Ende
+    Ende
+    Wenn mres >= 16777216 dann
+        mres = 8388608
+        e = e + 1
+    Ende
+    Wenn e >= 255 dann
+        gebe_zurueck s * 2147483648 + 2139095040
+    Ende
+    Wenn e <= 0 dann
+        gebe_zurueck s * 2147483648
+    Ende
+    gebe_zurueck fs_pack(s, e, mres - 8388608)
+Ende
+
+// ---- fp32 除法 ----
+Funktion f32_div(a, b)
+    Wenn fs_iszero(b) == 1 dann
+        gebe_zurueck 0
+    Ende
+    Wenn fs_iszero(a) == 1 dann
+        s = fs_sign(a) + fs_sign(b)
+        Wenn s >= 2 dann
+            s = 1
+        Ende
+        gebe_zurueck s * 2147483648
+    Ende
+    s = fs_sign(a) + fs_sign(b)
+    Wenn s >= 2 dann
+        s = 0
+    Ende
+    ea = fs_exp(a)
+    eb = fs_exp(b)
+    ma = fs_mant(a) + 8388608
+    mb = fs_mant(b) + 8388608
+    // 归一化: ratio = ma/mb in [0.5, 2), 化为 1.xxx 小数
+    e = ea - eb + 127
+    num = ma
+    Wenn ma >= mb dann
+        // ratio in [1,2): frac = (ma-mb)/mb in [0,1)
+        num = ma - mb
+    Sonst
+        // ratio in [0.5,1): 2*ratio in [1,2), frac = (2ma-mb)/mb
+        e = e - 1
+        num = ma * 2 - mb
+    Ende
+    // 长除法 23 位小数 + 1 位舍入: q = round(frac * 2^23)
+    q = 0
+    i = 0
+    Solange i < 23
+        num = num * 2
+        q = q * 2
+        Wenn num >= mb dann
+            num = num - mb
+            q = q + 1
+        Ende
+        i = i + 1
+    Ende
+    // 舍入位 (ties-to-even)
+    num = num * 2
+    Wenn num > mb dann
+        q = q + 1
+    Sonst
+        Wenn num == mb dann
+            // 恰好 0.5: ties-to-even
+            Wenn (q % 2) == 1 dann
+                q = q + 1
+            Ende
+        Ende
+    Ende
+    mres = 8388608 + q
+    Wenn mres >= 16777216 dann
+        mres = 8388608
+        e = e + 1
+    Ende
+    Wenn e >= 255 dann
+        gebe_zurueck s * 2147483648 + 2139095040
+    Ende
+    Wenn e <= 0 dann
+        gebe_zurueck s * 2147483648
+    Ende
+    gebe_zurueck fs_pack(s, e, mres - 8388608)
+Ende
+
+// ---- fp32 加法 (IEEE 754 round-to-nearest-even) ----
+Funktion f32_add(a, b)
+    sa = fs_sign(a)
+    sb = fs_sign(b)
+    // 零处理: 异号零相加得 +0, 仅 (-0)+(-0) 得 -0
+    Wenn fs_iszero(a) == 1 dann
+        Wenn fs_iszero(b) == 1 dann
+            s = sa + sb
+            Wenn s >= 2 dann
+                s = 1
+            Sonst
+                s = 0
+            Ende
+            gebe_zurueck s * 2147483648
+        Sonst
+            gebe_zurueck b
+        Ende
+    Ende
+    Wenn fs_iszero(b) == 1 dann
+        gebe_zurueck a
+    Ende
+    ea = fs_exp(a)
+    eb = fs_exp(b)
+    // 保证 aAbs >= bAbs (交换使 |a| >= |b|)
+    aa = fs_abs(a)
+    ab = fs_abs(b)
+    swap = 0
+    Wenn ea < eb dann
+        swap = 1
+    Sonst
+        Wenn ea == eb und aa < ab dann
+            swap = 1
+        Ende
+    Ende
+    Wenn swap == 1 dann
+        tmp = a
+        a = b
+        b = tmp
+        tmp = sa
+        sa = sb
+        sb = tmp
+        tmp = ea
+        ea = eb
+        eb = tmp
+        tmp = aa
+        aa = ab
+        ab = tmp
+    Ende
+    ma = fs_mant(a) + 8388608   // 24 位 1.xxx
+    mb = fs_mant(b) + 8388608
+    shift = ea - eb             // >= 0
+    // b 扩展 3 保护位, 右移 shift 位 (保留低 3 位 g/r/s + sticky)
+    mb3 = mb * 8
+    bst = 0
+    mb_s = 0
+    Wenn shift >= 28 dann
+        bst = 1                 // b 全部移出 (mb 非零)
+    Sonst
+        Wenn shift > 0 dann
+            Wenn (mb3 % p2(shift)) != 0 dann
+                bst = 1
+            Ende
+            mb_s = lsr(mb3, shift)
+        Sonst
+            mb_s = mb3
+        Ende
+    Ende
+    ma3 = ma * 8                // 27 位
+    // 加/减 (27 位 + sticky)
+    r = 0
+    sr = 0
+    st = bst
+    Wenn sa == sb dann
+        r = ma3 + mb_s
+        sr = sa
+    Sonst
+        // 异号: aAbs >= bAbs -> ma3 >= mb_s
+        Wenn ma3 > mb_s dann
+            r = ma3 - mb_s
+            sr = sa
+        Sonst
+            Wenn ma3 == mb_s dann
+                // 高位相消: 仅 sticky 残余, RN -> 0
+                r = 0
+                sr = sa
+            Sonst
+                // 防御: 不应发生
+                r = mb_s - ma3
+                sr = sb
+            Ende
+        Ende
+    Ende
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    e = ea
+    // 归一化 r 到 [2^26, 2^27) (24 位 + 3 保护)
+    // 右移丢弃的低位并入 sticky( st ), 避免丢失 sticky 位
+    Solange r >= 134217728
+        Wenn (r % 2) == 1 dann
+            st = 1
+        Ende
+        r = lsr(r, 1)
+        e = e + 1
+    Ende
+    Solange r < 67108864
+        r = r * 2
+        e = e - 1
+    Ende
+    // 提取 24 位 + round/sticky
+    // 3 个保护位 = r 的低 3 位 (bit2=round, bit1|bit0=sticky)
+    // 修正: 原代码 rbit=bit1, sbit=bit0 漏掉 bit2(真 round), 在 tie 情形 ±1 ULP 错
+    mres = lsr(r, 3)
+    rbit = lsr(r, 2) % 2
+    sbit = 0
+    Wenn (r % 4) != 0 dann
+        sbit = 1
+    Ende
+    sb_all = 0
+    Wenn sbit == 1 oder st == 1 dann
+        sb_all = 1
+    Ende
+    // 舍入区分加/减法:
+    //  同号加法: true = r + eps (b 截断为正) -> 标准 tie-even: rbit AND (sb_all OR mres 奇)
+    //  异号减法: true = r - eps (b 截断使结果偏大) -> 严格 frac>0.5 才上舍入: rbit AND sbit
+    //    (st=1 时 eps>0 使 true<r, frac=0.5 情形必须向下; st=0 退化为标准规则)
+    Wenn sa == sb dann
+        // 加法
+        Wenn rbit == 1 und (sb_all == 1 oder (mres % 2) == 1) dann
+            mres = mres + 1
+        Ende
+    Sonst
+        // 减法
+        Wenn st == 1 dann
+            Wenn rbit == 1 und sbit == 1 dann
+                mres = mres + 1
+            Ende
+        Sonst
+            Wenn rbit == 1 und (sb_all == 1 oder (mres % 2) == 1) dann
+                mres = mres + 1
+            Ende
+        Ende
+    Ende
+    Wenn mres >= 16777216 dann
+        mres = 8388608
+        e = e + 1
+    Ende
+    Wenn e >= 255 dann
+        gebe_zurueck sr * 2147483648 + 2139095040
+    Ende
+    Wenn e <= 0 dann
+        gebe_zurueck sr * 2147483648
+    Ende
+    gebe_zurueck fs_pack(sr, e, mres - 8388608)
+Ende
+
+// ---- fp32 平方根 (整数精确, IEEE 正确舍入) ----
+// a = ma * 2^(ei-23), ma 24 位 1.xxx, ei = ea-127. 偶化指数:
+//   m2 = ma (ei 偶) 或 2*ma (ei 奇), ke 偶. sqrt(a) = sqrt(m2) * 2^(ke/2-11.5)
+//   结果尾数 R = round(sqrt(m2*2^23)), m2*2^23 in [2^46, 2^48) (64位内).
+//   R = floor(sqrt(N)) 或 +1 (舍入), 无 tie (N 整数, sqrt(N) 不恰为 x+0.5).
+Funktion f32_sqrt(a)
+    Wenn fs_iszero(a) == 1 dann
+        gebe_zurueck a
+    Ende
+    Wenn fs_sign(a) == 1 dann
+        gebe_zurueck 0
+    Ende
+    ea = fs_exp(a)
+    ma = fs_mant(a) + 8388608   // 24 位 1.xxx
+    ei = ea - 127
+    m2 = ma
+    ke = ei
+    // 奇偶校验: 原 `(ei - 2*(ei/2)) == 1` 对负奇数失效 (StarC `/` 向零截断,
+    //   ei=-1 -> ei/2=0 -> -1-0=-1 != 1 误判为偶, 不做偶化, 结果错 1.4x)
+    // 改为 != 0: 向零或向 -inf 截断均正确 (奇 -> ±1, 偶 -> 0)
+    Wenn (ei - 2 * (ei / 2)) != 0 dann
+        // ei 奇数: 偶化 (m2 翻倍, 指数减 1)
+        m2 = ma * 2
+        ke = ei - 1
+    Ende
+    // m2 in [2^23, 2^25), ke 偶数
+    N = m2 * 8388608            // m2 * 2^23, in [2^46, 2^48)
+    // 整数 Newton: 固定 25 次, 收敛到 floor(sqrt(N)) 附近 (二次收敛, 48位需~6次)
+    x = 8388608
+    i = 0
+    Solange i < 25
+        xn = (x + N / x) / 2
+        x = xn
+        i = i + 1
+    Ende
+    // 精确修正到 floor(sqrt(N))
+    sq = x * x
+    Solange sq > N
+        x = x - 1
+        sq = x * x
+    Ende
+    Solange (x + 1) * (x + 1) <= N
+        x = x + 1
+        sq = x * x
+    Ende
+    // 舍入: frac = sqrt(N) - x; frac > 0.5 <=> rem > x
+    rem = N - x * x
+    R = x
+    Wenn rem > x dann
+        R = x + 1
+    Ende
+    // R in [2^23, 2^24) (ei 偶: [2^23,2^23.5); ei 奇: [2^23.5,2^24)), 尾数 1.xxx
+    e_out = 127 + ke / 2
+    mres = R
+    Wenn mres >= 16777216 dann
+        mres = 8388608
+        e_out = e_out + 1
+    Ende
+    Wenn e_out >= 255 dann
+        gebe_zurueck 2139095040
+    Ende
+    Wenn e_out <= 0 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck fs_pack(0, e_out, mres - 8388608)
+Ende
+
+// ---- fp32 <-> 整数 ----
+// fp32 -> s32 (向零截断)
+Funktion f32_to_s32(a)
+    s = fs_sign(a)
+    e = fs_exp(a) - 127
+    Wenn e < 0 dann
+        gebe_zurueck 0
+    Ende
+    Wenn e >= 31 dann
+        Wenn s == 1 dann
+            gebe_zurueck 0 - 2147483648
+        Ende
+        gebe_zurueck 2147483647
+    Ende
+    mant = fs_mant(a) + 8388608  // 24-bit 1.xxx
+    Wenn e >= 23 dann
+        v = mant * p2(e - 23)
+    Sonst
+        v = lsr(mant, 23 - e)
+    Ende
+    Wenn s == 1 dann
+        v = 0 - v
+    Ende
+    gebe_zurueck v
+Ende
+// s32 -> fp32
+Funktion s32_to_f32(n)
+    Wenn n == 0 dann
+        gebe_zurueck 0
+    Ende
+    s = 0
+    Wenn n < 0 dann
+        s = 1
+        n = 0 - n
+    Ende
+    // 找最高位位置
+    e = 0
+    t = n
+    Solange t >= 2
+        t = t / 2
+        e = e + 1
+    Ende
+    // n 是 1.xxx * 2^e, 1.xxx 的 24 位: n / 2^(e-23) 截断
+    mant = n
+    Wenn e >= 23 dann
+        mant = lsr(n, e - 23)
+    Sonst
+        mant = n * p2(23 - e)
+    Ende
+    expo = e + 127
+    Wenn expo >= 255 dann
+        expo = 254
+    Ende
+    gebe_zurueck fs_pack(s, expo, mant - 8388608)
+Ende
+// fp32 * 2^n (n 整数, 指数平移)
+Funktion f32_scale2(a, n)
+    Wenn fs_iszero(a) == 1 dann
+        gebe_zurueck a
+    Ende
+    s = fs_sign(a)
+    ea = fs_exp(a)
+    ma = fs_mant(a)
+    ne = ea + n
+    Wenn ne >= 255 dann
+        gebe_zurueck s * 2147483648 + 2139095040
+    Ende
+    Wenn ne <= 0 dann
+        gebe_zurueck s * 2147483648
+    Ende
+    gebe_zurueck fs_pack(s, ne, ma)
+Ende
+
+// ---- fp32 exp (自然底, 纯 fp32 运算) ----
+// exp(x) = 2^(x*log2e); n = round(x*log2e); r = x - n*ln2 (in [-ln2/2,ln2/2]); exp = 2^n * exp(r)
+Funktion f32_exp(a)
+    Wenn fs_iszero(a) == 1 dann
+        gebe_zurueck 1065353216  // 1.0
+    Ende
+    log2e = 1069066811   // 1.4426950408889634 fp32
+    ln2 = 1060205080     // 0.6931471805599453 fp32
+    half = 1056964608    // 0.5
+    one = 1065353216
+    xl = f32_mul(a, log2e)
+    t = f32_add(xl, half)
+    // round(xl): 正负分开 (trunc 向零), round-half-away-from-zero
+    Wenn fs_sign(xl) == 1 dann
+        n = 0 - f32_to_s32(f32_add(fs_neg(xl), half))
+    Sonst
+        n = f32_to_s32(t)
+    Ende
+    nf = s32_to_f32(n)
+    // r = a - n*ln2
+    r = f32_sub(a, f32_mul(nf, ln2))
+    // exp(r) 泰勒 8 项: 1 + r + r2/2 + r3/6 + r4/24 + r5/120 + r6/720 + r7/5040 + r8/40320
+    term = one
+    sum = term
+    term = f32_mul(term, r)                                          // r
+    sum = f32_add(sum, term)
+    term = f32_mul(term, r)
+    term = f32_mul(term, 1056964608)        // term2 = r2/2
+    sum = f32_add(sum, term)
+    term = f32_mul(term, r)
+    term = f32_mul(term, 1051372203)        // term3 = r3/6
+    sum = f32_add(sum, term)
+    term = f32_mul(term, r)
+    term = f32_mul(term, 1048576000)        // term4 = r4/24
+    sum = f32_add(sum, term)
+    term = f32_mul(term, r)
+    term = f32_mul(term, 1045220557)        // term5 = r5/120
+    sum = f32_add(sum, term)
+    term = f32_mul(term, r)
+    term = f32_mul(term, 1042983595)        // term6 = r6/720
+    sum = f32_add(sum, term)
+    term = f32_mul(term, r)
+    term = f32_mul(term, 1041385765)        // term7 = r7/5040
+    sum = f32_add(sum, term)
+    term = f32_mul(term, r)
+    term = f32_mul(term, 1040187392)        // term8 = r8/40320
+    sum = f32_add(sum, term)
+    gebe_zurueck f32_scale2(sum, n)
+Ende
+// fp32 减法
+Funktion f32_sub(a, b)
+    gebe_zurueck f32_add(a, fs_neg(b))
+Ende
+
+// ---- fp32 ln (自然对数, 纯 fp32 运算) ----
+// ln(x) = k*ln2 + ln(m), x = m*2^k, m in [1,2); ln(m) via atanh 级数
+Funktion f32_ln(a)
+    Wenn fs_iszero(a) == 1 dann
+        gebe_zurueck 0
+    Ende
+    Wenn fs_sign(a) == 1 dann
+        gebe_zurueck 0
+    Ende
+    ln2 = 1060205080
+    one = 1065353216
+    k = fs_exp(a) - 127
+    mb = fs_pack(0, 127, fs_mant(a))  // 1.xxx as fp32
+    m1 = f32_sub(mb, one)
+    mp1 = f32_add(mb, one)
+    z = f32_div(m1, mp1)   // in [0, 1/3]
+    z2 = f32_mul(z, z)
+    z4 = f32_mul(z2, z2)
+    z6 = f32_mul(z4, z2)
+    z8 = f32_mul(z6, z2)
+    z10 = f32_mul(z8, z2)
+    // 1 + z2/3 + z4/5 + z6/7 + z8/9 + z10/11
+    s = one
+    s = f32_add(s, f32_mul(z2, 1051372203))   // 1/3
+    s = f32_add(s, f32_mul(z4, 1045220557))   // 1/5
+    s = f32_add(s, f32_mul(z6, 1041385765))   // 1/7
+    s = f32_add(s, f32_mul(z8, 1038323257))   // 1/9
+    s = f32_add(s, f32_mul(z10, 1035611788))  // 1/11
+    // ln(m) = 2*z*s
+    lnm = f32_mul(f32_mul(z, s), 1073741824)  // *2.0
+    kln = f32_mul(s32_to_f32(k), ln2)
+    gebe_zurueck f32_add(lnm, kln)
+Ende
+
+// ---- 便捷包装 ----
+Funktion f32_softplus(a)
+    e = f32_exp(a)
+    o = f32_add(e, 1065353216)
+    gebe_zurueck f32_ln(o)
+Ende
+Funktion f32_sqrtsoftplus(a)
+    l = f32_softplus(a)
+    gebe_zurueck f32_sqrt(l)
+Ende
+Funktion f32_silu(a)
+    n = fs_neg(a)
+    e = f32_exp(n)
+    o = f32_add(e, 1065353216)
+    gebe_zurueck f32_div(a, o)
+Ende
+
+// ---- 有符号浮点比较 (修正 StarC `>` 无符号位模式 bug) ----
+// StarC 的 `a > b` 对 fp32 位模式按无符号整数比较, 负数(高位置1)被当超大正数。
+// f32_gt(a,b) 用符号位分派: 符号不同则正>负; 同号正序=位序, 同号负序=位序取反。
+// 返回 1 当 a>b (有符号), 0 否则。NaN(-inf哨兵)不会误选为最大。
+Funktion f32_gt(a, b)
+    sa = fs_sign(a)
+    sb = fs_sign(b)
+    Wenn sa != sb dann
+        Wenn sa == 0 dann
+            gebe_zurueck 1
+        Ende
+        gebe_zurueck 0
+    Ende
+    Wenn sa == 0 dann
+        Wenn a > b dann
+            gebe_zurueck 1
+        Ende
+        gebe_zurueck 0
+    Ende
+    Wenn a < b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 有符号浮点小于: a<b 等价 f32_gt(b,a)
+Funktion f32_lt(a, b)
+    gebe_zurueck f32_gt(b, a)
+Ende

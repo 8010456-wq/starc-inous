@@ -1,0 +1,286 @@
+// ============================================================================
+//  nc :: inuos/ncc_asm.staro
+//  x86-64 机器码发射器（能力实现层）
+//  编译器自身零内建：本库只用 ncc_lib 能力函数 + 语言原语 alloc/raw_setbyte。
+//  CPU 指令编码在此层用 raw_setbyte 写字节（这是能力实现，允许）。
+//  约定：所有数值 = 64 位整数（寄存器 rax 等），返回 rax。
+// ============================================================================
+
+// ---------- 编码缓冲：code_buf（可增长）----------
+
+// 全局代码缓冲区（动态增长）
+Funktion asm_init(bufcap)
+    gebe_zurueck bufcap
+Ende
+
+// 往 buf+off 写 1 字节，返回新 off
+Funktion asm_byte(buf, off, b)
+    raw_setbyte(buf, off, b)
+    gebe_zurueck off + 1
+Ende
+
+// 写 4 字节小端
+Funktion asm_word32(buf, off, v)
+    raw_setbyte(buf, off, v % 256)
+    raw_setbyte(buf, off + 1, (v / 256) % 256)
+    raw_setbyte(buf, off + 2, (v / 65536) % 256)
+    raw_setbyte(buf, off + 3, (v / 16777216) % 256)
+    gebe_zurueck off + 4
+Ende
+
+// 写 8 字节小端
+Funktion asm_word64(buf, off, v)
+    off = asm_word32(buf, off, v % 4294967296)
+    off = asm_word32(buf, off, v / 4294967296)
+    gebe_zurueck off
+Ende
+
+// ---------- 寄存器编码（REX 前缀辅助）----------
+
+// r/m 字节低 3 位 = reg 编号（0=rax,1=rcx,2=rdx,3=rbx,4=rsp,5=rbp,6=rsi,7=rdi）
+// REX 前缀: 0x40 | (W<<3) | (R<<2) | (X<<1) | B
+
+// mov rax, imm64 (48 B8+rd)
+Funktion asm_mov_rax_imm64(buf, off, v)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0xB8)
+    off = asm_word64(buf, off, v)
+    gebe_zurueck off
+Ende
+
+// mov r/m64, imm32 符号扩展 (48 C7 /0)
+Funktion asm_mov_r64_imm32(buf, off, rm, v)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0xC7)
+    // ModRM: mod=11, reg=000, rm=rm
+    off = asm_byte(buf, off, 0xC0 + rm)
+    off = asm_word32(buf, off, v)
+    gebe_zurueck off
+Ende
+
+// mov rax, [rip+disp32]  (48 8B 05 disp32)
+Funktion asm_mov_rax_rip(buf, off, disp)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x8B)
+    off = asm_byte(buf, off, 0x05)
+    off = asm_word32(buf, off, disp)
+    gebe_zurueck off
+Ende
+
+// mov [rip+disp32], rax (48 89 05 disp32)
+Funktion asm_mov_rip_rax(buf, off, disp)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x89)
+    off = asm_byte(buf, off, 0x05)
+    off = asm_word32(buf, off, disp)
+    gebe_zurueck off
+Ende
+
+// mov r/m64, r64  (48 89 /r)  rm=dest reg, src=src reg
+Funktion asm_mov_r64_rm64(buf, off, rm, src)
+    off = asm_byte(buf, off, 0x48)
+    // ModRM mod=11, reg=src, rm=rm
+    off = asm_byte(buf, off, 0xC0 + (src * 8) + rm)
+    gebe_zurueck off
+Ende
+
+// mov r64, r/m64  (48 8B /r)
+Funktion asm_mov_rm64_r64(buf, off, dest, rm)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0xC0 + (dest * 8) + rm)
+    gebe_zurueck off
+Ende
+
+// ---------- 算术 ----------
+
+// add r/m64, r64  (48 01 /r)
+Funktion asm_add_r64_rm64(buf, off, rm, src)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x01)
+    off = asm_byte(buf, off, 0xC0 + (src * 8) + rm)
+    gebe_zurueck off
+Ende
+
+// add r64, r/m64  (48 03 /r)
+Funktion asm_add_rm64_r64(buf, off, dest, rm)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x03)
+    off = asm_byte(buf, off, 0xC0 + (dest * 8) + rm)
+    gebe_zurueck off
+Ende
+
+// sub r/m64, r64  (48 29 /r)
+Funktion asm_sub_r64_rm64(buf, off, rm, src)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x29)
+    off = asm_byte(buf, off, 0xC0 + (src * 8) + rm)
+    gebe_zurueck off
+Ende
+
+// sub r64, r/m64  (48 2B /r)
+Funktion asm_sub_rm64_r64(buf, off, dest, rm)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x2B)
+    off = asm_byte(buf, off, 0xC0 + (dest * 8) + rm)
+    gebe_zurueck off
+Ende
+
+// imul r64, r/m64  (48 0F AF /r)
+Funktion asm_imul_r64_rm64(buf, off, dest, rm)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x0F)
+    off = asm_byte(buf, off, 0xAF)
+    off = asm_byte(buf, off, 0xC0 + (dest * 8) + rm)
+    gebe_zurueck off
+Ende
+
+// idiv r/m64  (48 F7 /7)
+Funktion asm_idiv_rm64(buf, off, rm)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0xF7)
+    off = asm_byte(buf, off, 0xF8 + rm)
+    gebe_zurueck off
+Ende
+
+// cqo (48 99)
+Funktion asm_cqo(buf, off)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x99)
+    gebe_zurueck off
+Ende
+
+// ---------- 栈 ----------
+
+// push r64 (50+rd)
+Funktion asm_push(buf, off, reg)
+    off = asm_byte(buf, off, 0x50 + reg)
+    gebe_zurueck off
+Ende
+
+// pop r64 (58+rd)
+Funktion asm_pop(buf, off, reg)
+    off = asm_byte(buf, off, 0x58 + reg)
+    gebe_zurueck off
+Ende
+
+// ---------- 调用与跳转 ----------
+
+// call rel32 (E8 disp32)
+Funktion asm_call_rel32(buf, off, disp)
+    off = asm_byte(buf, off, 0xE8)
+    off = asm_word32(buf, off, disp)
+    gebe_zurueck off
+Ende
+
+// call rax (FF D0)
+Funktion asm_call_rax(buf, off)
+    off = asm_byte(buf, off, 0xFF)
+    off = asm_byte(buf, off, 0xD0)
+    gebe_zurueck off
+Ende
+
+// jmp rel32 (E9 disp32)
+Funktion asm_jmp_rel32(buf, off, disp)
+    off = asm_byte(buf, off, 0xE9)
+    off = asm_word32(buf, off, disp)
+    gebe_zurueck off
+Ende
+
+// jcc rel32: 条件码 cc (0F 8x disp32)
+// cc: 0=JO 1=JNO 2=JB 3=JAE 4=JE 5=JNE 6=JBE 7=JA 8=JS 9=JNS
+//    A=JP B=JNP C=JL D=JGE E=JLE F=JG
+Funktion asm_jcc_rel32(buf, off, cc, disp)
+    off = asm_byte(buf, off, 0x0F)
+    off = asm_byte(buf, off, 0x80 + cc)
+    off = asm_word32(buf, off, disp)
+    gebe_zurueck off
+Ende
+
+// ret (C3)
+Funktion asm_ret(buf, off)
+    off = asm_byte(buf, off, 0xC3)
+    gebe_zurueck off
+Ende
+
+// int3 (CC) - 调试断点
+Funktion asm_int3(buf, off)
+    off = asm_byte(buf, off, 0xCC)
+    gebe_zurueck off
+Ende
+
+// ---------- 函数序言/尾声 ----------
+
+// push rbp; mov rbp,rsp (55 48 89 E5)
+Funktion asm_prologue(buf, off)
+    off = asm_byte(buf, off, 0x55)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x89)
+    off = asm_byte(buf, off, 0xE5)
+    gebe_zurueck off
+Ende
+
+// leave (C9) + ret (C3)
+Funktion asm_epilogue(buf, off)
+    off = asm_byte(buf, off, 0xC9)
+    off = asm_byte(buf, off, 0xC3)
+    gebe_zurueck off
+Ende
+
+// 调整 rsp（sub rsp, imm32）：48 81 EC imm32
+Funktion asm_sub_rsp(buf, off, n)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x81)
+    off = asm_byte(buf, off, 0xEC)
+    off = asm_word32(buf, off, n)
+    gebe_zurueck off
+Ende
+
+// add rsp, imm32：48 81 C4 imm32
+Funktion asm_add_rsp(buf, off, n)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x81)
+    off = asm_byte(buf, off, 0xC4)
+    off = asm_word32(buf, off, n)
+    gebe_zurueck off
+Ende
+
+// 栈上访问：mov reg, [rbp+disp32]（disp 可为负）
+// 48 8B 45 disp32 (mov rax,[rbp+disp]) 等
+// reg: 目标寄存器编号
+Funktion asm_mov_reg_rbpdisp(buf, off, reg, disp)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x8B)
+    // ModRM: mod=10(disp32), reg=reg, rm=5(rbp)
+    off = asm_byte(buf, off, 0x80 + (reg * 8) + 5)
+    off = asm_word32(buf, off, disp)
+    gebe_zurueck off
+Ende
+
+// mov [rbp+disp32], reg：48 89 45 disp32
+Funktion asm_mov_rbpdisp_reg(buf, off, reg, disp)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x89)
+    off = asm_byte(buf, off, 0x80 + (reg * 8) + 5)
+    off = asm_word32(buf, off, disp)
+    gebe_zurueck off
+Ende
+
+// mov rax, [rsp+disp32]（48 8B 44 24 disp32）— mod=01,rm=100,SIB,disp8? 用 mod=10 disp32
+Funktion asm_mov_rax_rspdisp(buf, off, disp)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x8B)
+    off = asm_byte(buf, off, 0x44)
+    off = asm_byte(buf, off, 0x24)
+    off = asm_word32(buf, off, disp)
+    gebe_zurueck off
+Ende
+
+// mov [rsp+disp32], rax（48 89 44 24 disp32）
+Funktion asm_mov_rspdisp_rax(buf, off, disp)
+    off = asm_byte(buf, off, 0x48)
+    off = asm_byte(buf, off, 0x89)
+    off = asm_byte(buf, off, 0x44)
+    off = asm_byte(buf, off, 0x24)
+    off = asm_word32(buf, off, disp)
+    gebe_zurueck off
+Ende

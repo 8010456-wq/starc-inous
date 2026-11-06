@@ -1,0 +1,88 @@
+// inuos/parser.staro - 中缀表达式 token -> 后缀式 (RPN), Shunting-Yard 算法
+// 优先级: + - = 1; * / = 2; 括号 () 处理
+// rpn: 每项 8 字节 [type(4)][value(4)], type: 1=数字 4=运算符(value 是 ASCII)
+// 非递归, 用显式运算符栈 ostack(256 字节, 存运算符 ASCII)
+// 依赖: sys.staro(raw_set32/get32/raw_setbyte/raw_byteat)
+
+// 运算符优先级
+Funktion op_prio(c)
+    Wenn c == 43 dann gebe_zurueck 1 Ende  // +
+    Wenn c == 45 dann gebe_zurueck 1 Ende  // -
+    Wenn c == 42 dann gebe_zurueck 2 Ende  // *
+    Wenn c == 47 dann gebe_zurueck 2 Ende  // /
+    gebe_zurueck 0
+Ende
+
+// token 流 -> RPN, 返回 RPN 项数
+Funktion parse_rpn(tokens, n, rpn)
+    ostack = alloc(256)
+    osp = 0
+    rn = 0
+    i = 0
+    Solange i < n
+        base = i * 32
+        t = raw_get32(tokens, base)
+        Wenn t == 1 dann  // 数字 -> RPN 直接
+            v = raw_get32(tokens, base + 4)
+            raw_set32(rpn, rn * 8, 1)
+            raw_set32(rpn, rn * 8 + 4, v)
+            rn = rn + 1
+        Sonst
+            Wenn t == 4 dann  // 运算符
+                c = raw_byteat(tokens, base + 8)
+                Wenn c == 40 dann  // ( 压栈
+                    raw_setbyte(ostack, osp, 40)
+                    osp = osp + 1
+                Sonst
+                    Wenn c == 41 dann  // ) 弹到 (
+                        stop = 0
+                        Solange osp > 0 und stop == 0
+                            oc = raw_byteat(ostack, osp - 1)
+                            Wenn oc == 40 dann
+                                osp = osp - 1
+                                stop = 1
+                            Sonst
+                                raw_set32(rpn, rn * 8, 4)
+                                raw_set32(rpn, rn * 8 + 4, oc)
+                                rn = rn + 1
+                                osp = osp - 1
+                            Ende
+                        Ende
+                    Sonst
+                        // 二元运算符: 弹出优先级 >= 当前的
+                        stop = 0
+                        Solange osp > 0 und stop == 0
+                            oc = raw_byteat(ostack, osp - 1)
+                            Wenn oc == 40 dann
+                                stop = 1
+                            Sonst
+                                Wenn op_prio(oc) >= op_prio(c) dann
+                                    raw_set32(rpn, rn * 8, 4)
+                                    raw_set32(rpn, rn * 8 + 4, oc)
+                                    rn = rn + 1
+                                    osp = osp - 1
+                                Sonst
+                                    stop = 1
+                                Ende
+                            Ende
+                        Ende
+                        raw_setbyte(ostack, osp, c)
+                        osp = osp + 1
+                    Ende
+                Ende
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    // 弹出剩余运算符
+    Solange osp > 0
+        oc = raw_byteat(ostack, osp - 1)
+        Wenn oc != 40 dann
+            raw_set32(rpn, rn * 8, 4)
+            raw_set32(rpn, rn * 8 + 4, oc)
+            rn = rn + 1
+        Ende
+        osp = osp - 1
+    Ende
+    gebe_zurueck rn
+Ende

@@ -1,0 +1,124 @@
+// ============================================================================
+//  starshell :: inuos/file.staro
+//  StarShell V4 能力库 · 文件系统：读取/写入/判断存在
+//  铁律 E：能力在此 .staro 实现，只用 alloc/raw_byteat/raw_setbyte + WinAPI。
+// ============================================================================
+
+linx-o kernel32 CreateFileA ReadFile WriteFile GetFileSize CloseHandle
+linx-o kernel32 GetFileAttributesA GetCurrentDirectoryA SetCurrentDirectoryA
+linx-o kernel32 DeleteFileA
+linx-o kernel32 FindFirstFileA FindNextFileA FindClose
+
+// 读整个文件 -> StarC 字符串（失败返回 0）
+Funktion file_read(path)
+    c = starc_to_cstr(path)
+    h = CreateFileA(c, 2147483648, 1, 0, 3, 128, 0)
+    Wenn h == 0 - 1 dann
+        gebe_zurueck 0
+    Ende
+    size = GetFileSize(h, 0)
+    Wenn size == 4294967295 dann
+        CloseHandle(h)
+        gebe_zurueck 0
+    Ende
+    buf = alloc(8 + size + 1)
+    nb = alloc(4)
+    ok = ReadFile(h, buf + 8, size, nb, 0)
+    CloseHandle(h)
+    raw_setbyte(buf, 0, size % 256)
+    raw_setbyte(buf, 1, (size / 256) % 256)
+    raw_setbyte(buf, 2, (size / 65536) % 256)
+    raw_setbyte(buf, 3, (size / 16777216) % 256)
+    raw_setbyte(buf, 8 + size, 0)
+    gebe_zurueck buf
+Ende
+
+// 写 StarC 字符串到文件（覆盖）。返回写入字节数或 0。
+Funktion file_write(path, data)
+    c = starc_to_cstr(path)
+    n = str_len(data)
+    h = CreateFileA(c, 1073741824, 1, 0, 2, 128, 0)
+    Wenn h == 0 - 1 dann
+        gebe_zurueck 0
+    Ende
+    nb = alloc(4)
+    ok = WriteFile(h, data + 8, n, nb, 0)
+    CloseHandle(h)
+    gebe_zurueck n
+Ende
+
+// 追加写 StarC 字符串到文件
+Funktion file_append(path, data)
+    c = starc_to_cstr(path)
+    n = str_len(data)
+    h = CreateFileA(c, 1073741824, 1, 0, 4, 128, 0)
+    Wenn h == 0 - 1 dann
+        gebe_zurueck 0
+    Ende
+    nb = alloc(4)
+    ok = WriteFile(h, data + 8, n, nb, 0)
+    CloseHandle(h)
+    gebe_zurueck n
+Ende
+
+// 文件/目录是否存在
+Funktion file_exists(path)
+    c = starc_to_cstr(path)
+    attr = GetFileAttributesA(c)
+    Wenn attr == 4294967295 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 删除文件
+Funktion file_delete(path)
+    c = starc_to_cstr(path)
+    r = DeleteFileA(c)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 当前目录 -> StarC 字符串
+Funktion dir_cur()
+    buf = alloc(1024)
+    n = GetCurrentDirectoryA(1024, buf)
+    s = cstr_to_starc(buf)
+    gebe_zurueck s
+Ende
+
+// 切换目录（dir 是 StarC 字符串）
+Funktion dir_set(dir)
+    c = starc_to_cstr(dir)
+    r = SetCurrentDirectoryA(c)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 列出目录内容（pattern 是 StarC 字符串，如 "D:/dir/*"），逐行输出
+Funktion dir_list(pattern)
+    c = starc_to_cstr(pattern)
+    fd = alloc(320)
+    h = FindFirstFileA(c, fd)
+    Wenn h == 0 - 1 dann
+        gebe_zurueck 0
+    Ende
+    write_cstr(fd + 44)
+    write_newline()
+    loop = 1
+    Solange loop == 1
+        r = FindNextFileA(h, fd)
+        Wenn r == 0 dann
+            loop = 0
+        Sonst
+            write_cstr(fd + 44)
+            write_newline()
+        Ende
+    Ende
+    FindClose(h)
+    gebe_zurueck 1
+Ende

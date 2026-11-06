@@ -1,0 +1,309 @@
+// cache_v1.staro - StarC v1.1.1 热缓存模块
+// 功能：文件I/O + 缓存管理
+// Windows API: CreateFileA, WriteFile, ReadFile, CloseHandle, GetFileSize
+// 
+// 缓存格式 (CCV1):
+//   [4 bytes: magic "CCV1"]
+//   [4 bytes: version (1)]
+//   [4 bytes: result_count]
+//   For each result:
+//     [4 bytes: path_length]
+//     [path bytes]
+//
+// 用途：首次运行扫描磁盘并保存结果，二次运行直接从缓存读取
+
+linx-o kernel32 CreateFileA WriteFile ReadFile CloseHandle GetFileSize DeleteFileA
+
+// ============ 常量 ============
+
+// GENERIC_READ = 0x80000000
+// GENERIC_WRITE = 0x40000000
+// FILE_SHARE_READ = 0x00000001
+// FILE_SHARE_WRITE = 0x00000002
+// CREATE_ALWAYS = 2
+// OPEN_EXISTING = 3
+// FILE_ATTRIBUTE_NORMAL = 128
+
+// CCV1 magic bytes: 0x43 0x43 0x56 0x31
+
+// ============ 文件 I/O 函数 ============
+
+// open_write(path) - 创建/覆盖文件用于写入
+// 返回文件句柄，失败返回 0
+Funktion open_write(path)
+    path_cstr = make_cstr(path)
+    
+    // CreateFileA(path, GENERIC_WRITE, FILE_SHARE_WRITE, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+    fh = CreateFileA(path_cstr, 1073741824, 2, 0, 2, 128, 0)
+    
+    Wenn fh == 0 dann
+        gebe_zurueck 0
+    Ende
+    
+    gebe_zurueck fh
+Ende
+
+// open_read(path) - 打开文件用于读取
+// 返回文件句柄，失败返回 0
+Funktion open_read(path)
+    path_cstr = make_cstr(path)
+    
+    // CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0)
+    fh = CreateFileA(path_cstr, 2147483648, 1, 0, 3, 0, 0)
+    
+    Wenn fh == 0 dann
+        gebe_zurueck 0
+    Ende
+    
+    gebe_zurueck fh
+Ende
+
+// file_size(handle) - 获取文件大小
+Funktion file_size(handle)
+    size = GetFileSize(handle, 0)
+    gebe_zurueck size
+Ende
+
+// write_bytes(handle, data, size) - 写入字节到文件
+// 返回写入的字节数，失败返回 0
+Funktion write_bytes(handle, data, size)
+    // 分配缓冲区接收写入字节数
+    rn = alloc(4)
+    raw_setbyte(rn, 0, 0)
+    raw_setbyte(rn, 1, 0)
+    raw_setbyte(rn, 2, 0)
+    raw_setbyte(rn, 3, 0)
+    
+    ok = WriteFile(handle, data, size, rn, 0)
+    
+    Wenn ok == 0 dann
+        gebe_zurueck 0
+    Ende
+    
+    // 读取写入字节数
+    b0 = raw_byteat(rn, 0)
+    b1 = raw_byteat(rn, 1)
+    b2 = raw_byteat(rn, 2)
+    b3 = raw_byteat(rn, 3)
+    written = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+    
+    gebe_zurueck written
+Ende
+
+// read_bytes(handle, buf, size) - 从文件读取字节
+// 返回读取的字节数，失败返回 0
+Funktion read_bytes(handle, buf, size)
+    // 分配缓冲区接收读取字节数
+    rn = alloc(4)
+    raw_setbyte(rn, 0, 0)
+    raw_setbyte(rn, 1, 0)
+    raw_setbyte(rn, 2, 0)
+    raw_setbyte(rn, 3, 0)
+    
+    ok = ReadFile(handle, buf, size, rn, 0)
+    
+    Wenn ok == 0 dann
+        gebe_zurueck 0
+    Ende
+    
+    // 读取字节数
+    b0 = raw_byteat(rn, 0)
+    b1 = raw_byteat(rn, 1)
+    b2 = raw_byteat(rn, 2)
+    b3 = raw_byteat(rn, 3)
+    read = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+    
+    gebe_zurueck read
+Ende
+
+// close_handle(handle) - 关闭文件句柄
+Funktion close_handle(handle)
+    CloseHandle(handle)
+    gebe_zurueck 0
+Ende
+
+// delete_file(path) - 删除文件
+Funktion delete_file(path)
+    path_cstr = make_cstr(path)
+    DeleteFileA(path_cstr)
+    gebe_zurueck 0
+Ende
+
+// ============ 缓存辅助函数 ============
+
+// write_u32(buf, offset, value) - 写入32位整数到缓冲区
+Funktion write_u32(buf, offset, value)
+    raw_setbyte(buf, offset, value % 256)
+    raw_setbyte(buf, offset + 1, (value / 256) % 256)
+    raw_setbyte(buf, offset + 2, (value / 65536) % 256)
+    raw_setbyte(buf, offset + 3, (value / 16777216) % 256)
+    gebe_zurueck 0
+Ende
+
+// read_u32(buf, offset) - 从缓冲区读取32位整数
+Funktion read_u32(buf, offset)
+    b0 = raw_byteat(buf, offset)
+    b1 = raw_byteat(buf, offset + 1)
+    b2 = raw_byteat(buf, offset + 2)
+    b3 = raw_byteat(buf, offset + 3)
+    value = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+    gebe_zurueck value
+Ende
+
+// ============ 缓存操作 ============
+
+// cache_exists(path) - 检查缓存文件是否存在
+// 返回 1 存在，0 不存在
+Funktion cache_exists(path)
+    fh = open_read(path)
+    Wenn fh == 0 dann
+        gebe_zurueck 0
+    Ende
+    close_handle(fh)
+    gebe_zurueck 1
+Ende
+
+// cache_save_result(cache_path, result_path) - 保存搜索结果到缓存
+// cache_path: 缓存文件路径
+// result_path: 搜索到的文件路径
+// 返回 1 成功，0 失败
+Funktion cache_save_result(cache_path, result_path)
+    result_len = liste_laenge(result_path)
+    
+    // 计算总大小: 4(magic) + 4(version) + 4(count) + 4(path_len) + result_len
+    total_size = 4 + 4 + 4 + 4 + result_len
+    
+    // 分配缓冲区
+    buf = alloc(total_size)
+    i = 0
+    Solange i < total_size
+        raw_setbyte(buf, i, 0)
+        i = i + 1
+    Ende
+    
+    // 写入 magic "CCV1"
+    raw_setbyte(buf, 0, 67)    // 'C'
+    raw_setbyte(buf, 1, 67)    // 'C'
+    raw_setbyte(buf, 2, 86)    // 'V'
+    raw_setbyte(buf, 3, 49)    // '1'
+    
+    // 写入 version = 1
+    write_u32(buf, 4, 1)
+    
+    // 写入 result_count = 1
+    write_u32(buf, 8, 1)
+    
+    // 写入 path_length
+    write_u32(buf, 12, result_len)
+    
+    // 写入 result_path
+    i = 0
+    Solange i < result_len
+        raw_setbyte(buf, 16 + i, byteat(result_path, i))
+        i = i + 1
+    Ende
+    
+    // 写入文件
+    fh = open_write(cache_path)
+    Wenn fh == 0 dann
+        gebe_zurueck 0
+    Ende
+    
+    written = write_bytes(fh, buf, total_size)
+    close_handle(fh)
+    
+    Wenn written == total_size dann
+        gebe_zurueck 1
+    Ende
+    
+    gebe_zurueck 0
+Ende
+
+// cache_load_result(cache_path) - 从缓存加载搜索结果
+// 返回搜索到的文件路径（StarC字符串），失败返回空字符串
+Funktion cache_load_result(cache_path)
+    fh = open_read(cache_path)
+    Wenn fh == 0 dann
+        gebe_zurueck ""
+    Ende
+    
+    // 读取文件头 (20 bytes: 4 magic + 4 version + 4 count + 4 path_len)
+    header = alloc(20)
+    read_n = read_bytes(fh, header, 20)
+    
+    Wenn read_n < 20 dann
+        close_handle(fh)
+        gebe_zurueck ""
+    Ende
+    
+    // 检查 magic
+    Wenn raw_byteat(header, 0) != 67 dann
+        close_handle(fh)
+        gebe_zurueck ""
+    Ende
+    Wenn raw_byteat(header, 1) != 67 dann
+        close_handle(fh)
+        gebe_zurueck ""
+    Ende
+    Wenn raw_byteat(header, 2) != 86 dann
+        close_handle(fh)
+        gebe_zurueck ""
+    Ende
+    Wenn raw_byteat(header, 3) != 49 dann
+        close_handle(fh)
+        gebe_zurueck ""
+    Ende
+    
+    // 读取 version
+    version = read_u32(header, 4)
+    
+    // 读取 result_count
+    result_count = read_u32(header, 8)
+    
+    // 读取 path_length
+    path_len = read_u32(header, 12)
+    
+    // 读取 result_path
+    Wenn path_len > 0 dann
+        result_buf = alloc(path_len + 1)
+        read_n = read_bytes(fh, result_buf, path_len)
+        
+        Wenn read_n < path_len dann
+            close_handle(fh)
+            gebe_zurueck ""
+        Ende
+        
+        close_handle(fh)
+        
+        // 转换为 StarC 字符串
+        result_str = alloc(8 + path_len + 1)
+        
+        // 写入长度头
+        write_u32(result_str, 0, path_len)
+        raw_setbyte(result_str, 4, 0)
+        raw_setbyte(result_str, 5, 0)
+        raw_setbyte(result_str, 6, 0)
+        raw_setbyte(result_str, 7, 0)
+        
+        // 复制数据
+        i = 0
+        Solange i < path_len
+            raw_setbyte(result_str, 8 + i, raw_byteat(result_buf, i))
+            i = i + 1
+        Ende
+        
+        // 空终止符
+        raw_setbyte(result_str, 8 + path_len, 0)
+        
+        gebe_zurueck result_str
+    Ende
+    
+    close_handle(fh)
+    gebe_zurueck ""
+Ende
+
+// cache_flush(cache_path) - 清除缓存（删除缓存文件）
+Funktion cache_flush(cache_path)
+    delete_file(cache_path)
+    gebe_zurueck 0
+Ende

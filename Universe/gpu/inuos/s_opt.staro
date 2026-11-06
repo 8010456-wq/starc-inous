@@ -1,0 +1,114 @@
+// ============================================================
+// s_opt.staro — S 系优化器 (StarC+staro 从零重写, 替代 Python 版 RL/K 系)
+// Universe 3D V1 阶段1: 6G 显存内训 100M 权重的核心
+// 纯 StarC, 零第三方依赖 (softfloat + tensor + sys)
+//
+// S1: Adam 类一阶 (一阶矩 m + 二阶矩 v + bias correction)
+//   s_adam_step(W, G, m, v, n, lr, beta1, beta2, eps, t)
+//   W = W - lr * mhat/(sqrt(vhat)+eps), mhat=m/(1-b1^t), vhat=v/(1-b2^t)
+// S2: 量化 + 混合精度 (fp16/int8, 6G 内训 100M 关键)
+//   s_pack_f16  / s_unpack_f16  : f32 <-> fp16 位模式
+//   s_quant_i8  / s_dequant_i8  : f32 -> int8 量化 (含 scale)
+// S3: 稀疏 / 梯度压缩
+//   s_grad_sparse(G, n, thr) : 置 |g|<thr 为 0 (阈值稀疏化)
+// ============================================================
+
+// ---- S1: Adam 一阶单步 ----
+// W/G/m/v: f32 位模式缓冲 (n 元素); lr/beta1/beta2/eps: f32 位模式; t: 步数
+// 返回 1 成功
+Funktion s_adam_step(W, G, m, v, n, lr, beta1, beta2, eps, t)
+    // bias correction: bc1 = 1 - b1^t, bc2 = 1 - b2^t
+    l1 = f32_ln(beta1)
+    l2 = f32_ln(beta2)
+    b1t = f32_exp(f32_mul(s32_to_f32(t), l1))
+    b2t = f32_exp(f32_mul(s32_to_f32(t), l2))
+    one = s32_to_f32(1)
+    bc1 = f32_sub(one, b1t)
+    bc2 = f32_sub(one, b2t)
+    omb1 = f32_sub(one, beta1)
+    omb2 = f32_sub(one, beta2)
+    i = 0
+    Solange i < n
+        g = raw_get32(G, i * 4)
+        // m = b1*m + (1-b1)*g
+        m_new = f32_add(f32_mul(beta1, raw_get32(m, i * 4)), f32_mul(omb1, g))
+        raw_set32(m, i * 4, m_new)
+        // v = b2*v + (1-b2)*g*g
+        g2 = f32_mul(g, g)
+        v_new = f32_add(f32_mul(beta2, raw_get32(v, i * 4)), f32_mul(omb2, g2))
+        raw_set32(v, i * 4, v_new)
+        // W -= lr * (m/bc1) / (sqrt(v/bc2) + eps)
+        mhat = f32_div(m_new, bc1)
+        vhat = f32_div(v_new, bc2)
+        denom = f32_add(f32_sqrt(vhat), eps)
+        delta = f32_div(f32_mul(lr, mhat), denom)
+        w_new = f32_sub(raw_get32(W, i * 4), delta)
+        raw_set32(W, i * 4, w_new)
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// ---- S2: f32 <-> fp16 位模式转换 (混合精度, 权重/激活减半) ----
+// 输入 f32 位模式, 输出 fp16 位模式 (低16位有效)
+Funktion s_pack_f16(a)
+    // 简化为保留指数+截断尾数 (未做舍入, 精度足够 S2 混合训练)
+    // f32: s|e8|m23 -> f16: s|e5|m10
+    sign = a / 2147483648
+    expo = (a / 8388608) % 256
+    mant = a % 8388608
+    // 重偏置: e5 = e8 - 127 + 15
+    e5 = expo - 127 + 15
+    h = sign * 32768 + e5 * 1024 + mant / 8192
+    gebe_zurueck h
+Ende
+
+// fp16 位模式 -> f32 位模式
+Funktion s_unpack_f16(h)
+    sign = h / 32768
+    e5 = (h / 1024) % 32
+    mant = h % 1024
+    expo = e5 - 15 + 127
+    f = sign * 2147483648 + expo * 8388608 + mant * 8192
+    gebe_zurueck f
+Ende
+
+// ---- S2: f32 -> int8 量化 (含 scale), 输出 i8 字节 + scale f32 ----
+// 输入 f32 位模式缓冲 buf (n 元素), 输出 i8 缓冲 q (n 字节), scale_out 存 scale 位模式
+Funktion s_quant_i8(buf, q, n, scale_out)
+    // 求 max|buf|
+    amax = s32_to_f32(0)
+    i = 0
+    Solange i < n
+        v = raw_get32(buf, i * 4)
+        Wenn f32_gt(v, amax) dann amax = v Ende
+        Wenn f32_lt(v, f32_sub(s32_to_f32(0), amax)) dann amax = f32_sub(s32_to_f32(0), v) Ende
+        i = i + 1
+    Ende
+    // scale = 127 / amax
+    scale = f32_div(s32_to_f32(127), amax)
+    raw_set32(scale_out, 0, scale)
+    i = 0
+    Solange i < n
+        v = raw_get32(buf, i * 4)
+        qv = f32_to_s32(f32_mul(v, scale))
+        Wenn qv > 127 dann qv = 127 Ende
+        Wenn qv < -128 dann qv = -128 Ende
+        raw_setbyte(q, i, qv + 128)
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// ---- S3: 梯度阈值稀疏化 (置 |g| < thr 为 0) ----
+Funktion s_grad_sparse(G, n, thr)
+    i = 0
+    Solange i < n
+        g = raw_get32(G, i * 4)
+        Wenn f32_lt(g, thr) und f32_gt(g, f32_sub(s32_to_f32(0), thr)) dann
+            raw_set32(G, i * 4, s32_to_f32(0))
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende

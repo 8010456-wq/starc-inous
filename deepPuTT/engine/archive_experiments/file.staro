@@ -1,0 +1,18 @@
+// inuos/file.staro - CreateFileA/WriteFile 副作用测试
+linx "kernel32.dll!CreateFileA"
+linx "kernel32.dll!WriteFile"
+linx "kernel32.dll!CloseHandle"
+Funktion file_write_test()
+    // 创建 test.txt (GENERIC_WRITE=0x40000000, CREATE_ALWAYS=2, FILE_ATTRIBUTE_NORMAL=0x80)
+    h = CreateFileA("D:/starc_test.txt", 1073741824, 0, 0, 2, 128, 0)
+    // 写 "OK" (2字节)
+    data = alloc(2)
+    raw_setbyte(data, 0, 79)   // 'O'
+    raw_setbyte(data, 1, 75)   // 'K'
+    written = alloc(4)
+    raw_set32(written, 0, 0)
+    r = WriteFile(h, data, 2, written, 0)
+    CloseHandle(h)
+    n = raw_get32(written, 0)
+    gebe_zurueck n
+Ende

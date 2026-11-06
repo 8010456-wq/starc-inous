@@ -1,0 +1,291 @@
+// ============================================================================
+//  starshell :: inuos/eng_mathe.staro
+//  Selbst implementierte Mathe-Befehle (keine Weiterleitung, reine Berechnung)
+//  Eisenregel E: nur alloc/raw_setbyte/raw_byteat + einfache Arithmetik.
+// ============================================================================
+
+Funktion mathe_istprim(n)
+    Wenn n < 2 dann
+        gebe_zurueck 0
+    Ende
+    i = 2
+    Solange i * i <= n
+        r = n - (n / i) * i
+        Wenn r == 0 dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+Funktion mathe_fakultaet(n)
+    Wenn n <= 1 dann
+        gebe_zurueck 1
+    Ende
+    f = 1
+    i = 2
+    Solange i <= n
+        f = f * i
+        i = i + 1
+    Ende
+    gebe_zurueck f
+Ende
+
+Funktion mathe_ggt(a, b)
+    Solange b != 0
+        r = a - (a / b) * b
+        a = b
+        b = r
+    Ende
+    Wenn a < 0 dann
+        a = 0 - a
+    Ende
+    gebe_zurueck a
+Ende
+
+Funktion mathe_kgv(a, b)
+    Wenn a == 0 dann
+        Wenn b == 0 dann
+            gebe_zurueck 0
+        Ende
+    Ende
+    g = mathe_ggt(a, b)
+    Wenn g == 0 dann
+        gebe_zurueck 0
+    Ende
+    q = a / g
+    r = q * b
+    Wenn r < 0 dann
+        r = 0 - r
+    Ende
+    gebe_zurueck r
+Ende
+
+Funktion mathe_fib(n)
+    Wenn n <= 0 dann
+        gebe_zurueck 0
+    Ende
+    Wenn n == 1 dann
+        gebe_zurueck 1
+    Ende
+    a = 0
+    b = 1
+    i = 2
+    Solange i <= n
+        c = a + b
+        a = b
+        b = c
+        i = i + 1
+    Ende
+    gebe_zurueck b
+Ende
+
+Funktion mathe_ziffernsumme(n)
+    Wenn n < 0 dann
+        n = 0 - n
+    Ende
+    s = 0
+    Solange n > 0
+        s = s + (n - (n / 10) * 10)
+        n = n / 10
+    Ende
+    gebe_zurueck s
+Ende
+
+// Verzeichnis der Mathematik-Befehle
+Funktion eng_mathe(op, args)
+    Wenn str_eq(op, "add") dann
+        a = argument_n(args, 0, 1)
+        b = argument_n(args, 0, 2)
+        r = str_to_int(a) + str_to_int(b)
+        write_int(r)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "sub") dann
+        a = argument_n(args, 0, 1)
+        b = argument_n(args, 0, 2)
+        write_int(str_to_int(a) - str_to_int(b))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "mul") dann
+        a = argument_n(args, 0, 1)
+        b = argument_n(args, 0, 2)
+        write_int(str_to_int(a) * str_to_int(b))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "div") dann
+        a = argument_n(args, 0, 1)
+        b = argument_n(args, 0, 2)
+        d = str_to_int(b)
+        Wenn d == 0 dann
+            write_str("Fehler: Division durch 0")
+            write_newline()
+            gebe_zurueck 1
+        Ende
+        write_int(str_to_int(a) / d)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "mod") dann
+        a = argument_n(args, 0, 1)
+        b = argument_n(args, 0, 2)
+        d = str_to_int(b)
+        Wenn d == 0 dann
+            write_str("Fehler: Modulo durch 0")
+            write_newline()
+            gebe_zurueck 1
+        Ende
+        n = str_to_int(a)
+        write_int(n - (n / d) * d)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "abs") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        Wenn a < 0 dann
+            a = 0 - a
+        Ende
+        write_int(a)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "quadrat") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        write_int(a * a)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "kubik") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        write_int(a * a * a)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "potenz") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        b = str_to_int(argument_n(args, 0, 2))
+        r = 1
+        i = 0
+        Solange i < b
+            r = r * a
+            i = i + 1
+        Ende
+        write_int(r)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "wurzel") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        Wenn a < 0 dann
+            write_str("Fehler: Wurzel aus negativer Zahl")
+            write_newline()
+            gebe_zurueck 1
+        Ende
+        r = 0
+        Solange r * r <= a
+            r = r + 1
+        Ende
+        write_int(r - 1)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "max") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        b = str_to_int(argument_n(args, 0, 2))
+        Wenn a > b dann
+            write_int(a)
+        Sonst
+            write_int(b)
+        Ende
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "min") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        b = str_to_int(argument_n(args, 0, 2))
+        Wenn a < b dann
+            write_int(a)
+        Sonst
+            write_int(b)
+        Ende
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "istprim") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        Wenn mathe_istprim(a) == 1 dann
+            write_str("ja")
+        Sonst
+            write_str("nein")
+        Ende
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "fakultaet") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        write_int(mathe_fakultaet(a))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "ggt") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        b = str_to_int(argument_n(args, 0, 2))
+        write_int(mathe_ggt(a, b))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "kgv") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        b = str_to_int(argument_n(args, 0, 2))
+        write_int(mathe_kgv(a, b))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "fib") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        write_int(mathe_fib(a))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "istgerade") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        r = a - (a / 2) * 2
+        Wenn r == 0 dann
+            write_str("ja")
+        Sonst
+            write_str("nein")
+        Ende
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "ziffernsumme") dann
+        a = str_to_int(argument_n(args, 0, 1))
+        write_int(mathe_ziffernsumme(a))
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "istpalindrom") dann
+        s = argument_n(args, 0, 1)
+        n = str_len(s)
+        ok = 1
+        i = 0
+        Solange i < n
+            Wenn raw_byteat(s, 8 + i) != raw_byteat(s, 8 + n - 1 - i) dann
+                ok = 0
+            Ende
+            i = i + 1
+        Ende
+        Wenn ok == 1 dann
+            write_str("ja")
+        Sonst
+            write_str("nein")
+        Ende
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende

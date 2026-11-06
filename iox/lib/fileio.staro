@@ -1,0 +1,222 @@
+// fileio.staro - 文件 I/O 模块
+// 使用 Windows API: CreateFileA, ReadFile, GetFileSize, CloseHandle, DeleteFileA
+// 编码转换: MultiByteToWideChar, WideCharToMultiByte
+// 控制台: SetConsoleOutputCP
+
+linx-o kernel32 CreateFileA ReadFile GetFileSize CloseHandle DeleteFileA GetStdHandle WriteFile MultiByteToWideChar WideCharToMultiByte SetConsoleOutputCP
+
+// ========== 控制台设置 ==========
+
+// 设置控制台输出为 UTF-8 编码
+Funktion set_utf8_console()
+    SetConsoleOutputCP(65001)
+    gebe_zurueck 1
+Ende
+
+// ========== 编码转换 ==========
+
+// GBK 转 UTF-8
+Funktion gbk_to_utf8(starc_str)
+    cstr = to_cstr(starc_str)
+
+    // 获取需要的宽字符数量
+    wide_size = MultiByteToWideChar(936, 0, cstr, -1, 0, 0)
+    Wenn wide_size <= 0 dann
+        gebe_zurueck starc_str
+    Ende
+
+    // 分配宽字符缓冲区
+    wide_buf = alloc(wide_size * 2)
+
+    // GBK → UTF-16
+    MultiByteToWideChar(936, 0, cstr, -1, wide_buf, wide_size)
+
+    // 获取需要的 UTF-8 字节数
+    utf8_size = WideCharToMultiByte(65001, 0, wide_buf, -1, 0, 0)
+    Wenn utf8_size <= 0 dann
+        gebe_zurueck starc_str
+    Ende
+
+    // 分配 UTF-8 缓冲区
+    utf8_buf = alloc(utf8_size + 1)
+
+    // UTF-16 → UTF-8
+    WideCharToMultiByte(65001, 0, wide_buf, -1, utf8_buf, utf8_size, 0, 0)
+
+    // 转为 StarC 字符串
+    result = from_cstr(utf8_buf)
+    gebe_zurueck result
+Ende
+
+// ========== 文件操作 ==========
+
+// 读取整个文件到 StarC 字符串
+Funktion read_entire_file(path)
+    path_cstr = to_cstr(path)
+    handle = CreateFileA(path_cstr, 2147483648, 0, 0, 3, 0, 0)
+
+    Wenn handle == -1 dann
+        gebe_zurueck ""
+    Ende
+
+    size = GetFileSize(handle)
+
+    Wenn size <= 0 dann
+        CloseHandle(handle)
+        gebe_zurueck ""
+    Ende
+
+    buf = alloc(size)
+    bytes_read = alloc(4)
+    raw_setbyte(bytes_read, 0, 0)
+    raw_setbyte(bytes_read, 1, 0)
+    raw_setbyte(bytes_read, 2, 0)
+    raw_setbyte(bytes_read, 3, 0)
+
+    result = ReadFile(handle, buf, size, bytes_read, 0)
+    CloseHandle(handle)
+
+    Wenn result == 0 dann
+        gebe_zurueck ""
+    Ende
+
+    actual_size = raw_byteat(bytes_read, 0)
+    actual_size = actual_size + raw_byteat(bytes_read, 1) * 256
+    actual_size = actual_size + raw_byteat(bytes_read, 2) * 65536
+    actual_size = actual_size + raw_byteat(bytes_read, 3) * 16777216
+
+    str_buf = alloc(8 + actual_size + 1)
+    raw_setbyte(str_buf, 0, actual_size % 256)
+    raw_setbyte(str_buf, 1, (actual_size / 256) % 256)
+    raw_setbyte(str_buf, 2, (actual_size / 65536) % 256)
+    raw_setbyte(str_buf, 3, (actual_size / 16777216) % 256)
+    raw_setbyte(str_buf, 4, 0)
+    raw_setbyte(str_buf, 5, 0)
+    raw_setbyte(str_buf, 6, 0)
+    raw_setbyte(str_buf, 7, 0)
+
+    i = 0
+    Solange i < actual_size
+        raw_setbyte(str_buf, 8 + i, raw_byteat(buf, i))
+        i = i + 1
+    Ende
+    raw_setbyte(str_buf, 8 + actual_size, 0)
+
+    gebe_zurueck str_buf
+Ende
+
+// 检查文件是否存在
+Funktion file_exists(path)
+    path_cstr = to_cstr(path)
+    handle = CreateFileA(path_cstr, 2147483648, 0, 0, 3, 0, 0)
+
+    Wenn handle == -1 dann
+        gebe_zurueck 0
+    Ende
+
+    CloseHandle(handle)
+    gebe_zurueck 1
+Ende
+
+// 写入字符串到文件
+Funktion write_file(path, content)
+    path_cstr = to_cstr(path)
+    content_cstr = to_cstr(content)
+
+    handle = CreateFileA(path_cstr, 1073741824, 0, 0, 2, 0, 0)
+
+    Wenn handle == -1 dann
+        gebe_zurueck 0
+    Ende
+
+    content_len = str_len(content)
+    bytes_written = alloc(4)
+    raw_setbyte(bytes_written, 0, 0)
+    raw_setbyte(bytes_written, 1, 0)
+    raw_setbyte(bytes_written, 2, 0)
+    raw_setbyte(bytes_written, 3, 0)
+
+    WriteFile(handle, content_cstr, content_len, bytes_written, 0)
+    CloseHandle(handle)
+
+    gebe_zurueck content_len
+Ende
+
+// ========== 命令行 ==========
+
+linx-o kernel32 GetCommandLineA
+
+// 获取命令行 C 字符串指针
+Funktion get_cmdline()
+    ptr = GetCommandLineA()
+    gebe_zurueck ptr
+Ende
+
+// 从命令行提取指定位置的参数
+Funktion get_arg_at(cmdline, index)
+    pos = 0
+    current_arg = 0
+
+    // 跳过前导空格
+    Solange raw_byteat(cmdline, pos) == 32
+        pos = pos + 1
+    Ende
+
+    Solange raw_byteat(cmdline, pos) != 0
+        // 跳过空格
+        Solange raw_byteat(cmdline, pos) == 32
+            pos = pos + 1
+        Ende
+
+        Wenn raw_byteat(cmdline, pos) == 0 dann
+            gebe_zurueck ""
+        Ende
+
+        Wenn current_arg == index dann
+            arg_start = pos
+            arg_end = pos
+            Solange raw_byteat(cmdline, arg_end) != 32 und raw_byteat(cmdline, arg_end) != 0
+                arg_end = arg_end + 1
+            Ende
+            arg_len = arg_end - arg_start
+
+            // 去掉引号
+            Wenn arg_len > 0 und raw_byteat(cmdline, arg_start) == 34 dann
+                arg_start = arg_start + 1
+                arg_len = arg_len - 1
+            Ende
+            Wenn arg_len > 0 und raw_byteat(cmdline, arg_start + arg_len - 1) == 34 dann
+                arg_len = arg_len - 1
+            Ende
+
+            Wenn arg_len <= 0 dann
+                gebe_zurueck ""
+            Ende
+
+            arg_buf = alloc(8 + arg_len + 1)
+            raw_setbyte(arg_buf, 0, arg_len % 256)
+            raw_setbyte(arg_buf, 1, (arg_len / 256) % 256)
+            raw_setbyte(arg_buf, 2, (arg_len / 65536) % 256)
+            raw_setbyte(arg_buf, 3, (arg_len / 16777216) % 256)
+            raw_setbyte(arg_buf, 4, 0)
+            raw_setbyte(arg_buf, 5, 0)
+            raw_setbyte(arg_buf, 6, 0)
+            raw_setbyte(arg_buf, 7, 0)
+            j = 0
+            Solange j < arg_len
+                raw_setbyte(arg_buf, 8 + j, raw_byteat(cmdline, arg_start + j))
+                j = j + 1
+            Ende
+            raw_setbyte(arg_buf, 8 + arg_len, 0)
+            gebe_zurueck arg_buf
+        Ende
+
+        // 跳到下一个参数
+        current_arg = current_arg + 1
+        Solange raw_byteat(cmdline, pos) != 32 und raw_byteat(cmdline, pos) != 0
+            pos = pos + 1
+        Ende
+    Ende
+
+    gebe_zurueck ""
+Ende

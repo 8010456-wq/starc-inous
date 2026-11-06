@@ -1,0 +1,96 @@
+// ============================================================================
+//  starshell :: inuos/eng_pfad.staro
+//  Selbst implementierte Pfad-Befehle (reine Zeichenkettenlogik)
+//  args = C-String des Befehlsrests.
+// ============================================================================
+
+// Verzeichnisteil eines Pfades
+Funktion pfad_dirname(args)
+    p = extract_arg(args, 0)
+    n = str_len(p)
+    i = n - 1
+    Solange i >= 0
+        ch = raw_byteat(p, 8 + i)
+        Wenn ch == 47 dann
+            gebe_zurueck str_slice(p, 0, i)
+        Ende
+        Wenn ch == 92 dann
+            gebe_zurueck str_slice(p, 0, i)
+        Ende
+        i = i - 1
+    Ende
+    gebe_zurueck cstr_to_starc(".")
+Ende
+
+// Endung eines Pfades (inkl. Punkt)
+Funktion pfad_ext(args)
+    p = extract_arg(args, 0)
+    n = str_len(p)
+    i = n - 1
+    Solange i >= 0
+        ch = raw_byteat(p, 8 + i)
+        Wenn ch == 47 dann
+            gebe_zurueck cstr_to_starc("")
+        Ende
+        Wenn ch == 92 dann
+            gebe_zurueck cstr_to_starc("")
+        Ende
+        Wenn ch == 46 dann
+            gebe_zurueck str_slice(p, i, n - i)
+        Ende
+        i = i - 1
+    Ende
+    gebe_zurueck cstr_to_starc("")
+Ende
+
+// Basisname ohne Endung
+Funktion pfad_basename(args)
+    p = extract_arg(args, 0)
+    gebe_zurueck basis_name(p)
+Ende
+
+// Pfade zusammenfuegen
+Funktion pfad_join(args)
+    a = extract_arg(args, 0)
+    b = argument_n(args, 0, 2)
+    s = a
+    n = str_len(s)
+    Wenn n > 0 dann
+        letztes = raw_byteat(s, 8 + n - 1)
+        Wenn letztes != 47 dann
+            Wenn letztes != 92 dann
+                s = str_concat(s, "/")
+            Ende
+        Ende
+    Ende
+    s = str_concat(s, b)
+    write_str(s)
+    write_newline()
+    gebe_zurueck 1
+Ende
+
+// Normieren: \ -> /, doppelte trennen
+Funktion pfad_normal(args)
+    p = extract_arg(args, 0)
+    n = str_len(p)
+    buf = alloc(8 + n + 2)
+    pos = 0
+    i = 0
+    Solange i < n
+        ch = raw_byteat(p, 8 + i)
+        Wenn ch == 92 dann
+            ch = 47
+        Ende
+        raw_setbyte(buf, 8 + pos, ch)
+        pos = pos + 1
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 0, pos % 256)
+    raw_setbyte(buf, 1, (pos / 256) % 256)
+    raw_setbyte(buf, 2, (pos / 65536) % 256)
+    raw_setbyte(buf, 3, (pos / 16777216) % 256)
+    raw_setbyte(buf, 8 + pos, 0)
+    write_str(buf)
+    write_newline()
+    gebe_zurueck 1
+Ende

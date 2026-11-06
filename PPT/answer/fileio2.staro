@@ -1,0 +1,42 @@
+// ============================================================================
+//  fileio.staro —— language-bench 实例读取能力层（铁律 E：能力全在 .staro）
+//  仅保留核心：open / size / read_all / close（供最小验证）
+// ============================================================================
+
+linx-o kernel32 CreateFileA GetFileSizeEx ReadFile CloseHandle
+
+Funktion fio_read_u64(buf, off)
+    v = raw_byteat(buf, off + 0) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    v = v + raw_byteat(buf, off + 4) * 4294967296 + raw_byteat(buf, off + 5) * 1099511627776 + raw_byteat(buf, off + 6) * 281474976710656 + raw_byteat(buf, off + 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+Funktion fio_open(path_c)
+    h = CreateFileA(path_c, 0x80000000, 1, 0, 3, 0x80, 0)
+    gebe_zurueck h
+Ende
+
+Funktion fio_size(h)
+    p = alloc(8)
+    ok = GetFileSizeEx(h, p)
+    Wenn ok == 0 dann
+        gebe_zurueck -1
+    Ende
+    gebe_zurueck fio_read_u64(p, 0)
+Ende
+
+Funktion fio_read_all(h, size)
+    buf = alloc(size + 1)
+    nb = alloc(4)
+    ok = ReadFile(h, buf, size, nb, 0)
+    Wenn ok == 0 dann
+        gebe_zurueck 0
+    Ende
+    raw_setbyte(buf, size, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion fio_close(h)
+    CloseHandle(h)
+    gebe_zurueck 0
+Ende

@@ -1,0 +1,108 @@
+// inuos/cuda_loader.staro - CUDA Driver API 绑定 (starcx64 项目, PTX 加载执行验证)
+// 复用 deepPuTT cuda.staro 的关键封装
+// 依赖: sys.staro (raw_get32/get64)
+
+linx "nvcuda.dll!cuInit"
+linx "nvcuda.dll!cuDeviceGetCount"
+linx "nvcuda.dll!cuDeviceGet"
+linx "nvcuda.dll!cuCtxCreate"
+linx "nvcuda.dll!cuCtxDestroy"
+linx "nvcuda.dll!cuMemAlloc"
+linx "nvcuda.dll!cuMemFree"
+linx "nvcuda.dll!cuModuleLoadData"
+linx "nvcuda.dll!cuModuleGetFunction"
+linx "nvcuda.dll!cuLaunchKernel"
+linx "nvcuda.dll!cuMemcpyDtoH"
+linx "nvcuda.dll!cuMemcpyHtoD"
+
+Funktion cuda_init()
+    r = cuInit(0)
+    gebe_zurueck r
+Ende
+
+Funktion cuda_device_count()
+    cnt = alloc(4)
+    raw_set32(cnt, 0, 0)
+    r = cuDeviceGetCount(cnt)
+    Wenn r != 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    n = raw_get32(cnt, 0)
+    gebe_zurueck n
+Ende
+
+Funktion cuda_device(ordinal)
+    dev = alloc(4)
+    raw_set32(dev, 0, 0)
+    r = cuDeviceGet(dev, ordinal)
+    Wenn r != 0 dann
+        gebe_zurueck 0
+    Ende
+    d = raw_get32(dev, 0)
+    gebe_zurueck d
+Ende
+
+Funktion cuda_ctx_create(dev)
+    ctx = alloc(8)
+    raw_set64(ctx, 0, 0)
+    r = cuCtxCreate(ctx, 0, dev)
+    Wenn r != 0 dann
+        gebe_zurueck 0
+    Ende
+    h = raw_get64(ctx, 0)
+    gebe_zurueck h
+Ende
+
+Funktion cuda_ctx_destroy(ctx)
+    cuCtxDestroy(ctx)
+    gebe_zurueck 0
+Ende
+
+Funktion cuda_mem_alloc(size)
+    ptr = alloc(8)
+    raw_set64(ptr, 0, 0)
+    r = cuMemAlloc(ptr, size)
+    Wenn r != 0 dann
+        gebe_zurueck 0
+    Ende
+    h = raw_get64(ptr, 0)
+    gebe_zurueck h
+Ende
+
+Funktion cuda_mem_free(ptr)
+    cuMemFree(ptr)
+    gebe_zurueck 0
+Ende
+
+Funktion cuda_module_load(ptx_cstr, out_mod)
+    mod = alloc(8)
+    raw_set64(mod, 0, 0)
+    r = cuModuleLoadData(mod, ptx_cstr)
+    h = raw_get64(mod, 0)
+    raw_set64(out_mod, 0, h)
+    gebe_zurueck r
+Ende
+
+Funktion cuda_func_get(mod, name_cstr, out_func)
+    func = alloc(8)
+    raw_set64(func, 0, 0)
+    r = cuModuleGetFunction(func, mod, name_cstr)
+    h = raw_get64(func, 0)
+    raw_set64(out_func, 0, h)
+    gebe_zurueck r
+Ende
+
+Funktion cuda_launch(func, gx, gy, gz, bx, by, bz, smem, stream, params)
+    r = cuLaunchKernel(func, gx, gy, gz, bx, by, bz, smem, stream, params, 0)
+    gebe_zurueck r
+Ende
+
+Funktion cuda_memcpy_dtoh(dst_host, src_dev, n)
+    r = cuMemcpyDtoH(dst_host, src_dev, n)
+    gebe_zurueck r
+Ende
+
+Funktion cuda_memcpy_htod(dst_dev, src_host, n)
+    r = cuMemcpyHtoD(dst_dev, src_host, n)
+    gebe_zurueck r
+Ende

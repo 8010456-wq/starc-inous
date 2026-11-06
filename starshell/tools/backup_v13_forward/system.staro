@@ -1,0 +1,90 @@
+// ============================================================================
+//  starshell :: inuos/system.staro
+//  StarShell V4 能力库 · 系统：Rechnername, Benutzer, Umgebung, Zeit, Warten
+//  铁律 E：能力全部在此 .staro 实现，只用 alloc/raw_setbyte/raw_byteat + WinAPI。
+// ============================================================================
+
+linx-o kernel32 GetComputerNameA GetLocalTime Sleep
+linx-o kernel32 GetEnvironmentVariableA SetEnvironmentVariableA
+linx-o advapi32 GetUserNameA
+
+// ---------- Rechnername ----------
+// GetComputerNameA(LPSTR lpBuffer, LPDWORD pcbBuffer) - Groesse als Zeiger!
+Funktion rechner_name()
+    buf = alloc(256)
+    nb = alloc(4)
+    raw_setbyte(nb, 0, 0)
+    raw_setbyte(nb, 1, 1)
+    raw_setbyte(nb, 2, 0)
+    raw_setbyte(nb, 3, 0)
+    n = GetComputerNameA(buf, nb)
+    gebe_zurueck cstr_to_starc(buf)
+Ende
+
+// ---------- Angemeldeter Benutzer ----------
+// GetUserNameA(LPSTR lpBuffer, LPDWORD pcbBuffer) - Groesse als Zeiger!
+Funktion benutzer_name()
+    buf = alloc(256)
+    nb = alloc(4)
+    raw_setbyte(nb, 0, 0)
+    raw_setbyte(nb, 1, 1)
+    raw_setbyte(nb, 2, 0)
+    raw_setbyte(nb, 3, 0)
+    n = GetUserNameA(buf, nb)
+    gebe_zurueck cstr_to_starc(buf)
+Ende
+
+// ---------- Umgebungsvariable lesen ----------
+Funktion umgebung_get(name)
+    c = starc_to_cstr(name)
+    buf = alloc(4096)
+    n = GetEnvironmentVariableA(c, buf, 4096)
+    gebe_zurueck cstr_to_starc(buf)
+Ende
+
+// ---------- Umgebungsvariable setzen (Prozess) ----------
+Funktion umgebung_set(name, wert)
+    c = starc_to_cstr(name)
+    w = starc_to_cstr(wert)
+    r = SetEnvironmentVariableA(c, w)
+    gebe_zurueck r
+Ende
+
+// ---------- Warten in Millisekunden ----------
+Funktion warte_ms(ms)
+    Sleep(ms)
+    gebe_zurueck 0
+Ende
+
+// ---------- Zwei Ziffern mit fuehrender Null ----------
+Funktion zahl2(num)
+    s = int_to_str(num)
+    Wenn str_len(s) < 2 dann
+        gebe_zurueck str_concat("0", s)
+    Ende
+    gebe_zurueck s
+Ende
+
+// ---------- Zeitstempel JJJJ-MM-TT HH:MM:SS ----------
+Funktion zeit_stamp()
+    st = alloc(16)
+    GetLocalTime(st)
+    jahr = raw_byteat(st, 0) + raw_byteat(st, 1) * 256
+    monat = raw_byteat(st, 2) + raw_byteat(st, 3) * 256
+    tag = raw_byteat(st, 6) + raw_byteat(st, 7) * 256
+    stunde = raw_byteat(st, 8) + raw_byteat(st, 9) * 256
+    minute = raw_byteat(st, 10) + raw_byteat(st, 11) * 256
+    sekunde = raw_byteat(st, 12) + raw_byteat(st, 13) * 256
+    s = int_to_str(jahr)
+    s = str_concat(s, "-")
+    s = str_concat(s, zahl2(monat))
+    s = str_concat(s, "-")
+    s = str_concat(s, zahl2(tag))
+    s = str_concat(s, " ")
+    s = str_concat(s, zahl2(stunde))
+    s = str_concat(s, ":")
+    s = str_concat(s, zahl2(minute))
+    s = str_concat(s, ":")
+    s = str_concat(s, zahl2(sekunde))
+    gebe_zurueck s
+Ende

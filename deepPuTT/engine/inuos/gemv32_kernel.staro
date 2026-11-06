@@ -1,0 +1,62 @@
+// inuos/gemv32_kernel.staro - GPU 纯 fp32 GEMV 内核 PTX 生成 (deepPuTT)
+// 依赖: sys.staro, str.staro (str_len)
+// 内核 gemv32: 每线程输出行 m 的 out[m] = sum_k act[k] * w[m*K+k], w 是 fp32
+// 参数: w(u64) act(u64) out(u64) M(u32) K(u32)
+// 用途: 作独立 oracle(喂 CPU 反量化后 fp32 权重) 验证 fused fp4gemv; 也用于 BF16/F8 门控 GEMV
+
+Funktion kstr_emit3(out, off, s)
+    n = str_len(s)
+    i = 0
+    Solange i < n
+        raw_setbyte(out, off + i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    gebe_zurueck off + n
+Ende
+
+Funktion gemv32_ptx(out, off)
+    off = kstr_emit3(out, off, ".version 7.0\n")
+    off = kstr_emit3(out, off, ".target sm_75\n")
+    off = kstr_emit3(out, off, ".address_size 64\n")
+    off = kstr_emit3(out, off, ".visible .entry gemv32(.param .u64 w, .param .u64 act, .param .u64 out, .param .u32 M, .param .u32 K) {\n")
+    off = kstr_emit3(out, off, ".reg .u32 %m, %M, %K, %k, %bi, %t1, %t2;\n")
+    off = kstr_emit3(out, off, ".reg .u64 %rw, %ra, %ro, %addr, %addr2;\n")
+    off = kstr_emit3(out, off, ".reg .f32 %f, %a, %acc;\n")
+    off = kstr_emit3(out, off, ".reg .pred %p;\n")
+    off = kstr_emit3(out, off, "mov.u32 %t1, %ctaid.x;\n")
+    off = kstr_emit3(out, off, "mov.u32 %t2, %ntid.x;\n")
+    off = kstr_emit3(out, off, "mul.lo.u32 %m, %t1, %t2;\n")
+    off = kstr_emit3(out, off, "mov.u32 %t1, %tid.x;\n")
+    off = kstr_emit3(out, off, "add.u32 %m, %m, %t1;\n")
+    off = kstr_emit3(out, off, "ld.param.u32 %M, [M];\n")
+    off = kstr_emit3(out, off, "setp.ge.u32 %p, %m, %M;\n")
+    off = kstr_emit3(out, off, "@%p bra EXIT;\n")
+    off = kstr_emit3(out, off, "ld.param.u64 %rw, [w];\n")
+    off = kstr_emit3(out, off, "ld.param.u64 %ra, [act];\n")
+    off = kstr_emit3(out, off, "ld.param.u64 %ro, [out];\n")
+    off = kstr_emit3(out, off, "ld.param.u32 %K, [K];\n")
+    off = kstr_emit3(out, off, "mov.f32 %acc, 0f00000000;\n")
+    off = kstr_emit3(out, off, "mov.u32 %k, 0;\n")
+    off = kstr_emit3(out, off, "LOOP:\n")
+    off = kstr_emit3(out, off, "setp.ge.u32 %p, %k, %K;\n")
+    off = kstr_emit3(out, off, "@%p bra DONE;\n")
+    off = kstr_emit3(out, off, "mul.lo.u32 %bi, %m, %K;\n")
+    off = kstr_emit3(out, off, "add.u32 %bi, %bi, %k;\n")
+    off = kstr_emit3(out, off, "mul.wide.u32 %addr, %bi, 4;\n")
+    off = kstr_emit3(out, off, "add.u64 %addr, %rw, %addr;\n")
+    off = kstr_emit3(out, off, "ld.global.f32 %f, [%addr];\n")
+    off = kstr_emit3(out, off, "mul.wide.u32 %addr2, %k, 4;\n")
+    off = kstr_emit3(out, off, "add.u64 %addr2, %ra, %addr2;\n")
+    off = kstr_emit3(out, off, "ld.global.f32 %a, [%addr2];\n")
+    off = kstr_emit3(out, off, "fma.rn.f32 %acc, %a, %f, %acc;\n")
+    off = kstr_emit3(out, off, "add.u32 %k, %k, 1;\n")
+    off = kstr_emit3(out, off, "bra LOOP;\n")
+    off = kstr_emit3(out, off, "DONE:\n")
+    off = kstr_emit3(out, off, "mul.wide.u32 %addr2, %m, 4;\n")
+    off = kstr_emit3(out, off, "add.u64 %addr2, %ro, %addr2;\n")
+    off = kstr_emit3(out, off, "st.global.f32 [%addr2], %acc;\n")
+    off = kstr_emit3(out, off, "EXIT:\n")
+    off = kstr_emit3(out, off, "ret;\n")
+    off = kstr_emit3(out, off, "}\n")
+    gebe_zurueck off
+Ende

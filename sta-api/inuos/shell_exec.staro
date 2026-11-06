@@ -1,0 +1,131 @@
+// shell_exec.staro - StarShell v2.0 进程执行模块
+// 零内建函数，全部使用 Windows API + 运行时原语
+// 可用: alloc, raw_setbyte, raw_byteat, linx-o
+// 不可用: Ausgeben, i2s, byteat, liste_launge, as_str
+
+linx-o kernel32 CreateProcessA WaitForSingleObject GetExitCodeProcess CloseHandle
+
+// CreateProcessA 参数:
+// 1. lpApplicationName: NULL (0)
+// 2. lpCommandLine: LPSTR (must be writable)
+// 3. lpProcessAttributes: NULL (0)
+// 4. lpThreadAttributes: NULL (0)
+// 5. bInheritHandles: 0 (FALSE)
+// 6. dwCreationFlags: 0
+// 7. lpEnvironment: NULL (0)
+// 8. lpCurrentDirectory: NULL (0)
+// 9. lpStartupInfo: LPSTARTUPINFO
+// 10. lpProcessInformation: LPPROCESS_INFORMATION
+//
+// STARTUPINFOA 结构 (68 bytes):
+// cb: 4 bytes (68)
+// lpReserved: 8 bytes (NULL)
+// lpTitle: 8 bytes (NULL)
+// dwFlags: 4 bytes (0)
+// wShowWindow: 2 bytes (0)
+// cbReserved2: 2 bytes (0)
+// lpReserved2: 8 bytes (NULL)
+// dwReserved: 4 bytes (0)
+// hStdInput: 8 bytes (NULL)
+// hStdOutput: 8 bytes (NULL)
+// hStdError: 8 bytes (NULL)
+//
+// PROCESS_INFORMATION 结构 (24 bytes):
+// hProcess: 8 bytes
+// hThread: 8 bytes
+// dwProcessId: 4 bytes
+// dwThreadId: 4 bytes
+
+// 执行进程并等待完成，返回退出码
+Funktion exec_process(cmdline)
+    // 计算命令行长度
+    cmdline_len = str_len(cmdline)
+    
+    // 分配可写缓冲区
+    cmd_buf = alloc(cmdline_len + 10)
+    
+    // 复制命令行
+    i = 0
+    Solange i < cmdline_len
+        raw_setbyte(cmd_buf, i, str_at(cmdline, i))
+        i = i + 1
+    Ende
+    raw_setbyte(cmd_buf, cmdline_len, 0)
+    
+    // 分配 STARTUPINFO (68 bytes)
+    si = alloc(68)
+    
+    // 清零 STARTUPINFO
+    i = 0
+    Solange i < 68
+        raw_setbyte(si, i, 0)
+        i = i + 1
+    Ende
+    
+    // 设置 cb = 68
+    raw_setbyte(si, 0, 68)
+    
+    // 分配 PROCESS_INFORMATION (24 bytes)
+    pi = alloc(24)
+    
+    // 清零 PROCESS_INFORMATION
+    i = 0
+    Solange i < 24
+        raw_setbyte(pi, i, 0)
+        i = i + 1
+    Ende
+    
+    // 调用 CreateProcessA
+    // CreateProcessA(NULL, cmd_buf, NULL, NULL, 0, 0, NULL, NULL, si, pi)
+    result = CreateProcessA(0, cmd_buf, 0, 0, 0, 0, 0, 0, si, pi)
+    
+    Wenn result == 0 dann
+        // 创建失败
+        gebe_zurueck 1
+    Ende
+    
+    // 提取进程句柄 (offset 0-7)
+    h0 = raw_byteat(pi, 0)
+    h1 = raw_byteat(pi, 1)
+    h2 = raw_byteat(pi, 2)
+    h3 = raw_byteat(pi, 3)
+    h4 = raw_byteat(pi, 4)
+    h5 = raw_byteat(pi, 5)
+    h6 = raw_byteat(pi, 6)
+    h7 = raw_byteat(pi, 7)
+    
+    process_handle = h0 + h1 * 256 + h2 * 65536 + h3 * 16777216 + h4 * 4294967296 + h5 * 1099511627776 + h6 * 281474976710656 + h7 * 72057594037927936
+    
+    // 等待进程结束 (INFINITE = -1)
+    WaitForSingleObject(process_handle, -1)
+    
+    // 获取退出码
+    exit_buf = alloc(4)
+    raw_setbyte(exit_buf, 0, 0)
+    raw_setbyte(exit_buf, 1, 0)
+    raw_setbyte(exit_buf, 2, 0)
+    raw_setbyte(exit_buf, 3, 0)
+    GetExitCodeProcess(process_handle, exit_buf)
+    
+    exit_code = raw_byteat(exit_buf, 0) + raw_byteat(exit_buf, 1) * 256 + raw_byteat(exit_buf, 2) * 65536 + raw_byteat(exit_buf, 3) * 16777216
+    
+    // 关闭进程句柄
+    CloseHandle(process_handle)
+    
+    // 提取线程句柄 (offset 8-15)
+    th0 = raw_byteat(pi, 8)
+    th1 = raw_byteat(pi, 9)
+    th2 = raw_byteat(pi, 10)
+    th3 = raw_byteat(pi, 11)
+    th4 = raw_byteat(pi, 12)
+    th5 = raw_byteat(pi, 13)
+    th6 = raw_byteat(pi, 14)
+    th7 = raw_byteat(pi, 15)
+    
+    thread_handle = th0 + th1 * 256 + th2 * 65536 + th3 * 16777216 + th4 * 4294967296 + th5 * 1099511627776 + th6 * 281474976710656 + th7 * 72057594037927936
+    
+    // 关闭线程句柄
+    CloseHandle(thread_handle)
+    
+   gebe_zurueck exit_code
+Ende

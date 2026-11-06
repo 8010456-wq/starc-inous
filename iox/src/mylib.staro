@@ -1,0 +1,3 @@
+Funktion custom_func_from_staro(x)
+    gebe_zurueck x * 2
+Ende

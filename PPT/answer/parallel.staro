@@ -1,0 +1,159 @@
+// ============================================================================
+//  parallel.staro —— language-bench 考题「Parallel reduction」能力层
+//  铁律 E：能力全在这里实现。并发用 WinAPI 线程（经 Parallel 原语）+ 命名共享内存。
+//  ★ 不改编译器：Parallel 块只能放无参函数调用，所以 worker 分片号
+//    通过命名共享内存（CreateFileMapping/MapViewOfFile）在 .staro 内传递。
+// ============================================================================
+
+linx-o kernel32 CreateFileMappingA MapViewOfFile UnmapViewOfFile CloseHandle
+linx-o kernel32 QueryPerformanceCounter QueryPerformanceFrequency
+
+Funktion qpc()
+    p = alloc(8)
+    QueryPerformanceCounter(p)
+    v = raw_byteat(p, 0) + raw_byteat(p, 1) * 256 + raw_byteat(p, 2) * 65536 + raw_byteat(p, 3) * 16777216
+    v = v + raw_byteat(p, 4) * 4294967296 + raw_byteat(p, 5) * 1099511627776 + raw_byteat(p, 6) * 281474976710656 + raw_byteat(p, 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+Funktion qpf()
+    p = alloc(8)
+    QueryPerformanceFrequency(p)
+    v = raw_byteat(p, 0) + raw_byteat(p, 1) * 256 + raw_byteat(p, 2) * 65536 + raw_byteat(p, 3) * 16777216
+    v = v + raw_byteat(p, 4) * 4294967296 + raw_byteat(p, 5) * 1099511627776 + raw_byteat(p, 6) * 281474976710656 + raw_byteat(p, 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+Funktion write_u64(buf, off, v)
+    raw_setbyte(buf, off + 0, v % 256)
+    raw_setbyte(buf, off + 1, (v / 256) % 256)
+    raw_setbyte(buf, off + 2, (v / 65536) % 256)
+    raw_setbyte(buf, off + 3, (v / 16777216) % 256)
+    raw_setbyte(buf, off + 4, (v / 4294967296) % 256)
+    raw_setbyte(buf, off + 5, (v / 1099511627776) % 256)
+    raw_setbyte(buf, off + 6, (v / 281474976710656) % 256)
+    raw_setbyte(buf, off + 7, (v / 72057594037927936) % 256)
+    gebe_zurueck 0
+Ende
+
+Funktion read_u64(buf, off)
+    v = raw_byteat(buf, off + 0) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    v = v + raw_byteat(buf, off + 4) * 4294967296 + raw_byteat(buf, off + 5) * 1099511627776 + raw_byteat(buf, off + 6) * 281474976710656 + raw_byteat(buf, off + 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+// 共享内存布局（64 字节）：
+//   [0..7]   = N 上限
+//   [16..23] = worker0 count
+//   [24..31] = worker1 count
+//   [32..39] = worker2 count
+//   [40..47] = worker3 count
+// 固定映射名 "LB_PAR_SHM"（C 字符串，非 StarC 字符串——WinAPI 直接读）。
+// 注意：MapViewOfFile 访问权限必须用 FILE_MAP_ALL_ACCESS = 0xF001F = 983071，
+//       用 98305（=0x18001）会映射出「不可写」视图，一写就段错误。
+
+Funktion shm_name()
+    // 返回 "LB_PAR_SHM\0" 的 C 字符串指针（静态，只建一次）
+    n = alloc(16)
+    raw_setbyte(n, 0, 76)   // L
+    raw_setbyte(n, 1, 66)   // B
+    raw_setbyte(n, 2, 95)   // _
+    raw_setbyte(n, 3, 80)   // P
+    raw_setbyte(n, 4, 65)   // A
+    raw_setbyte(n, 5, 82)   // R
+    raw_setbyte(n, 6, 95)   // _
+    raw_setbyte(n, 7, 83)   // S
+    raw_setbyte(n, 8, 72)   // H
+    raw_setbyte(n, 9, 77)   // M
+    raw_setbyte(n, 10, 0)   // NUL
+    gebe_zurueck n
+Ende
+
+Funktion shm_create()
+    // CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 64, "LB_PAR_SHM")
+    h = CreateFileMappingA(-1, 0, 4, 0, 64, shm_name())
+    gebe_zurueck h
+Ende
+
+Funktion shm_map(h)
+    // MapViewOfFile(h, FILE_MAP_ALL_ACCESS=0xF001F=983071, 0, 0, 0)
+    p = MapViewOfFile(h, 983071, 0, 0, 0)
+    gebe_zurueck p
+Ende
+
+Funktion worker0()
+    worker_impl(0)
+    gebe_zurueck 0
+Ende
+Funktion worker1()
+    worker_impl(1)
+    gebe_zurueck 0
+Ende
+Funktion worker2()
+    worker_impl(2)
+    gebe_zurueck 0
+Ende
+Funktion worker3()
+    worker_impl(3)
+    gebe_zurueck 0
+Ende
+
+Funktion worker_impl(t)
+    h = shm_create()
+    base = shm_map(h)
+    n = read_u64(base, 0)
+    write_u64(base, 16 + t * 8, 0)          // 结果槽清零
+    count = 0
+    v = t
+    Solange v < n
+        prim = is_prime(v)
+        Wenn prim == 1 dann
+            count = count + 1
+        Ende
+        v = v + 4
+    Ende
+    write_u64(base, 16 + t * 8, count)
+    UnmapViewOfFile(base)
+    CloseHandle(h)
+    gebe_zurueck 0
+Ende
+
+// 素数判定（n>=2 且无奇约数 d<=sqrt(n) 整除 n；n=2 素；偶数>2 非素）
+Funktion is_prime(v)
+    prim = 1
+    Wenn v < 2 dann
+        prim = 0
+    Sonst
+        Wenn v == 2 dann
+            prim = 1
+        Sonst
+            Wenn v % 2 == 0 dann
+                prim = 0
+            Sonst
+                d = 3
+                Solange d * d <= v
+                    Wenn v % d == 0 dann
+                        prim = 0
+                        d = v                       // 无 break：哨兵提前退出
+                    Sonst
+                        d = d + 2
+                    Ende
+                Ende
+            Ende
+        Ende
+    Ende
+    gebe_zurueck prim
+Ende
+
+// 单线程对照（同一算法，不并发）
+Funktion count_primes_serial(n)
+    count = 0
+    v = 2
+    Solange v < n
+        Wenn is_prime(v) == 1 dann
+            count = count + 1
+        Ende
+        v = v + 1
+    Ende
+    gebe_zurueck count
+Ende

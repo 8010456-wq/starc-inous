@@ -1,0 +1,87 @@
+// ============================================================================
+//  sort.staro —— language-bench 考题「Sort」能力层
+//  铁律 E：能力全在 .staro。2M int32 升序排序，精确复现 lbgen ref_sort。
+//  ★ 用 LSD 基数排序（8 位 digit × 4 遍，稳定、O(4n)）。MINSTD 值全在
+//    [1, 2147483646]（正数），无符号问题，无需符号翻转。
+//  sort_run(buf) -> 返回 alloc(n*4)：n=2M 个 int32 word（已升序）。
+//  buf = 实例净荷（n×4 字节）。
+// ============================================================================
+
+Funktion read_u32_le(buf, off)
+    v = raw_byteat(buf, off + 0) + raw_byteat(buf, off + 1) * 256
+    v = v + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    gebe_zurueck v
+Ende
+
+Funktion write_u32_le(buf, off, v)
+    raw_setbyte(buf, off + 0, v % 256)
+    raw_setbyte(buf, off + 1, (v / 256) % 256)
+    raw_setbyte(buf, off + 2, (v / 65536) % 256)
+    raw_setbyte(buf, off + 3, (v / 16777216) % 256)
+    gebe_zurueck 0
+Ende
+
+Funktion sort_run(buf)
+    n = 2000000
+    a = alloc(n * 4)
+    b = alloc(n * 4)
+    count = alloc(256 * 8)
+    pos = alloc(256 * 8)
+
+    // 加载输入
+    i = 0
+    Solange i < n
+        write_u32_le(a, i * 4, read_u32_le(buf, i * 4))
+        i = i + 1
+    Ende
+
+    // LSD 基数排序：4 遍（字节 0..3）
+    p = 0
+    Solange p < 4
+        // 清空计数
+        d = 0
+        Solange d < 256
+            write_u64(count, d * 8, 0)
+            d = d + 1
+        Ende
+        // 计数
+        i = 0
+        Solange i < n
+            digit = raw_byteat(a, i * 4 + p)
+            c = read_u64(count, digit * 8)
+            write_u64(count, digit * 8, c + 1)
+            i = i + 1
+        Ende
+        // 前缀和 -> 起始位置
+        total = 0
+        d = 0
+        Solange d < 256
+            write_u64(pos, d * 8, total)
+            total = total + read_u64(count, d * 8)
+            d = d + 1
+        Ende
+        // 稳定分配
+        i = 0
+        Solange i < n
+            digit = raw_byteat(a, i * 4 + p)
+            q = read_u64(pos, digit * 8)
+            write_u32_le(b, q * 4, read_u32_le(a, i * 4))
+            write_u64(pos, digit * 8, q + 1)
+            i = i + 1
+        Ende
+        // 交换 a/b
+        t = a
+        a = b
+        b = t
+        p = p + 1
+    Ende
+
+    // a 已升序，输出 word
+    out = alloc(n * 4)
+    i = 0
+    Solange i < n
+        write_u32_le(out, i * 4, read_u32_le(a, i * 4))
+        i = i + 1
+    Ende
+    gebe_zurueck out
+Ende

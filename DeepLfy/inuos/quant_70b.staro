@@ -1,0 +1,109 @@
+// ============================================================
+// quant_70b.staro — DeepLfy S 系量化管线 (推理量化 PTQ 核心)
+// 基于 s_opt.staro (S2 量化) 扩展到 LLM 块量化 fp8/fp4 + 激活校准
+// 纯 StarC, 零第三方 (复用 Universe/gpu/inuos/s_opt.staro 的 s_quant_i8 基底)
+//
+// 目标: DeepSeek-V4-Flash-Code-70B-MAX
+//   混合精度策略 (老板 10-30% 预算, 仿 V2-Lite 实测最优):
+//     attention + shared expert + 首层 dense -> 4-bit
+//     64 个路由专家 -> 2-3 bit  (专家多、单个不重要, 量化损伤小)
+//   校准: 无数据集动态校准 (用激活 amax, 或校准集统计)
+// ============================================================
+
+// ---- 四舍五入到最近整数 (half away from zero), 返回 int ----
+// StarC 的 f32_to_s32 是截断向零, 故按符号加/减 0.5 再截断,
+// 即得标准 round-half-away-from-zero (修正截断量化 0.5 步负偏置)
+Funktion s_round_half(x)
+    half = f32_div(s32_to_f32(1), s32_to_f32(2))   // 0.5f
+    Wenn f32_lt(x, s32_to_f32(0)) dann
+        gebe_zurueck f32_to_s32(f32_sub(x, half))
+    Sonst
+        gebe_zurueck f32_to_s32(f32_add(x, half))
+    Ende
+Ende
+
+// ---- 块级 fp8 量化 (e4m3, block 大小 B, 每块一个 scale) ----
+// buf: f32 位模式缓冲 (n 元素); q: 输出字节缓冲; B: 块大小; scale: 输出 scale 数组 (每块一个 f32)
+Funktion s_block_quant_fp8(buf, q, n, B, scale)
+    b = 0
+    Solange b < n
+        // 块内 amax
+        amax = 0
+        i = 0
+        Solange i < B
+            v = raw_get32(buf, (b + i) * 4)
+            Wenn f32_gt(v, amax) dann amax = v Ende
+            Wenn f32_lt(v, f32_sub(0, amax)) dann amax = f32_sub(0, v) Ende
+            i = i + 1
+        Ende
+        // scale = 127 / amax  (int8 满量程, 非 e4m3 的 448)
+        scale_v = f32_div(s32_to_f32(127), amax)
+        raw_set32(scale, (b / B) * 4, scale_v)
+        i = 0
+        Solange i < B
+            v = raw_get32(buf, (b + i) * 4)
+            qv = s_round_half(f32_mul(v, scale_v))
+            // clamp 到 e4m3 [-448,448] 近似 -> 存 int8 字节 (量化到 8bit)
+            Wenn qv > 127 dann qv = 127 Ende
+            Wenn qv < -128 dann qv = -128 Ende
+            raw_setbyte(q, b + i, qv + 128)
+            i = i + 1
+        Ende
+        b = b + B
+    Ende
+    gebe_zurueck 1
+Ende
+
+// ---- 块级 fp4 量化 (e2m1, block 大小 B, 每块一个 scale) ----
+// 4bit 每权重 (2 权重/字节, 高低半字节), scale 每块
+Funktion s_block_quant_fp4(buf, q, n, B, scale)
+    b = 0
+    Solange b < n
+        amax = 0
+        i = 0
+        Solange i < B
+            v = raw_get32(buf, (b + i) * 4)
+            Wenn f32_gt(v, amax) dann amax = v Ende
+            Wenn f32_lt(v, f32_sub(0, amax)) dann amax = f32_sub(0, v) Ende
+            i = i + 1
+        Ende
+        // scale = 6 / amax  (e2m1 max 6)
+        scale_v = f32_div(s32_to_f32(6), amax)
+        raw_set32(scale, (b / B) * 4, scale_v)
+        i = 0
+        Solange i < B
+            v = raw_get32(buf, (b + i) * 4)
+            // 有符号 4bit: qv in [-8,7], 存 qv+8 (0..15)
+            qv = s_round_half(f32_mul(v, scale_v))
+            Wenn qv > 7 dann qv = 7 Ende
+            Wenn qv < -8 dann qv = -8 Ende
+            qv = qv + 8
+            // 打包: 偶数位高半字节, 奇数位低半字节 (StarC 无位运算, 乘除模模拟)
+            byte_i = (b + i) / 2
+            Wenn (b + i) % 2 == 0 dann
+                lo = raw_byteat(q, byte_i) % 16
+                raw_setbyte(q, byte_i, qv * 16 + lo)
+            Sonst
+                hi = (raw_byteat(q, byte_i) / 16) * 16
+                raw_setbyte(q, byte_i, hi + qv)
+            Ende
+            i = i + 1
+        Ende
+        b = b + B
+    Ende
+    gebe_zurueck 1
+Ende
+
+// ---- 激活校准: 收集整段激活的全局 amax (供动态量化 scale) ----
+Funktion s_calib_amax(buf, n, amax_out)
+    amax = 0
+    i = 0
+    Solange i < n
+        v = raw_get32(buf, i * 4)
+        Wenn f32_gt(v, amax) dann amax = v Ende
+        Wenn f32_lt(v, f32_sub(0, amax)) dann amax = f32_sub(0, v) Ende
+        i = i + 1
+    Ende
+    raw_set32(amax_out, 0, amax)
+    gebe_zurueck 1
+Ende

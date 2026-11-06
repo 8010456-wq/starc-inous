@@ -1,0 +1,108 @@
+// inuos/codegen_ptx.staro - RPN -> PTX 汇编 (栈式, 虚拟寄存器 %f0..%f15)
+// 数字 -> mov.f32 %f{sp}, v; ; 运算符 -> 弹右/左, add/sub/mul/div.f32; 压栈; 结果在 %f0
+// 依赖: emit.staro(emit_str/emit_int/emit_nl/emit_line), sys.staro(raw_get32)
+//
+// PTX 语法要点:
+//   顶层 directive (.version/.target/.address_size/.visible) 用 \n 结束 (无分号)
+//   内核内指令 (.reg/ld/mov/add/.../st/ret) 必须用 ; 结束
+//   换行必须纯 \n (10), 不能 \r\n (PTX 解析器拒绝 \r)
+// 单表达式结果总在 %f0
+
+Funktion ptx_emit_reg(out, off, reg)  // 写 %f{reg}
+    off = emit_str(out, off, "%f")
+    off = emit_int(out, off, reg)
+    gebe_zurueck off
+Ende
+
+// 写纯 \n 换行
+Funktion ptx_nl(out, off)
+    raw_setbyte(out, off, 10)
+    gebe_zurueck off + 1
+Ende
+
+// 写一行 (字符串 + \n), 无分号 (顶层 directive 用)
+Funktion ptx_line(out, off, s)
+    off = emit_str(out, off, s)
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+// 写指令 + ";" + \n (内核内指令用)
+Funktion ptx_instr(out, off, s)
+    off = emit_str(out, off, s)
+    off = emit_str(out, off, ";")
+    off = ptx_nl(out, off)
+    gebe_zurueck off
+Ende
+
+// RPN -> PTX 表达式求值 (写 out[off..]), 返回新 off
+Funktion codegen_ptx_rpn(rpn, rn, out, off)
+    sp = 0
+    i = 0
+    Solange i < rn
+        base = i * 8
+        t = raw_get32(rpn, base)
+        v = raw_get32(rpn, base + 4)
+        Wenn t == 1 dann  // 数字 -> push (浮点立即数 {v}.0)
+            off = emit_str(out, off, "mov.f32 ")
+            off = ptx_emit_reg(out, off, sp)
+            off = emit_str(out, off, ", ")
+            off = emit_int(out, off, v)
+            off = emit_str(out, off, ".0;")
+            off = ptx_nl(out, off)
+            sp = sp + 1
+        Sonst
+            Wenn t == 4 dann  // 运算符
+                sp = sp - 2  // 弹右(%f[sp+1]) 弹左(%f[sp])
+                Wenn v == 43 dann
+                    off = emit_str(out, off, "add.f32 ")
+                Sonst
+                    Wenn v == 45 dann
+                        off = emit_str(out, off, "sub.f32 ")
+                    Sonst
+                        Wenn v == 42 dann
+                            off = emit_str(out, off, "mul.f32 ")
+                        Sonst
+                            Wenn v == 47 dann
+                                off = emit_str(out, off, "div.f32 ")
+                            Ende
+                        Ende
+                    Ende
+                Ende
+                off = ptx_emit_reg(out, off, sp)
+                off = emit_str(out, off, ", ")
+                off = ptx_emit_reg(out, off, sp)
+                off = emit_str(out, off, ", ")
+                off = ptx_emit_reg(out, off, sp + 1)
+                off = emit_str(out, off, ";")
+                off = ptx_nl(out, off)
+                sp = sp + 1
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck off
+Ende
+
+// PTX 内核骨架包装: .visible .entry name(.param .u64 out) { ... }
+Funktion codegen_ptx_kernel(name, rpn, rn, out, off)
+    off = ptx_line(out, off, ".version 7.0")
+    off = ptx_line(out, off, ".target sm_75")
+    off = ptx_line(out, off, ".address_size 64")
+    off = emit_str(out, off, ".visible .entry ")
+    off = emit_str(out, off, name)
+    off = ptx_line(out, off, "(.param .u64 out) {")
+    off = ptx_instr(out, off, ".reg .f32 %f0")
+    off = ptx_instr(out, off, ".reg .f32 %f1")
+    off = ptx_instr(out, off, ".reg .f32 %f2")
+    off = ptx_instr(out, off, ".reg .f32 %f3")
+    off = ptx_instr(out, off, ".reg .f32 %f4")
+    off = ptx_instr(out, off, ".reg .f32 %f5")
+    off = ptx_instr(out, off, ".reg .u64 %rd")
+    off = ptx_instr(out, off, "ld.param.u64 %rd, [out]")
+    off = codegen_ptx_rpn(rpn, rn, out, off)
+    off = ptx_instr(out, off, "st.global.f32 [%rd], %f0")
+    off = ptx_instr(out, off, "ret")
+    off = ptx_line(out, off, "}")
+    gebe_zurueck off
+Ende

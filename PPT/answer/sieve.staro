@@ -1,0 +1,89 @@
+// ============================================================================
+//  sieve.staro —— language-bench 考题「Prime sieve」能力层
+//  铁律 E：能力全在这里实现。只用语言原语 alloc/raw_setbyte/raw_byteat + WinAPI。
+//  不新增任何内建，不动编译器。字符串/输出由 core.staro 提供。
+// ============================================================================
+
+linx-o kernel32 QueryPerformanceCounter QueryPerformanceFrequency
+
+// ---------- 高精度计时（QueryPerformanceCounter，64 位）----------
+
+Funktion qpc()
+    p = alloc(8)
+    QueryPerformanceCounter(p)
+    v = raw_byteat(p, 0) + raw_byteat(p, 1) * 256 + raw_byteat(p, 2) * 65536 + raw_byteat(p, 3) * 16777216
+    v = v + raw_byteat(p, 4) * 4294967296 + raw_byteat(p, 5) * 1099511627776 + raw_byteat(p, 6) * 281474976710656 + raw_byteat(p, 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+Funktion qpf()
+    p = alloc(8)
+    QueryPerformanceFrequency(p)
+    v = raw_byteat(p, 0) + raw_byteat(p, 1) * 256 + raw_byteat(p, 2) * 65536 + raw_byteat(p, 3) * 16777216
+    v = v + raw_byteat(p, 4) * 4294967296 + raw_byteat(p, 5) * 1099511627776 + raw_byteat(p, 6) * 281474976710656 + raw_byteat(p, 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+// ---------- 64 位小端写入 / 读取（8 字节）----------
+
+Funktion write_u64(buf, off, v)
+    raw_setbyte(buf, off + 0, v % 256)
+    raw_setbyte(buf, off + 1, (v / 256) % 256)
+    raw_setbyte(buf, off + 2, (v / 65536) % 256)
+    raw_setbyte(buf, off + 3, (v / 16777216) % 256)
+    raw_setbyte(buf, off + 4, (v / 4294967296) % 256)
+    raw_setbyte(buf, off + 5, (v / 1099511627776) % 256)
+    raw_setbyte(buf, off + 6, (v / 281474976710656) % 256)
+    raw_setbyte(buf, off + 7, (v / 72057594037927936) % 256)
+    gebe_zurueck 0
+Ende
+
+Funktion read_u64(buf, off)
+    v = raw_byteat(buf, off + 0) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    v = v + raw_byteat(buf, off + 4) * 4294967296 + raw_byteat(buf, off + 5) * 1099511627776 + raw_byteat(buf, off + 6) * 281474976710656 + raw_byteat(buf, off + 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+// ---------- 埃拉托斯特尼筛（纯整数算术，无任何内建能力）----------
+// 返回 alloc(24) 的裸缓冲区：[count, last, sum] 各 8 字节小端。
+// 与 language-bench C 参照（sieve/main.c）算法完全一致：
+//   byte 数组，composite=1 标记，内层从 p*p 开始。
+
+Funktion sieve_run(n)
+    buf = alloc(n + 1)
+    i = 0
+    Solange i <= n
+        raw_setbyte(buf, i, 1)
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 0, 0)
+    raw_setbyte(buf, 1, 0)
+    p = 2
+    Solange p * p <= n
+        Wenn raw_byteat(buf, p) == 1 dann
+            m = p * p
+            Solange m <= n
+                raw_setbyte(buf, m, 0)
+                m = m + p
+            Ende
+        Ende
+        p = p + 1
+    Ende
+    count = 0
+    last = 0
+    sum = 0
+    i = 2
+    Solange i <= n
+        Wenn raw_byteat(buf, i) == 1 dann
+            count = count + 1
+            last = i
+            sum = sum + i
+        Ende
+        i = i + 1
+    Ende
+    r = alloc(24)
+    write_u64(r, 0, count)
+    write_u64(r, 8, last)
+    write_u64(r, 16, sum)
+    gebe_zurueck r
+Ende

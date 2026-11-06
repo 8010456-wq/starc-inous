@@ -1,0 +1,159 @@
+// ============================================================================
+//  starshell :: inuos/eng_prozess.staro
+//  Selbst implementierte Prozess-Befehle (WinAPI direkt, keine Weiterleitung)
+//  Verwendet EnumProcesses (psapi) + QueryFullProcessImageNameA (kernel32).
+//  Hinweis: Process32FirstA/Process32NextA sind auf diesem System nicht
+//  exportiert -> bewusst EnumProcesses statt Toolhelp-Snapshot.
+//  args = C-String des Befehlsrests.
+// ============================================================================
+
+linx-o psapi EnumProcesses
+linx-o kernel32 OpenProcess TerminateProcess CloseHandle QueryFullProcessImageNameA
+linx-o kernel32 CreateProcessA WaitForSingleObject GetExitCodeProcess
+
+// Prozesse auflisten (PID + Name)
+Funktion eng_prozess_liste()
+    buf = alloc(32768)
+    cb = alloc(4)
+    raw_setbyte(cb, 0, 0)
+    raw_setbyte(cb, 1, 128)
+    raw_setbyte(cb, 2, 0)
+    raw_setbyte(cb, 3, 0)
+    r = EnumProcesses(buf, 32768, cb)
+    Wenn r == 0 dann
+        write_str("EnumProcesses fehlgeschlagen")
+        write_newline()
+        gebe_zurueck 0
+    Ende
+    bytes = raw_byteat(cb, 0) + raw_byteat(cb, 1) * 256 + raw_byteat(cb, 2) * 65536 + raw_byteat(cb, 3) * 16777216
+    count = bytes / 4
+    i = 0
+    Solange i < count
+        pid = raw_byteat(buf, i * 4) + raw_byteat(buf, i * 4 + 1) * 256 + raw_byteat(buf, i * 4 + 2) * 65536 + raw_byteat(buf, i * 4 + 3) * 16777216
+        h = OpenProcess(4096, 0, pid)
+        Wenn h != 0 dann
+            namebuf = alloc(1024)
+            size = alloc(4)
+            raw_setbyte(size, 0, 0)
+            raw_setbyte(size, 1, 4)
+            raw_setbyte(size, 2, 0)
+            raw_setbyte(size, 3, 0)
+            ok = QueryFullProcessImageNameA(h, 0, namebuf, size)
+            Wenn ok != 0 dann
+                write_int(pid)
+                write_str("  ")
+                write_cstr(namebuf)
+                write_newline()
+            Ende
+            CloseHandle(h)
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// Anzahl Prozesse
+Funktion eng_prozess_zaehlen()
+    buf = alloc(32768)
+    cb = alloc(4)
+    raw_setbyte(cb, 0, 0)
+    raw_setbyte(cb, 1, 128)
+    raw_setbyte(cb, 2, 0)
+    raw_setbyte(cb, 3, 0)
+    r = EnumProcesses(buf, 32768, cb)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    bytes = raw_byteat(cb, 0) + raw_byteat(cb, 1) * 256 + raw_byteat(cb, 2) * 65536 + raw_byteat(cb, 3) * 16777216
+    gebe_zurueck bytes / 4
+Ende
+
+// Prozess beenden
+Funktion eng_prozess_kill(pid)
+    h = OpenProcess(1, 0, pid)
+    Wenn h == 0 dann
+        write_str("Fehler: Prozess nicht gefunden oder keine Rechte")
+        write_newline()
+        gebe_zurueck 0
+    Ende
+    r = TerminateProcess(h, 1)
+    CloseHandle(h)
+    Wenn r == 0 dann
+        write_str("Fehler: konnte Prozess nicht beenden")
+        write_newline()
+        gebe_zurueck 0
+    Ende
+    write_str("beendet: ")
+    write_int(pid)
+    write_newline()
+    gebe_zurueck 1
+Ende
+
+// Programm nativ starten (CreateProcessA)
+Funktion eng_prozess_starte(args)
+    cmd = extract_arg(args, 0)
+    Wenn str_len(cmd) == 0 dann
+        write_str("starte <Programm> [Argumente...]")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    cc = starc_to_cstr(c_rest(args, 0))
+    si = alloc(104)
+    pi = alloc(24)
+    r = CreateProcessA(0, cc, 0, 0, 0, 0, 0, 0, si, pi)
+    Wenn r == 0 dann
+        write_str("Start fehlgeschlagen: ")
+        write_str(cmd)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    write_str("gestartet: ")
+    write_str(cmd)
+    write_newline()
+    hproc = raw_byteat(pi, 0) + raw_byteat(pi, 1) * 256 + raw_byteat(pi, 2) * 65536 + raw_byteat(pi, 3) * 16777216
+    CloseHandle(hproc)
+    hthread = raw_byteat(pi, 8) + raw_byteat(pi, 9) * 256 + raw_byteat(pi, 10) * 65536 + raw_byteat(pi, 11) * 16777216
+    CloseHandle(hthread)
+    gebe_zurueck 1
+Ende
+
+// Existiert ein Prozess mit der PID?
+Funktion eng_prozess_existiert(pid)
+    h = OpenProcess(4096, 0, pid)
+    Wenn h == 0 dann
+        write_str("nein")
+    Sonst
+        write_str("ja")
+        CloseHandle(h)
+    Ende
+    write_newline()
+    gebe_zurueck 1
+Ende
+
+// Prozess-Befehle
+Funktion eng_prozess(op, args)
+    Wenn str_eq(op, "liste") dann
+        eng_prozess_liste()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "zahl") dann
+        write_int(eng_prozess_zaehlen())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "beende") dann
+        pid = str_to_int(extract_arg(args, 0))
+        eng_prozess_kill(pid)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "existiert") dann
+        pid = str_to_int(extract_arg(args, 0))
+        eng_prozess_existiert(pid)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "starte") dann
+        eng_prozess_starte(args)
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende

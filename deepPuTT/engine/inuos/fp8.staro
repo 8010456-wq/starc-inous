@@ -1,0 +1,99 @@
+// inuos/fp8.staro - FP8 E4M3 反量化 (deepPuTT, 纯整数算术, 输出 fp32 位模式)
+// 依赖: sys.staro (raw_byteat/raw_set32/raw_get32)
+//
+// DeepSeek-V4-Flash 注意力权重格式 (2026-10-29 权威确认, 多源一致):
+//   *.weight: dtype F8_E4M3, shape [out, in], 每元素 1 字节
+//   *.scale : dtype F8_E8M0, shape [out/128, in/128], 每 128x128 块 1 个 scale
+//   反量化: value = e4m3(byte) * 2^(scale_byte - 127)   (2^(b-127) 乘法约定, DeepSeek 用)
+//   E8M0: byte b -> 2^(b-127), b==255 为 NaN (规范)
+//   E4M3: 1符号 + 4指数(bias 7) + 3尾数; exp==0 子正规 = (mant/8)*2^-6;
+//         exp==15: 按 DeepSeek 编码饱和为 +/-448 (非 NaN)
+//
+// ⚠️ 注意: bf16.staro 的 decode_fp8e4m3 子正规/exp15 分支有 bug (见文件头), 此处为正确版,
+//    供 FP8 attention 全路径使用, 勿混用旧版.
+
+// E4M3 byte -> fp32 位模式 (正确版)
+Funktion e4m3_bits(b)
+    sign = b / 128              // 0 或 1
+    exp = (b / 8) % 16
+    mant = b % 8
+    ss = sign * 2147483648      // 0x80000000 或 0
+    // 正规 (exp 1..14): value = (1 + mant/8)*2^(exp-7)
+    //   fp32: 指数字段 = exp-7+127 = exp+120, 尾数 = mant<<20
+    Wenn exp >= 1 und exp <= 14 dann
+        e32 = exp + 120
+        gebe_zurueck ss + e32 * 8388608 + mant * 1048576
+    Ende
+    // exp==0: 子正规 value = (mant/8)*2^-6 = mant * 2^-9 (mant 1..7 均为 fp32 正规数)
+    //   mant*2^-9: 用归一化 1.xxx*2^e 构造 (e = -9+floor(log2(mant)))
+    Wenn exp == 0 dann
+        // 查表: mant -> (指数字段, 尾数字段)
+        // mant=0 -> 0; mant=1:2^-9 e=118 m=0; mant=2:2^-8 e=119 m=0; mant=3:1.5*2^-8 e=119 m=2^22
+        // mant=4:2^-7 e=120 m=0; mant=5:1.25*2^-7 e=120 m=2^21; mant=6:1.5*2^-7 e=120 m=2^22
+        // mant=7:1.75*2^-7 e=120 m=3*2^21
+        Wenn mant == 0 dann
+            gebe_zurueck ss
+        Ende
+        Wenn mant == 1 dann
+            gebe_zurueck ss + 118 * 8388608
+        Ende
+        Wenn mant == 2 dann
+            gebe_zurueck ss + 119 * 8388608
+        Ende
+        Wenn mant == 3 dann
+            gebe_zurueck ss + 119 * 8388608 + 4194304
+        Ende
+        Wenn mant == 4 dann
+            gebe_zurueck ss + 120 * 8388608
+        Ende
+        Wenn mant == 5 dann
+            gebe_zurueck ss + 120 * 8388608 + 2097152
+        Ende
+        Wenn mant == 6 dann
+            gebe_zurueck ss + 120 * 8388608 + 4194304
+        Ende
+        gebe_zurueck ss + 120 * 8388608 + 6291456  // mant==7
+    Ende
+    // exp==15: e4m3fn 变体 —— mant=0..6 为有效值 (1+m/8)*2^8 = 256+32m, mant=7 为 NaN
+    //   (DeepSeek 编码饱和于 448=exp15/mant6, 数据实测无 mant=7; 这里 mant=7 置 NaN 防误用)
+    //   256+32m 的 fp32: 指数字段 135(=8+127), 尾数 = m*2^20
+    Wenn exp == 15 dann
+        Wenn mant == 7 dann
+            gebe_zurueck ss + 2143289344  // NaN 0x7FC00000
+        Ende
+        gebe_zurueck ss + 135 * 8388608 + mant * 1048576
+    Ende
+    gebe_zurueck ss  // 不可达
+Ende
+
+// E4M3 LUT 查找: byte -> fp32 位模式
+Funktion e4m3_lut_bits(b)
+    gebe_zurueck e4m3_bits(b)
+Ende
+
+// 构建 256 项 E4M3 LUT 到 lutbuf (每项 4 字节 fp32 位模式)
+Funktion e4m3_build_lut(lutbuf)
+    b = 0
+    Solange b < 256
+        raw_set32(lutbuf, b * 4, e4m3_bits(b))
+        b = b + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 反量化一行 n 个 FP8 元素 (128x128 块缩放):
+//   wbase: weight 字节数组 (n 字节, 该行起始), scbase: scale 字节数组 (整块网格, 行主序)
+//   m: 当前行号(用于块行索引), ncb: 每行块列数, n: 元素数
+//   输出 n 个 fp32 位模式到 out[outoff..]
+Funktion fp8_dequant_row(wbase, scbase, m, ncb, n, out, outoff)
+    e = 0
+    Solange e < n
+        b = raw_byteat(wbase, e)
+        blk = (m / 128) * ncb + (e / 128)
+        k = e8m0_exp(raw_byteat(scbase, blk))
+        v = fp32_mul_pow2(e4m3_bits(b), k)
+        raw_set32(out, outoff + e * 4, v)
+        e = e + 1
+    Ende
+    gebe_zurueck 0
+Ende

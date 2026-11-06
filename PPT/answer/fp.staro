@@ -1,0 +1,79 @@
+// ============================================================================
+//  fp.staro —— StarC 浮点能力层（铁律 E：全部在 .staro 实现）
+//  ★ StarC 原生无浮点类型/字面量/运算符。浮点值 = 64 位整数里装的 IEEE754 位模式。
+//    这些函数是编译器提供的「库函数」（fadd/fmul/fdiv/fsqrt/fcmp/f2i/i2f），
+//    不是语言关键字（lex.h 里没有它们）。真正的双精度运算在编译器的 SSE 运行时里。
+//  本库把浮点能力封装成语义化接口：fp_make / fp_add / fp_mul / fp_div / fp_floor / fp_cmp ...
+//  正文 .starc 只调用这些，绝不直接碰位模式（除非算哈希）。
+// ============================================================================
+
+// ---------- 整数 <-> 浮点位模式 ----------
+
+Funktion fp_make(num, den)
+    // 从整数 num/den 构造浮点（返回位模式）。den 默认 1。
+    // 整数 -> double 位模式用 i2f（编译器库函数，非关键字）
+    n = i2f(num)
+    d = i2f(den)
+    r = fdiv(n, d)
+    gebe_zurueck r
+Ende
+
+Funktion fp_from_int(num)
+    gebe_zurueck i2f(num)
+Ende
+
+Funktion fp_to_int(f)
+    gebe_zurueck f2i(f)
+Ende
+
+// ---------- 基本运算（全部经编译器库函数，非语言内建）----------
+
+Funktion fp_add(a, b)
+    gebe_zurueck fadd(a, b)
+Ende
+
+Funktion fp_sub(a, b)
+    gebe_zurueck fsub(a, b)
+Ende
+
+Funktion fp_mul(a, b)
+    gebe_zurueck fmul(a, b)
+Ende
+
+Funktion fp_div(a, b)
+    gebe_zurueck fdiv(a, b)
+Ende
+
+Funktion fp_sqrt(a)
+    gebe_zurueck fsqrt(a)
+Ende
+
+Funktion fp_abs(a)
+    gebe_zurueck fabs(a)
+Ende
+
+Funktion fp_neg(a)
+    gebe_zurueck fneg(a)
+Ende
+
+Funktion fp_cmp(a, b)
+    // -1 / 0 / 1
+    gebe_zurueck fcmp(a, b)
+Ende
+
+// ---------- 常用数值 ----------
+
+Funktion fp_zero()
+    gebe_zurueck 0
+Ende
+
+Funktion fp_one()
+    gebe_zurueck i2f(1)
+Ende
+
+// ---------- 向下取整（截断成整数再回浮点）----------
+
+Funktion fp_floor(f)
+    i = f2i(f)
+    gebe_zurueck i2f(i)
+Ende

@@ -1,0 +1,336 @@
+// ============================================================================
+//  starshell :: inuos/eng_datei.staro
+//  Selbst implementierte Datei/Verzeichnis-Befehle (WinAPI direkt)
+//  args = C-String des Befehlsrests (nach dem Befehlsnamen).
+//  Faehigkeiten kommen aus file.staro; hier nur Befehlslogik + Ausgabe.
+// ============================================================================
+
+// Datei-/Verzeichnisliste (dir/ls/liste)
+Funktion datei_liste(args)
+    arg = extract_arg(args, 0)
+    pattern = str_concat(dir_cur(), "/*")
+    Wenn str_len(arg) != 0 dann
+        l = str_len(arg)
+        letztes = raw_byteat(arg, 8 + l - 1)
+        Wenn letztes == 47 dann
+            pattern = str_concat(arg, "*")
+        Sonst
+            Wenn letztes == 92 dann
+                pattern = str_concat(arg, "*")
+            Sonst
+                pattern = str_concat(arg, "/*")
+            Ende
+        Ende
+    Ende
+    dir_list(pattern)
+    gebe_zurueck 1
+Ende
+
+// Wechseln (cd/wechsle)
+Funktion datei_wechsle(args)
+    arg = extract_arg(args, 0)
+    Wenn str_len(arg) == 0 dann
+        write_str(dir_cur())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    r = dir_set(arg)
+    Wenn r == 0 dann
+        write_str("Verzeichnis nicht gefunden: ")
+        write_str(arg)
+        write_newline()
+    Sonst
+        write_str(dir_cur())
+        write_newline()
+    Ende
+    gebe_zurueck 1
+Ende
+
+// Aktuelles Verzeichnis (pwd/wo)
+Funktion datei_wo()
+    write_str(dir_cur())
+    write_newline()
+    gebe_zurueck 1
+Ende
+
+// Datei anzeigen (type/cat/zeige/more)
+Funktion datei_lesen(args)
+    arg = extract_arg(args, 0)
+    Wenn str_len(arg) == 0 dann
+        write_str("zeige <Datei>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn file_exists(arg) == 0 dann
+        write_str("Datei nicht gefunden: ")
+        write_str(arg)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    inhalt = file_read(arg)
+    Wenn inhalt == 0 dann
+        write_str("Fehler beim Lesen: ")
+        write_str(arg)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    write_str(inhalt)
+    write_newline()
+    gebe_zurueck 1
+Ende
+
+// Kopieren (copy/kopiere/cp)
+Funktion datei_kopieren(args)
+    q = argument_n(args, 0, 1)
+    z = argument_n(args, 0, 2)
+    Wenn str_len(q) == 0 dann
+        write_str("kopiere <Quelle> <Ziel>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_len(z) == 0 dann
+        write_str("kopiere <Quelle> <Ziel>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    r = file_copy(q, z)
+    Wenn r == 0 dann
+        write_str("Fehler beim Kopieren: ")
+        write_str(q)
+        write_newline()
+    Sonst
+        write_str("kopiert: ")
+        write_str(q)
+        write_str(" -> ")
+        write_str(z)
+        write_newline()
+    Ende
+    gebe_zurueck 1
+Ende
+
+// Verschieben/Umbenennen (move/verschiebe/ren/mv)
+Funktion datei_verschieben(args)
+    q = argument_n(args, 0, 1)
+    z = argument_n(args, 0, 2)
+    Wenn str_len(q) == 0 dann
+        write_str("verschiebe <Quelle> <Ziel>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_len(z) == 0 dann
+        write_str("verschiebe <Quelle> <Ziel>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    r = file_move(q, z)
+    Wenn r == 0 dann
+        write_str("Fehler beim Verschieben: ")
+        write_str(q)
+        write_newline()
+    Sonst
+        write_str("verschoben: ")
+        write_str(q)
+        write_str(" -> ")
+        write_str(z)
+        write_newline()
+    Ende
+    gebe_zurueck 1
+Ende
+
+// Loeschen (del/rm/loesche/erase)
+Funktion datei_loeschen(args)
+    arg = extract_arg(args, 0)
+    Wenn str_len(arg) == 0 dann
+        write_str("loesche <Datei>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    r = file_delete(arg)
+    Wenn r == 0 dann
+        write_str("Fehler beim Loeschen: ")
+        write_str(arg)
+        write_newline()
+    Sonst
+        write_str("geloescht: ")
+        write_str(arg)
+        write_newline()
+    Ende
+    gebe_zurueck 1
+Ende
+
+// Verzeichnis anlegen (mkdir/md)
+Funktion datei_anlegen(args)
+    arg = extract_arg(args, 0)
+    Wenn str_len(arg) == 0 dann
+        write_str("mkdir <Ordner>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    r = dir_create(arg)
+    Wenn r == 0 dann
+        write_str("Konnte nicht anlegen: ")
+        write_str(arg)
+        write_newline()
+    Sonst
+        write_str("angelegt: ")
+        write_str(arg)
+        write_newline()
+    Ende
+    gebe_zurueck 1
+Ende
+
+// Verzeichnis entfernen (rmdir/rd)
+Funktion datei_entfernen(args)
+    arg = extract_arg(args, 0)
+    Wenn str_len(arg) == 0 dann
+        write_str("rmdir <Ordner>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    r = dir_remove(arg)
+    Wenn r == 0 dann
+        write_str("Konnte nicht entfernen: ")
+        write_str(arg)
+        write_newline()
+    Sonst
+        write_str("entfernt: ")
+        write_str(arg)
+        write_newline()
+    Ende
+    gebe_zurueck 1
+Ende
+
+// Existiert (existiert/exists)
+Funktion datei_existiert(args)
+    arg = extract_arg(args, 0)
+    Wenn str_len(arg) == 0 dann
+        write_str("existiert <Pfad>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn file_exists(arg) == 1 dann
+        write_str("ja: ")
+        write_str(arg)
+    Sonst
+        write_str("nein: ")
+        write_str(arg)
+    Ende
+    write_newline()
+    gebe_zurueck 1
+Ende
+
+// Groesse (groesse/size)
+Funktion datei_groesse(args)
+    arg = extract_arg(args, 0)
+    Wenn str_len(arg) == 0 dann
+        write_str("groesse <Datei>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    g = file_groesse(arg)
+    Wenn g == 0 - 1 dann
+        write_str("Datei nicht gefunden: ")
+        write_str(arg)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    write_str(arg)
+    write_str("  ")
+    write_int(g)
+    write_str(" Bytes")
+    write_newline()
+    gebe_zurueck 1
+Ende
+
+// Attribute (attrib)
+Funktion datei_attrib(args)
+    arg = extract_arg(args, 0)
+    Wenn str_len(arg) == 0 dann
+        write_str("attrib <Pfad>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    m = file_attrib(arg)
+    Wenn m == 4294967295 dann
+        write_str("nicht gefunden: ")
+        write_str(arg)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    write_str(arg)
+    write_str("  [")
+    Wenn m - (m / 1) * 1 >= 1 dann
+        write_str("R")
+    Ende
+    Wenn m - (m / 2) * 2 >= 2 dann
+        write_str("H")
+    Ende
+    Wenn m - (m / 4) * 4 >= 4 dann
+        write_str("S")
+    Ende
+    Wenn m - (m / 16) * 16 >= 16 dann
+        write_str("D")
+    Ende
+    Wenn m - (m / 32) * 32 >= 32 dann
+        write_str("A")
+    Ende
+    write_str("]")
+    write_newline()
+    gebe_zurueck 1
+Ende
+
+// Touch (touch)
+Funktion datei_touch(args)
+    arg = extract_arg(args, 0)
+    Wenn str_len(arg) == 0 dann
+        write_str("touch <Datei>")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    r = file_touch(arg)
+    Wenn r == 0 dann
+        write_str("Fehler: ")
+        write_str(arg)
+        write_newline()
+    Sonst
+        write_str("beruehrt: ")
+        write_str(arg)
+        write_newline()
+    Ende
+    gebe_zurueck 1
+Ende
+
+// Verzeichnis-Liste mit Groessen (dirlist) - einfache Variante
+Funktion datei_liste_gross(args)
+    arg = extract_arg(args, 0)
+    pattern = str_concat(dir_cur(), "/*")
+    Wenn str_len(arg) != 0 dann
+        pattern = str_concat(arg, "/*")
+    Ende
+    c = starc_to_cstr(pattern)
+    fd = alloc(320)
+    h = FindFirstFileA(c, fd)
+    Wenn h == 0 - 1 dann
+        write_str("leer")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    write_cstr(fd + 44)
+    write_str("  ")
+    write_int(file_groesse(cstr_to_starc(fd + 44)))
+    write_newline()
+    loop = 1
+    Solange loop == 1
+        r = FindNextFileA(h, fd)
+        Wenn r == 0 dann
+            loop = 0
+        Sonst
+            write_cstr(fd + 44)
+            write_str("  ")
+            write_int(file_groesse(cstr_to_starc(fd + 44)))
+            write_newline()
+        Ende
+    Ende
+    FindClose(h)
+    gebe_zurueck 1
+Ende

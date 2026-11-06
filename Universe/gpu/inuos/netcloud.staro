@@ -1,0 +1,410 @@
+// ============================================================
+// netcloud.staro — 网云 (Net-Cloud) 提取器: .glb -> 点云+面云+体网络
+// Universe 3D V1 阶段0: 解析不只是简单转化, 把点/面拆成网云(训练前缀)
+// 复用 glb_voxel.staro 的 JSON 扫描 + GLB 容器解析 (零依赖, 只支持 .glb)
+// ============================================================
+
+// ---- 统计 .glb 的点数/面数 (两遍法第一步): out[0]=nV [8]=nF ----
+Funktion nc_count_points_faces(fb, js, js_end, out)
+    nm = glb_num_meshes(fb, js, js_end)
+    Wenn nm < 0 dann
+        gebe_zurueck 0
+    Ende
+    totalV = 0
+    totalF = 0
+    m = 0
+    Solange m < nm
+        primpos = alloc(8)
+        np = glb_mesh_prims(fb, js, js_end, m, primpos)
+        Wenn np > 0 dann
+            parr = raw_get64(primpos, 0)
+            p = 0
+            Solange p < np
+                ep = alloc(8)
+                r = js_arr_elem(fb, parr, js_end, p, ep)
+                Wenn r == 1 dann
+                    el = raw_get64(ep, 0)
+                    pp = alloc(16)
+                    glb_prim_pos(fb, el, js_end, pp)
+                    pos_acc = raw_get64(pp, 0)
+                    idx_acc = raw_get64(pp, 8)
+                    Wenn pos_acc != -1 dann
+                        ao = alloc(40)
+                        rr = glb_get_accessor(fb, js, js_end, pos_acc, ao)
+                        Wenn rr == 1 dann
+                            p_ct = raw_get64(ao, 8)
+                            nV = raw_get64(ao, 16)
+                            p_tv = raw_get64(ao, 32)
+                            Wenn p_ct == 5126 und p_tv == 2 und nV > 0 dann
+                                totalV = totalV + nV
+                                Wenn idx_acc != -1 dann
+                                    io = alloc(40)
+                                    r2 = glb_get_accessor(fb, js, js_end, idx_acc, io)
+                                    Wenn r2 == 1 dann
+                                        i_cnt = raw_get64(io, 16)
+                                        totalF = totalF + i_cnt / 3
+                                    Ende
+                                Sonst
+                                    totalF = totalF + nV / 3
+                                Ende
+                            Ende
+                        Ende
+                    Ende
+                Ende
+                p = p + 1
+            Ende
+        Ende
+        m = m + 1
+    Ende
+    raw_set64(out, 0, totalV)
+    raw_set64(out, 8, totalF)
+    gebe_zurueck 1
+Ende
+
+// ---- 提取点云+面云 (跨 prim 顶点偏移累加) ----
+// points: f32 位模式 [nV*3], faces: u32 [nF*3], stats: [0]=nV [8]=nF [16]=prim [24]=fail
+// 返回 1 成功 0 失败
+Funktion nc_extract_points_faces(fb, js, js_end, bin_data, points, faces, maxV, maxF, stats)
+    nm = glb_num_meshes(fb, js, js_end)
+    Wenn nm < 0 dann
+        gebe_zurueck 0
+    Ende
+    vbase_global = 0
+    totalF = 0
+    m = 0
+    Solange m < nm
+        primpos = alloc(8)
+        np = glb_mesh_prims(fb, js, js_end, m, primpos)
+        Wenn np > 0 dann
+            parr = raw_get64(primpos, 0)
+            p = 0
+            Solange p < np
+                ep = alloc(8)
+                r = js_arr_elem(fb, parr, js_end, p, ep)
+                Wenn r == 1 dann
+                    el = raw_get64(ep, 0)
+                    pp = alloc(16)
+                    glb_prim_pos(fb, el, js_end, pp)
+                    pos_acc = raw_get64(pp, 0)
+                    idx_acc = raw_get64(pp, 8)
+                    Wenn pos_acc != -1 dann
+                        ao = alloc(40)
+                        rr = glb_get_accessor(fb, js, js_end, pos_acc, ao)
+                        Wenn rr == 1 dann
+                            p_bv = raw_get64(ao, 0)
+                            p_ct = raw_get64(ao, 8)
+                            nV = raw_get64(ao, 16)
+                            p_bo = raw_get64(ao, 24)
+                            p_tv = raw_get64(ao, 32)
+                            Wenn p_ct == 5126 und p_tv == 2 und nV > 0 und vbase_global + nV <= maxV dann
+                                bo = alloc(32)
+                                r3 = glb_get_bv(fb, js, js_end, p_bv, bo)
+                                Wenn r3 == 1 dann
+                                    bv_bo = raw_get64(bo, 0)
+                                    bs = raw_get64(bo, 16)
+                                    stride = bs
+                                    Wenn stride == 0 dann
+                                        stride = 12
+                                    Ende
+                                    vbase = bin_data + bv_bo + p_bo
+                                    i = 0
+                                    Solange i < nV
+                                        x = raw_get32(fb, vbase + i * stride)
+                                        y = raw_get32(fb, vbase + i * stride + 4)
+                                        z = raw_get32(fb, vbase + i * stride + 8)
+                                        t_set(points, (vbase_global + i) * 3 + 0, x)
+                                        t_set(points, (vbase_global + i) * 3 + 1, y)
+                                        t_set(points, (vbase_global + i) * 3 + 2, z)
+                                        i = i + 1
+                                    Ende
+                                    // ---- 面云: 读 indices ----
+                                    Wenn idx_acc != -1 dann
+                                        io = alloc(40)
+                                        r4 = glb_get_accessor(fb, js, js_end, idx_acc, io)
+                                        Wenn r4 == 1 dann
+                                            i_bv = raw_get64(io, 0)
+                                            i_ct = raw_get64(io, 8)
+                                            i_cnt = raw_get64(io, 16)
+                                            i_bo = raw_get64(io, 24)
+                                            ibo = alloc(32)
+                                            r5 = glb_get_bv(fb, js, js_end, i_bv, ibo)
+                                            Wenn r5 == 1 dann
+                                                ibv_bo = raw_get64(ibo, 0)
+                                                ibase = bin_data + ibv_bo + i_bo
+                                                isz = 4
+                                                Wenn i_ct == 5123 dann
+                                                    isz = 2
+                                                Ende
+                                                nTri = i_cnt / 3
+                                                Wenn totalF + nTri <= maxF dann
+                                                    ti = 0
+                                                    Solange ti < nTri
+                                                        i0 = glb_read_idx(fb, ibase, ti * 3 + 0, isz) + vbase_global
+                                                        i1 = glb_read_idx(fb, ibase, ti * 3 + 1, isz) + vbase_global
+                                                        i2 = glb_read_idx(fb, ibase, ti * 3 + 2, isz) + vbase_global
+                                                        raw_set32(faces, (totalF + ti) * 12 + 0, i0)
+                                                        raw_set32(faces, (totalF + ti) * 12 + 4, i1)
+                                                        raw_set32(faces, (totalF + ti) * 12 + 8, i2)
+                                                        ti = ti + 1
+                                                    Ende
+                                                    totalF = totalF + nTri
+                                                Ende
+                                            Ende
+                                        Ende
+                                    Sonst
+                                        // 无 indices: 每 3 顶点一三角
+                                        nTri = nV / 3
+                                        Wenn totalF + nTri <= maxF dann
+                                            ti = 0
+                                            Solange ti < nTri
+                                                raw_set32(faces, (totalF + ti) * 12 + 0, vbase_global + ti * 3 + 0)
+                                                raw_set32(faces, (totalF + ti) * 12 + 4, vbase_global + ti * 3 + 1)
+                                                raw_set32(faces, (totalF + ti) * 12 + 8, vbase_global + ti * 3 + 2)
+                                                ti = ti + 1
+                                            Ende
+                                            totalF = totalF + nTri
+                                        Ende
+                                    Ende
+                                    vbase_global = vbase_global + nV
+                                    raw_set64(stats, 16, raw_get64(stats, 16) + 1)
+                                Ende
+                            Sonst
+                                raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+                            Ende
+                        Ende
+                    Ende
+                Ende
+                p = p + 1
+            Ende
+        Ende
+        m = m + 1
+    Ende
+    raw_set64(stats, 0, vbase_global)
+    raw_set64(stats, 8, totalF)
+    gebe_zurueck 1
+Ende
+
+// ---- 体网络: 空间哈希网格 (点 -> 单元), 体网络记录占位与邻接 ----
+// V 分辨率网格, 输入点已由 nc_normalize_unit 归一化到 [0,1)
+// cellcount[V*V*V] 记录每单元点数; 返回实际占用的单元数
+// 边界 clamp: x=1.0 -> nx=V -> clamp 到 V-1, 保证不丢点
+Funktion nc_build_voxnet(points, nV, V, cellcount)
+    vf = s32_to_f32(V)
+    i = 0
+    Solange i < nV
+        xf = t_get(points, i * 3 + 0)
+        yf = t_get(points, i * 3 + 1)
+        zf = t_get(points, i * 3 + 2)
+        nx = f32_to_s32(f32_mul(xf, vf))
+        ny = f32_to_s32(f32_mul(yf, vf))
+        nz = f32_to_s32(f32_mul(zf, vf))
+        Wenn nx < 0 dann nx = 0 Ende
+        Wenn nx >= V dann nx = V - 1 Ende
+        Wenn ny < 0 dann ny = 0 Ende
+        Wenn ny >= V dann ny = V - 1 Ende
+        Wenn nz < 0 dann nz = 0 Ende
+        Wenn nz >= V dann nz = V - 1 Ende
+        cell = nx * V * V + ny * V + nz
+        raw_set32(cellcount, cell * 4, raw_get32(cellcount, cell * 4) + 1)
+        i = i + 1
+    Ende
+    occ = 0
+    j = 0
+    Solange j < V * V * V
+        Wenn raw_get32(cellcount, j * 4) != 0 dann
+            occ = occ + 1
+        Ende
+        j = j + 1
+    Ende
+    gebe_zurueck occ
+Ende
+
+// ---- 网云专用归一化: 点映射到 [0,1) (用 bbox min/max 线性映射) ----
+// 区别于体素化 glb_normalize_global (映射到 [-0.45,0.45]), 保证网格映射对齐
+// gb 来自 glb_global_bbox: [0]=minx [8]=miny [16]=minz [24]=maxx [32]=maxy [40]=maxz
+Funktion nc_normalize_unit(verts, nV, gb)
+    minx = raw_get64(gb, 0)
+    miny = raw_get64(gb, 8)
+    minz = raw_get64(gb, 16)
+    maxx = raw_get64(gb, 24)
+    maxy = raw_get64(gb, 32)
+    maxz = raw_get64(gb, 40)
+    dx = f32_sub(maxx, minx)
+    dy = f32_sub(maxy, miny)
+    dz = f32_sub(maxz, minz)
+    zero = s32_to_f32(0)
+    i = 0
+    Solange i < nV
+        x = t_get(verts, i * 3 + 0)
+        y = t_get(verts, i * 3 + 1)
+        z = t_get(verts, i * 3 + 2)
+        Wenn f32_gt(dx, zero) dann
+            t_set(verts, i * 3 + 0, f32_div(f32_sub(x, minx), dx))
+        Sonst
+            t_set(verts, i * 3 + 0, zero)
+        Ende
+        Wenn f32_gt(dy, zero) dann
+            t_set(verts, i * 3 + 1, f32_div(f32_sub(y, miny), dy))
+        Sonst
+            t_set(verts, i * 3 + 1, zero)
+        Ende
+        Wenn f32_gt(dz, zero) dann
+            t_set(verts, i * 3 + 2, f32_div(f32_sub(z, minz), dz))
+        Sonst
+            t_set(verts, i * 3 + 2, zero)
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// ---- 冗余剔除: 点去重 + 面去重 + 退化面剔除 (阶段0.3) ----
+// 点按 f32 位模式哈希去重 (线性探测), 面索引重映射, 重复/退化三角剔除
+// 参数:
+//   points/faces: 输入 (nV*12 / nF*12 字节)
+//   dpoints/dfaces: 输出缓冲 (调用方分配 nV*12 / nF*12 上限)
+//   remap: 原顶点索引 -> 新索引 (nV*4)
+//   ht_slot: 哈希槽 (slots*4, 存"原索引+1", 0=空)
+//   slots: 哈希槽数 (建议 >= 2*nV)
+//   out: [0]=new_nV [8]=new_nF
+// 返回 1 成功 0 失败
+Funktion nc_dedup(points, faces, nV, nF, dpoints, dfaces, remap, ht_slot, slots, out)
+    i = 0
+    Solange i < slots
+        raw_set32(ht_slot, i * 4, 0)
+        i = i + 1
+    Ende
+    new_nV = 0
+    i = 0
+    Solange i < nV
+        x = raw_get32(points, i * 12 + 0)
+        y = raw_get32(points, i * 12 + 4)
+        z = raw_get32(points, i * 12 + 8)
+        h = (x + y * 31 + z * 1021) % slots
+        probe = h
+        done = 0
+        Solange done == 0
+            s = raw_get32(ht_slot, probe * 4)
+            Wenn s == 0 dann
+                // 空槽: 插入新点
+                raw_set32(dpoints, new_nV * 12 + 0, x)
+                raw_set32(dpoints, new_nV * 12 + 4, y)
+                raw_set32(dpoints, new_nV * 12 + 8, z)
+                raw_set32(ht_slot, probe * 4, i + 1)
+                raw_set32(remap, i * 4, new_nV)
+                new_nV = new_nV + 1
+                done = 1
+            Sonst
+                s0 = s - 1
+                Wenn raw_get32(points, s0 * 12 + 0) == x und raw_get32(points, s0 * 12 + 4) == y und raw_get32(points, s0 * 12 + 8) == z dann
+                    raw_set32(remap, i * 4, raw_get32(remap, s0 * 4))
+                    done = 1
+                Sonst
+                    probe = probe + 1
+                    Wenn probe >= slots dann probe = 0 Ende
+                Ende
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    // 重映射面 + 剔除退化 (重复顶点) 三角
+    new_nF = 0
+    i = 0
+    Solange i < nF
+        a = raw_get32(faces, i * 12 + 0)
+        b = raw_get32(faces, i * 12 + 4)
+        c = raw_get32(faces, i * 12 + 8)
+        na = raw_get32(remap, a * 4)
+        nb = raw_get32(remap, b * 4)
+        nc = raw_get32(remap, c * 4)
+        Wenn na != nb und nb != nc und na != nc dann
+            raw_set32(dfaces, new_nF * 12 + 0, na)
+            raw_set32(dfaces, new_nF * 12 + 4, nb)
+            raw_set32(dfaces, new_nF * 12 + 8, nc)
+            new_nF = new_nF + 1
+        Ende
+        i = i + 1
+    Ende
+    raw_set64(out, 0, new_nV)
+    raw_set64(out, 8, new_nF)
+    gebe_zurueck 1
+Ende
+
+// ---- 网云检索: 体网络占位相似度 (Jaccard) ----
+// 比较两个网云的体网络占位 (cell_idx 稀疏索引), 交集/并集 = 相似度
+// va/vb: V*V*V 字节标记缓冲 (调用方分配); out: [0]=inter [4]=union [8]=jac(f32)
+// 返回 1 成功
+Funktion nc_sim_voxnet(ci_a, occ_a, ci_b, occ_b, V, va, vb, out)
+    V3 = V * V * V
+    i = 0
+    Solange i < V3
+        raw_setbyte(va, i, 0)
+        raw_setbyte(vb, i, 0)
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < occ_a
+        c = raw_get32(ci_a, i * 4)
+        Wenn c < V3 dann raw_setbyte(va, c, 1) Ende
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < occ_b
+        c = raw_get32(ci_b, i * 4)
+        Wenn c < V3 dann raw_setbyte(vb, c, 1) Ende
+        i = i + 1
+    Ende
+    inter = 0
+    union = 0
+    i = 0
+    Solange i < V3
+        a = raw_byteat(va, i)
+        b = raw_byteat(vb, i)
+        Wenn a == 1 und b == 1 dann inter = inter + 1 Ende
+        Wenn a == 1 oder b == 1 dann union = union + 1 Ende
+        i = i + 1
+    Ende
+    jac = s32_to_f32(0)
+    Wenn union > 0 dann
+        jac = f32_div(s32_to_f32(inter), s32_to_f32(union))
+    Ende
+    raw_set32(out, 0, inter)
+    raw_set32(out, 4, union)
+    raw_set32(out, 8, jac)
+    gebe_zurueck 1
+Ende
+
+// ---- 特征提取: 体网络占位 -> 粗特征 X(V4=64 维) + 细目标 Y(V8=512 维) ----
+// 源体网络 V32=32768 cells; 归并: X[c4]=1 (V=4), Y[c8]=1 (V=8)
+// X/Y: f32 位模式缓冲 (V4^3=64 / V8^3=512)
+Funktion nc_feat(ci, occ, X, Y)
+    i = 0
+    Solange i < 64
+        raw_set32(X, i * 4, s32_to_f32(0))
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < 512
+        raw_set32(Y, i * 4, s32_to_f32(0))
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < occ
+        c = raw_get32(ci, i * 4)
+        cx = c / 1024
+        cy = (c / 32) % 32
+        cz = c % 32
+        x8 = cx / 4
+        y8 = cy / 4
+        z8 = cz / 4
+        c8 = x8 * 64 + y8 * 8 + z8
+        raw_set32(Y, c8 * 4, s32_to_f32(1))
+        x4 = cx / 8
+        y4 = cy / 8
+        z4 = cz / 8
+        c4 = x4 * 16 + y4 * 4 + z4
+        raw_set32(X, c4 * 4, s32_to_f32(1))
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende

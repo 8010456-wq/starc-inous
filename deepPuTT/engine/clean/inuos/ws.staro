@@ -1,0 +1,6 @@
+// inuos/ws.staro - ws2_32 返回值对照测试
+linx "ws2_32.dll!ntohs"
+Funktion ws_ntohs(v)
+    r = ntohs(v)
+    gebe_zurueck r
+Ende

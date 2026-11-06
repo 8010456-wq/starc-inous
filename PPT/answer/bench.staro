@@ -1,0 +1,165 @@
+// ============================================================================
+//  bench.staro —— language-bench 公共能力层（铁律 E：能力全在 .staro）
+//  计时（QueryPerformanceCounter）+ 小端读写 + lbgen hash_words（权威校验）。
+//  hash_words 复现 lbgen 的 CHECK：h1=(h1*1000003+w mod P1) mod P1,
+//  h2=(h2*999983+w mod P2) mod P2, 初值 17/19, 末尾再混入词数 n。
+//  ★ 只用于 9 个新基准；sieve/parallel 用各自的 sieve.staro/parallel.staro。
+// ============================================================================
+
+linx-o kernel32 QueryPerformanceCounter QueryPerformanceFrequency
+
+// ---------- 高精度计时 ----------
+
+Funktion qpc()
+    p = alloc(8)
+    QueryPerformanceCounter(p)
+    v = raw_byteat(p, 0) + raw_byteat(p, 1) * 256 + raw_byteat(p, 2) * 65536 + raw_byteat(p, 3) * 16777216
+    v = v + raw_byteat(p, 4) * 4294967296 + raw_byteat(p, 5) * 1099511627776 + raw_byteat(p, 6) * 281474976710656 + raw_byteat(p, 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+Funktion qpf()
+    p = alloc(8)
+    QueryPerformanceFrequency(p)
+    v = raw_byteat(p, 0) + raw_byteat(p, 1) * 256 + raw_byteat(p, 2) * 65536 + raw_byteat(p, 3) * 16777216
+    v = v + raw_byteat(p, 4) * 4294967296 + raw_byteat(p, 5) * 1099511627776 + raw_byteat(p, 6) * 281474976710656 + raw_byteat(p, 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+// ---------- 64 位小端写入 / 读取 ----------
+
+Funktion write_u64(buf, off, v)
+    // 符号安全：对负 v 用迭代借位法写出二进制补码（StarC % 带符号、/ 向零截断）。
+    b = v % 256
+    Wenn b < 0 dann
+        b = b + 256
+    Ende
+    raw_setbyte(buf, off + 0, b)
+    v = (v - b) / 256
+    b = v % 256
+    Wenn b < 0 dann
+        b = b + 256
+    Ende
+    raw_setbyte(buf, off + 1, b)
+    v = (v - b) / 256
+    b = v % 256
+    Wenn b < 0 dann
+        b = b + 256
+    Ende
+    raw_setbyte(buf, off + 2, b)
+    v = (v - b) / 256
+    b = v % 256
+    Wenn b < 0 dann
+        b = b + 256
+    Ende
+    raw_setbyte(buf, off + 3, b)
+    v = (v - b) / 256
+    b = v % 256
+    Wenn b < 0 dann
+        b = b + 256
+    Ende
+    raw_setbyte(buf, off + 4, b)
+    v = (v - b) / 256
+    b = v % 256
+    Wenn b < 0 dann
+        b = b + 256
+    Ende
+    raw_setbyte(buf, off + 5, b)
+    v = (v - b) / 256
+    b = v % 256
+    Wenn b < 0 dann
+        b = b + 256
+    Ende
+    raw_setbyte(buf, off + 6, b)
+    v = (v - b) / 256
+    b = v % 256
+    Wenn b < 0 dann
+        b = b + 256
+    Ende
+    raw_setbyte(buf, off + 7, b)
+    gebe_zurueck 0
+Ende
+
+Funktion read_u64(buf, off)
+    v = raw_byteat(buf, off + 0) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    v = v + raw_byteat(buf, off + 4) * 4294967296 + raw_byteat(buf, off + 5) * 1099511627776 + raw_byteat(buf, off + 6) * 281474976710656 + raw_byteat(buf, off + 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+// 有符号 int32 小端读取
+Funktion read_i32(buf, off)
+    v = raw_byteat(buf, off) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    Wenn v > 2147483647 dann
+        v = v - 4294967296
+    Ende
+    gebe_zurueck v
+Ende
+
+// 有符号 int64 小端读取（用于 8 字节 word）
+Funktion read_i64(buf, off)
+    v = read_u64(buf, off)
+    // 若符号位为 1（>2^63-1），转有符号
+    Wenn v > 9223372036854775807 dann
+        v = v - 18446744073709551616
+    Ende
+    gebe_zurueck v
+Ende
+
+// 有符号 int64 小端写入（二进制补码）。write_u64 已符号安全（迭代借位法），直接委托。
+Funktion write_i64(buf, off, v)
+    gebe_zurueck write_u64(buf, off, v)
+Ende
+
+// ---------- lbgen hash_words ----------
+// 对 buf 中 n 个 word（每个 elem 字节，4 或 8，小端有符号）计算 CHECK。
+// 返回打包 h1*4294967296+h2（.starc 用 unpack_h1/unpack_h2 解出）。
+Funktion hash_words(buf, n, elem)
+    h1 = 17
+    h2 = 19
+    i = 0
+    Solange i < n
+        Wenn elem == 4 dann
+            w = read_i32(buf, i * 4)
+        Sonst
+            w = read_i64(buf, i * 8)
+        Ende
+        // m1 = ((w % P1) + P1) % P1   (P1=2147483647)
+        m1 = w % 2147483647
+        Wenn m1 < 0 dann
+            m1 = m1 + 2147483647
+        Ende
+        // m2 = ((w % P2) + P2) % P2   (P2=2147483629)
+        m2 = w % 2147483629
+        Wenn m2 < 0 dann
+            m2 = m2 + 2147483629
+        Ende
+        h1 = (h1 * 1000003 + m1) % 2147483647
+        h2 = (h2 * 999983 + m2) % 2147483629
+        i = i + 1
+    Ende
+    // 末尾混入词数 n
+    m1 = n % 2147483647
+    m2 = n % 2147483629
+    h1 = (h1 * 1000003 + m1) % 2147483647
+    h2 = (h2 * 999983 + m2) % 2147483629
+    gebe_zurueck h1 * 4294967296 + h2
+Ende
+
+Funktion unpack_h1(p)
+    gebe_zurueck p / 4294967296
+Ende
+
+Funktion unpack_h2(p)
+    gebe_zurueck p % 4294967296
+Ende
+
+// ---------- 打印 h1:h2 ----------
+
+Funktion write_hash(p)
+    write_str("check = ")
+    write_int(unpack_h1(p))
+    write_str(":")
+    write_int(unpack_h2(p))
+    write_newline()
+    gebe_zurueck 0
+Ende

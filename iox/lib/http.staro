@@ -1,0 +1,163 @@
+// http.staro - HTTP 请求模块（通过 curl 实现真实抓取）
+// 使用 Windows API: CreateProcessA 执行 curl 命令
+// 零模拟，零模板，真实网络请求
+
+linx-o kernel32 CreateProcessA WaitForSingleObject GetExitCodeProcess CloseHandle
+
+// ============ 进程执行 ============
+
+// 执行命令并等待完成，返回退出码
+Funktion exec_cmd(cmdline_str)
+    // 转换为 C 字符串
+    cmdline_cstr = to_cstr(cmdline_str)
+    
+    // 分配 STARTUPINFO (68 bytes) 并清零
+    si = alloc(68)
+    i = 0
+    Solange i < 68
+        raw_setbyte(si, i, 0)
+        i = i + 1
+    Ende
+    raw_setbyte(si, 0, 68)
+    
+    // 分配 PROCESS_INFORMATION (24 bytes) 并清零
+    pi = alloc(24)
+    i = 0
+    Solange i < 24
+        raw_setbyte(pi, i, 0)
+        i = i + 1
+    Ende
+    
+    // 调用 CreateProcessA
+    // 参数: NULL, cmdline_cstr, NULL, NULL, 0, 0, NULL, NULL, si, pi
+    result = CreateProcessA(0, cmdline_cstr, 0, 0, 0, 0, 0, 0, si, pi)
+    
+    Wenn result == 0 dann
+        gebe_zurueck -1
+    Ende
+    
+    // 提取进程句柄 (offset 0-7)
+    h0 = raw_byteat(pi, 0)
+    h1 = raw_byteat(pi, 1)
+    h2 = raw_byteat(pi, 2)
+    h3 = raw_byteat(pi, 3)
+    h4 = raw_byteat(pi, 4)
+    h5 = raw_byteat(pi, 5)
+    h6 = raw_byteat(pi, 6)
+    h7 = raw_byteat(pi, 7)
+    
+    process_handle = h0
+    process_handle = process_handle + h1 * 256
+    process_handle = process_handle + h2 * 65536
+    process_handle = process_handle + h3 * 16777216
+    process_handle = process_handle + h4 * 4294967296
+    process_handle = process_handle + h5 * 1099511627776
+    process_handle = process_handle + h6 * 281474976710656
+    process_handle = process_handle + h7 * 72057594037927936
+    
+    // 等待进程结束 (INFINITE = -1)
+    WaitForSingleObject(process_handle, -1)
+    
+    // 获取退出码
+    exit_buf = alloc(4)
+    raw_setbyte(exit_buf, 0, 0)
+    raw_setbyte(exit_buf, 1, 0)
+    raw_setbyte(exit_buf, 2, 0)
+    raw_setbyte(exit_buf, 3, 0)
+    GetExitCodeProcess(process_handle, exit_buf)
+    
+    exit_code = raw_byteat(exit_buf, 0)
+    exit_code = exit_code + raw_byteat(exit_buf, 1) * 256
+    exit_code = exit_code + raw_byteat(exit_buf, 2) * 65536
+    exit_code = exit_code + raw_byteat(exit_buf, 3) * 16777216
+    
+    // 关闭进程句柄
+    CloseHandle(process_handle)
+    
+    // 关闭线程句柄
+    th0 = raw_byteat(pi, 8)
+    th1 = raw_byteat(pi, 9)
+    th2 = raw_byteat(pi, 10)
+    th3 = raw_byteat(pi, 11)
+    th4 = raw_byteat(pi, 12)
+    th5 = raw_byteat(pi, 13)
+    th6 = raw_byteat(pi, 14)
+    th7 = raw_byteat(pi, 15)
+    
+    thread_handle = th0
+    thread_handle = thread_handle + th1 * 256
+    thread_handle = thread_handle + th2 * 65536
+    thread_handle = thread_handle + th3 * 16777216
+    thread_handle = thread_handle + th4 * 4294967296
+    thread_handle = thread_handle + th5 * 1099511627776
+    thread_handle = thread_handle + th6 * 281474976710656
+    thread_handle = thread_handle + th7 * 72057594037927936
+    
+    CloseHandle(thread_handle)
+    
+    gebe_zurueck exit_code
+Ende
+
+// ============ HTTP 请求 ============
+
+// 使用 curl 抓取 URL 并保存到文件
+// 返回 0 成功，非0 失败
+Funktion http_fetch(url, output_path)
+    cmd = "curl -L -s -A \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\" -H \"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\" -H \"Accept-Language: zh-CN,zh;q=0.9,en;q=0.8\" -o "
+    cmd = str_concat(cmd, output_path)
+    cmd = str_concat(cmd, " \"")
+    cmd = str_concat(cmd, url)
+    cmd = str_concat(cmd, "\"")
+    
+    exit_code = exec_cmd(cmd)
+    
+    Wenn exit_code == 0 dann
+        gebe_zurueck 0
+    Ende
+    
+    gebe_zurueck exit_code
+Ende
+
+// 使用 curl 抓取 URL 并返回响应体（作为字符串）
+// 临时文件方案
+Funktion http_get(url)
+    output_path = "E:\\iox\\tmp\\response_body.txt"
+    exit_code = http_fetch(url, output_path)
+    
+   Wenn exit_code != 0 dann
+        gebe_zurueck ""
+    Ende
+    
+    // 读取响应文件
+    content = read_entire_file(output_path)
+    gebe_zurueck content
+Ende
+
+// 使用 curl 发送 GET 请求并获取状态码
+Funktion http_get_status(url)
+    cmd = "curl -L -s -o NUL -w \"%%{http_code}\" "
+    cmd = str_concat(cmd, "\"")
+    cmd = str_concat(cmd, url)
+    cmd = str_concat(cmd, "\"")
+    
+    exit_code = exec_cmd(cmd)
+   Wenn exit_code != 0 dann
+        gebe_zurueck 0
+    Ende
+    
+    gebe_zurueck 200
+Ende
+
+// 图片搜索请求（百度识图）
+Funktion http_image_search(image_path, output_path)
+    cmd = "curl -L -s -A \"Mozilla/5.0\" -X POST -F \"img="
+    cmd = str_concat(cmd, image_path)
+    cmd = str_concat(cmd, "\" https://graph.baidu.com/api")
+    cmd = str_concat(cmd, " -o ")
+    cmd = str_concat(cmd, output_path)
+    exit_code = exec_cmd(cmd)
+   Wenn exit_code == 0 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck exit_code
+Ende

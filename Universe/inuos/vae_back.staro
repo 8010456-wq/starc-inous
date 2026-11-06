@@ -1,0 +1,227 @@
+// inuos/vae_back.staro - 体素 3D VAE 反向传播 (Universe 训练用)
+// 依赖: tensor.staro, softfloat.staro
+// 与 vae.staro 前向对称. 所有梯度以 fp32 位模式累加.
+// 说明: 这些反向函数对"单样本"生效 (batch=1), 梯度直接累加到权重缓冲.
+
+// ---- sigmoid 导数: dy/dlogit = y*(1-y) ----
+Funktion vb_sig_deriv(y)
+    onem = f32_sub(1065353216, y)
+    gebe_zurueck f32_mul(y, onem)
+Ende
+
+// ---- conv3d_pad1 反向 (前向: conv3d_pad1_relu) ----
+// 输入梯度 dout (Co,D,H,W) -> din (Ci,D,H,W), dw (Co,Ci,3,3,3), dbias (Co)
+// 需记录前向激活用于 ReLU 导数 (传 fwd 前向输出)
+Funktion conv3d_pad1_backward(dout, fwd, in, w, din, dw, dbias, Ci, D, H, W, Co)
+    // 先清零梯度
+    t_zero(din, Ci * D * H * W)
+    t_zero(dw, Co * Ci * 27)
+    t_zero(dbias, Co)
+    co = 0
+    Solange co < Co
+        od = 0
+        Solange od < D
+            oh = 0
+            Solange oh < H
+                ow = 0
+                Solange ow < W
+                    out_idx = ((co * D + od) * H + oh) * W + ow
+                    // ReLU 导数: fwd>0 ? 1 : 0
+                    fv = t_get(fwd, out_idx)
+                    relu_deriv = 0
+                    Wenn fv != 0 dann
+                        relu_deriv = 1065353216
+                    Ende
+                    dacc = f32_mul(t_get(dout, out_idx), relu_deriv)
+                    // dbias[co] += dacc
+                    t_set(dbias, co, f32_add(t_get(dbias, co), dacc))
+                    // 对输入/权重贡献
+                    ci = 0
+                    Solange ci < Ci
+                        kd = 0
+                        Solange kd < 3
+                            kh = 0
+                            Solange kh < 3
+                                kw = 0
+                                Solange kw < 3
+                                    id = od + kd - 1
+                                    ih = oh + kh - 1
+                                    iw = ow + kw - 1
+                                    Wenn id >= 0 und id < D und ih >= 0 und ih < H und iw >= 0 und iw < W dann
+                                        in_idx = ((ci * D + id) * H + ih) * W + iw
+                                        w_idx = (((co * Ci + ci) * 3 + kd) * 3 + kh) * 3 + kw
+                                        // dw += dacc * in
+                                        t_set(dw, w_idx, f32_add(t_get(dw, w_idx), f32_mul(dacc, t_get(in, in_idx))))
+                                        // din += dacc * w
+                                        t_set(din, in_idx, f32_add(t_get(din, in_idx), f32_mul(dacc, t_get(w, w_idx))))
+                                    Ende
+                                    kw = kw + 1
+                                Ende
+                                kh = kh + 1
+                            Ende
+                            kd = kd + 1
+                        Ende
+                        ci = ci + 1
+                    Ende
+                    ow = ow + 1
+                Ende
+                oh = oh + 1
+            Ende
+            od = od + 1
+        Ende
+        co = co + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- conv3d_s2 反向 (stride=2, pad=1, 核3^3) ----
+Funktion conv3d_s2_backward(dout, fwd, in, w, din, dw, dbias, Ci, D, H, W, Co)
+    OD = (D + 1) / 2
+    OH = (H + 1) / 2
+    OW = (W + 1) / 2
+    t_zero(din, Ci * D * H * W)
+    t_zero(dw, Co * Ci * 27)
+    t_zero(dbias, Co)
+    co = 0
+    Solange co < Co
+        od = 0
+        Solange od < OD
+            oh = 0
+            Solange oh < OH
+                ow = 0
+                Solange ow < OW
+                    out_idx = ((co * OD + od) * OH + oh) * OW + ow
+                    fv = t_get(fwd, out_idx)
+                    relu_deriv = 0
+                    Wenn fv != 0 dann
+                        relu_deriv = 1065353216
+                    Ende
+                    dacc = f32_mul(t_get(dout, out_idx), relu_deriv)
+                    t_set(dbias, co, f32_add(t_get(dbias, co), dacc))
+                    ci = 0
+                    Solange ci < Ci
+                        kd = 0
+                        Solange kd < 3
+                            kh = 0
+                            Solange kh < 3
+                                kw = 0
+                                Solange kw < 3
+                                    id = od * 2 + kd - 1
+                                    ih = oh * 2 + kh - 1
+                                    iw = ow * 2 + kw - 1
+                                    Wenn id >= 0 und id < D und ih >= 0 und ih < H und iw >= 0 und iw < W dann
+                                        in_idx = ((ci * D + id) * H + ih) * W + iw
+                                        w_idx = (((co * Ci + ci) * 3 + kd) * 3 + kh) * 3 + kw
+                                        t_set(dw, w_idx, f32_add(t_get(dw, w_idx), f32_mul(dacc, t_get(in, in_idx))))
+                                        t_set(din, in_idx, f32_add(t_get(din, in_idx), f32_mul(dacc, t_get(w, w_idx))))
+                                    Ende
+                                    kw = kw + 1
+                                Ende
+                                kh = kh + 1
+                            Ende
+                            kd = kd + 1
+                        Ende
+                        ci = ci + 1
+                    Ende
+                    ow = ow + 1
+                Ende
+                oh = oh + 1
+            Ende
+            od = od + 1
+        Ende
+        co = co + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- deconv3d_s2 反向 (转置卷积 stride2) ----
+// 前向: out(Co,Do,Ho,Wo) += in(Ci,Di,Hi,Wi) 散布. 
+// 反向: din(Ci,Di,Hi,Wi) 从 dout 汇聚. dw(Ci,Co,3,3,3).
+Funktion deconv3d_s2_backward(dout, fwd, in, w, din, dw, dbias, Ci, Di, Hi, Wi, Co)
+    Do = Di * 2
+    Ho = Hi * 2
+    Wo = Wi * 2
+    t_zero(din, Ci * Di * Hi * Wi)
+    t_zero(dw, Ci * Co * 27)
+    t_zero(dbias, Co)
+    // dbias: sum over out positions of dout*relu_deriv
+    co = 0
+    Solange co < Co
+        od = 0
+        Solange od < Do
+            oh = 0
+            Solange oh < Ho
+                ow = 0
+                Solange ow < Wo
+                    out_idx = ((co * Do + od) * Ho + oh) * Wo + ow
+                    fv = t_get(fwd, out_idx)
+                    relu_deriv = 0
+                    Wenn fv != 0 dann
+                        relu_deriv = 1065353216
+                    Ende
+                    dacc = f32_mul(t_get(dout, out_idx), relu_deriv)
+                    t_set(dbias, co, f32_add(t_get(dbias, co), dacc))
+                    ow = ow + 1
+                Ende
+                oh = oh + 1
+            Ende
+            od = od + 1
+        Ende
+        co = co + 1
+    Ende
+    // din/dw: 每个输入点 (ci,di,hi,wi) 贡献到 out[di*2+kd-1, ...]
+    ci = 0
+    Solange ci < Ci
+        di = 0
+        Solange di < Di
+            hi = 0
+            Solange hi < Hi
+                wi = 0
+                Solange wi < Wi
+                    in_idx = ((ci * Di + di) * Hi + hi) * Wi + wi
+                    vin = t_get(in, in_idx)
+                    dvin = 0
+                    co = 0
+                    Solange co < Co
+                        kd = 0
+                        Solange kd < 3
+                            kh = 0
+                            Solange kh < 3
+                                kw = 0
+                                Solange kw < 3
+                                    od = di * 2 + kd - 1
+                                    oh = hi * 2 + kh - 1
+                                    ow = wi * 2 + kw - 1
+                                    Wenn od >= 0 und od < Do und oh >= 0 und oh < Ho und ow >= 0 und ow < Wo dann
+                                        out_idx = ((co * Do + od) * Ho + oh) * Wo + ow
+                                        fv = t_get(fwd, out_idx)
+                                        relu_deriv = 0
+                                        Wenn fv != 0 dann
+                                            relu_deriv = 1065353216
+                                        Ende
+                                        dacc = f32_mul(t_get(dout, out_idx), relu_deriv)
+                                        w_idx = (((ci * Co + co) * 3 + kd) * 3 + kh) * 3 + kw
+                                        // dw += dacc * vin
+                                        t_set(dw, w_idx, f32_add(t_get(dw, w_idx), f32_mul(dacc, vin)))
+                                        // dvin += dacc * w
+                                        dvin = f32_add(dvin, f32_mul(dacc, t_get(w, w_idx)))
+                                    Ende
+                                    kw = kw + 1
+                                Ende
+                                kh = kh + 1
+                            Ende
+                            kd = kd + 1
+                        Ende
+                        co = co + 1
+                    Ende
+                    t_set(din, in_idx, dvin)
+                    wi = wi + 1
+                Ende
+                hi = hi + 1
+            Ende
+            di = di + 1
+        Ende
+        ci = ci + 1
+    Ende
+    gebe_zurueck 0
+Ende

@@ -1,0 +1,142 @@
+// ============================================================================
+//  starshell :: inuos/eng_sys.staro
+//  Selbst implementierte System-Befehle (WinAPI direkt, keine Weiterleitung)
+//  args = C-String des Befehlsrests.
+// ============================================================================
+
+linx-o kernel32 GetVersionExA GetTickCount GetSystemInfo
+linx-o kernel32 GlobalMemoryStatusEx
+
+// ---------- Betriebssystemversion ----------
+Funktion os_version_text()
+    osvi = alloc(148)
+    raw_setbyte(osvi, 0, 148)
+    raw_setbyte(osvi, 1, 0)
+    raw_setbyte(osvi, 2, 0)
+    raw_setbyte(osvi, 3, 0)
+    GetVersionExA(osvi)
+    major = raw_byteat(osvi, 4) + raw_byteat(osvi, 5) * 256
+    minor = raw_byteat(osvi, 8) + raw_byteat(osvi, 9) * 256
+    build = raw_byteat(osvi, 12) + raw_byteat(osvi, 13) * 256
+    s = int_to_str(major)
+    s = str_concat(s, ".")
+    s = str_concat(s, int_to_str(minor))
+    s = str_concat(s, " (Build ")
+    s = str_concat(s, int_to_str(build))
+    s = str_concat(s, ")")
+    gebe_zurueck s
+Ende
+
+// ---------- Gesamter physischer Speicher (MB) ----------
+Funktion mem_gesamt_mb()
+    st = alloc(64)
+    raw_setbyte(st, 0, 64)
+    raw_setbyte(st, 1, 0)
+    raw_setbyte(st, 2, 0)
+    raw_setbyte(st, 3, 0)
+    GlobalMemoryStatusEx(st)
+    low = raw_byteat(st, 8) + raw_byteat(st, 9) * 256 + raw_byteat(st, 10) * 65536 + raw_byteat(st, 11) * 16777216
+    high = raw_byteat(st, 12) + raw_byteat(st, 13) * 256
+    total = low + high * 4294967296
+    gebe_zurueck total / 1048576
+Ende
+
+// ---------- Verfuegbarer Speicher (MB) ----------
+Funktion mem_verfuegbar_mb()
+    st = alloc(64)
+    raw_setbyte(st, 0, 64)
+    raw_setbyte(st, 1, 0)
+    raw_setbyte(st, 2, 0)
+    raw_setbyte(st, 3, 0)
+    GlobalMemoryStatusEx(st)
+    low = raw_byteat(st, 16) + raw_byteat(st, 17) * 256 + raw_byteat(st, 18) * 65536 + raw_byteat(st, 19) * 16777216
+    high = raw_byteat(st, 20) + raw_byteat(st, 21) * 256
+    total = low + high * 4294967296
+    gebe_zurueck total / 1048576
+Ende
+
+// ---------- Anzahl Prozessoren ----------
+Funktion cpu_kernzahl()
+    si = alloc(48)
+    GetSystemInfo(si)
+    gebe_zurueck raw_byteat(si, 32) + raw_byteat(si, 33) * 256 + raw_byteat(si, 34) * 65536 + raw_byteat(si, 35) * 16777216
+Ende
+
+// ---------- Seitengroesse ----------
+Funktion cpu_seitengroesse()
+    si = alloc(48)
+    GetSystemInfo(si)
+    gebe_zurueck raw_byteat(si, 4) + raw_byteat(si, 5) * 256 + raw_byteat(si, 6) * 65536 + raw_byteat(si, 7) * 16777216
+Ende
+
+// ---------- Uptime in Sekunden ----------
+Funktion uptime_sekunden()
+    gebe_zurueck GetTickCount() / 1000
+Ende
+
+// ---------- System-Befehle ----------
+Funktion eng_sys(op, args)
+    Wenn str_eq(op, "info") dann
+        write_str("Betriebssystem: ")
+        write_str(os_version_text())
+        write_newline()
+        write_str("Prozessoren: ")
+        write_int(cpu_kernzahl())
+        write_newline()
+        write_str("Seitengroesse: ")
+        write_int(cpu_seitengroesse())
+        write_newline()
+        write_str("Speicher gesamt: ")
+        write_int(mem_gesamt_mb())
+        write_str(" MB")
+        write_newline()
+        write_str("Speicher frei: ")
+        write_int(mem_verfuegbar_mb())
+        write_str(" MB")
+        write_newline()
+        write_str("Uptime: ")
+        write_int(uptime_sekunden())
+        write_str(" s")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "version") dann
+        write_str(os_version_text())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "cpu") dann
+        write_int(cpu_kernzahl())
+        write_str(" Prozessoren")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "ram") dann
+        write_str("Gesamt: ")
+        write_int(mem_gesamt_mb())
+        write_str(" MB, Frei: ")
+        write_int(mem_verfuegbar_mb())
+        write_str(" MB")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "ramgesamt") dann
+        write_int(mem_gesamt_mb())
+        write_str(" MB")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "ramfrei") dann
+        write_int(mem_verfuegbar_mb())
+        write_str(" MB")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq(op, "uptime") dann
+        write_int(uptime_sekunden())
+        write_str(" s")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende

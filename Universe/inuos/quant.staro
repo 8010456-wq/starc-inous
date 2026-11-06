@@ -1,0 +1,115 @@
+// inuos/quant.staro - FP4 反量化 (deepPuTT, 纯整数算术实现位操作, 输出 fp32 位模式)
+// 依赖: sys.staro (raw_byteat/raw_set32/get32), bf16.staro (decode_fp8e4m3)
+//
+// DeepSeek-V4-Flash 专家权重格式 (实测确认):
+//   w1.weight / w3.weight: dtype I8, shape [out, in/2] 每字节 = 2 个 FP4 E2M1 (低/高 nibble)
+//   w1.scale  / w3.scale : dtype F8_E8M0, shape [out, in/32] 每 32 元素 1 个 scale
+//   FP4 E2M1 LUT (官方): 索引 0..15 -> {0,0.5,1,1.5,2,3,4,6, -0,-0.5,-1,-1.5,-2,-3,-4,-6}
+//   scale = 2^(b-127), b 是 u8 字节
+//
+// StarC 无原生浮点/位运算符: 全用算术实现 (x*2^k=指数加k, 掩码=%, 移位=/), 
+//   反量化输出 fp32 IEEE754 位模式 (u32 整数, 传给 CUDA/按位处理)
+
+// FP4 E2M1 LUT: 索引 -> fp32 位模式 (0..7 正, 8..15 负, 符号位 0x80000000)
+Funktion fp4_lut_bits(nib)
+    sign = 0
+    idx = nib
+    Wenn idx >= 8 dann
+        sign = 2147483648  // 0x80000000
+        idx = idx - 8
+    Ende
+    base = 0
+    Wenn idx == 0 dann base = 0 Ende                       // 0.0
+    Wenn idx == 1 dann base = 1056964608 Ende              // 0x3F000000 0.5
+    Wenn idx == 2 dann base = 1065353216 Ende              // 0x3F800000 1.0
+    Wenn idx == 3 dann base = 1069547520 Ende              // 0x3FC00000 1.5
+    Wenn idx == 4 dann base = 1073741824 Ende              // 0x40000000 2.0
+    Wenn idx == 5 dann base = 1077936128 Ende              // 0x40400000 3.0
+    Wenn idx == 6 dann base = 1082130432 Ende              // 0x40800000 4.0
+    Wenn idx == 7 dann base = 1086324736 Ende              // 0x40C00000 6.0
+    gebe_zurueck sign + base
+Ende
+
+// 低/高 nibble (0..15), 用算术实现
+Funktion fp4_nibble_low(b)
+    gebe_zurueck b % 16
+Ende
+
+Funktion fp4_nibble_high(b)
+    gebe_zurueck (b / 16) % 16
+Ende
+
+// E8M0 scale: u8 字节 b -> 2 的指数 (b-127)
+Funktion e8m0_exp(b)
+    gebe_zurueck b - 127
+Ende
+
+// 写有符号 32 位 (补码) 到缓冲. raw_set32 对负数有 bug (C 除法/取模符号不一致),
+// 负数须先转 2^32+v 的无符号再写
+Funktion write_s32(ptr, off, v)
+    Wenn v >= 0 dann
+        raw_set32(ptr, off, v)
+    Sonst
+        raw_set32(ptr, off, 4294967296 + v)
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 读有符号 32 位 (补码 -> 负数)
+Funktion read_s32(ptr, off)
+    v = raw_get32(ptr, off)
+    Wenn v >= 2147483648 dann
+        gebe_zurueck v - 4294967296
+    Ende
+    gebe_zurueck v
+Ende
+
+// fp32 位模式 bits 乘以 2^k (只改指数字段), 返回新位模式
+// 0/负零保持; 下溢返回 0; 上溢返回 inf(同号)
+Funktion fp32_mul_pow2(bits, k)
+    sign = bits / 2147483648  // 0 或 1
+    exp = (bits / 8388608) % 256  // 指数字段
+    mant = bits % 8388608         // 尾数字段
+    Wenn exp == 0 und mant == 0 dann
+        gebe_zurueck sign * 2147483648  // ±0
+    Ende
+    newexp = exp + k
+    Wenn newexp <= 0 dann
+        gebe_zurueck sign * 2147483648  // 下溢 -> ±0
+    Ende
+    Wenn newexp >= 255 dann
+        gebe_zurueck sign * 2147483648 + 2139095040  // 上溢 -> ±inf
+    Ende
+    gebe_zurueck sign * 2147483648 + newexp * 8388608 + mant
+Ende
+
+// 反量化一个字节的 2 个 FP4 元素 (低/高 nibble), 各乘 scale=2^k, 写 2 个 fp32 位模式到 out[off..off+8)
+Funktion fp4_dequant_byte(b, k, out, off)
+    low = fp4_nibble_low(b)
+    high = fp4_nibble_high(b)
+    lv = fp32_mul_pow2(fp4_lut_bits(low), k)
+    hv = fp32_mul_pow2(fp4_lut_bits(high), k)
+    raw_set32(out, off, lv)
+    raw_set32(out, off + 4, hv)
+    gebe_zurueck 0
+Ende
+
+// 反量化一行 n 元素 (n 应为偶数):
+//   wbase: weight 字节数组 (n/2 字节), swbase: scale 字节数组 (每 32 元素 1 组)
+//   输出 n 个 fp32 位模式到 out[outoff..]
+Funktion fp4_dequant_row(wbase, swbase, n, out, outoff)
+    e = 0
+    Solange e < n
+        b = raw_byteat(wbase, e / 2)
+        g = e / 32
+        k = e8m0_exp(raw_byteat(swbase, g))
+        nib = fp4_nibble_low(b)
+        Wenn e % 2 == 1 dann
+            nib = fp4_nibble_high(b)
+        Ende
+        v = fp32_mul_pow2(fp4_lut_bits(nib), k)
+        raw_set32(out, outoff + e * 4, v)
+        e = e + 1
+    Ende
+    gebe_zurueck 0
+Ende

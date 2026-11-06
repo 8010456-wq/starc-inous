@@ -1,0 +1,646 @@
+// ============================================================================
+//  MGTO1 :: mg_tok.staro —— GPT-2 风格 byte-level BPE 分词器（Qwen2/Qwen2.5）
+//
+//  字节级约定（与 Qwen 官方 tokenizer 完全一致）：
+//    - 编码：文本(UTF-8) -> 逐字节经 btu 映射 -> u16 字符序列（码点 0..323）
+//    - vocab.json key 是 unicode 字符串，其 UTF-8 解码的码点 == btu 值序列
+//      （例 "Ġ"=U+0120=288 是空格字节 0x20 的映射）
+//    - ranks：key = 相邻两 token 字符序列的完整拼接
+//    - decode：id -> u16 序列 -> 逐字符经 inv_btu 反查 -> 原始字节 -> UTF-8
+//
+//  数据结构：
+//    - btu[512]   : byte -> unicode 码点（u16 数组）
+//    - inv_btu[324]: unicode 码点 -> byte（仅对 0..323 有效；btu 值域 0..323）
+//    - vocab      : token(u16 序列) -> id（开放寻址哈希）
+//    - ranks      : pair 拼接串(u16 序列) -> rank（开放寻址哈希）
+// ============================================================================
+
+// ---- 构建 bytes_to_unicode 表 ----
+// btu: 512B（256 项 u16）；inv_btu: 324B（索引 = 码点，0..323）
+Funktion tok_build_btu(btu, inv_btu)
+    inbs = alloc(256)
+    mem_zero(inbs, 256)
+    b = 33
+    Solange b <= 126
+        raw_setbyte(inbs, b, 1)
+        b = b + 1
+    Ende
+    b = 161
+    Solange b <= 172
+        raw_setbyte(inbs, b, 1)
+        b = b + 1
+    Ende
+    b = 174
+    Solange b <= 255
+        raw_setbyte(inbs, b, 1)
+        b = b + 1
+    Ende
+    n = 0
+    b = 0
+    Solange b < 256
+        Wenn raw_byteat(inbs, b) == 1 dann
+            raw_setbyte(btu, b * 2, b)
+            raw_setbyte(btu, b * 2 + 1, 0)
+        Sonst
+            v = 256 + n
+            raw_setbyte(btu, b * 2, v - (v / 256) * 256)
+            raw_setbyte(btu, b * 2 + 1, v / 256)
+            n = n + 1
+        Ende
+        b = b + 1
+    Ende
+    // inv_btu：码点 -> byte
+    b = 0
+    Solange b < 256
+        u = raw_byteat(btu, b * 2) + raw_byteat(btu, b * 2 + 1) * 256
+        raw_setbyte(inv_btu, u, b)
+        b = b + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 哈希工具（FNV-1a 变体，u16 序列）----
+// ★ 编译器安全乘法/除法：真乘法(如 h*33)与大常数乘法(如 x*262144)有 bug。
+//   因此：*33 用移位实现 h*8*4+h（2/4/8 走 shl）；*256 用 *8*8*4；
+//   对 262144 取模用减法循环（h 恒 <262144）。返回 h 恒正且 <262144。
+Funktion tok_hash16(seq, n)
+    h = 5381
+    i = 0
+    Solange i < n
+        c = raw_byteat(seq, i * 2) + raw_byteat(seq, i * 2 + 1) * 8 * 8 * 4
+        h = h * 8 * 4 + h + c
+        Solange h >= 262144
+            h = h - 262144
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck h
+Ende
+
+// ---- vocab 哈希表：token(u16 序列) -> id ----
+// 布局：vb[0]=buckets, vb[8]=count, vb[16]=bucket(索引+1,u32), vb[24]=keypool,
+//       vb[32]=keypool偏移, vb[40]=meta(off,len,id 每项24字节)
+Funktion tok_vocab_init(vb, buckets)
+    raw_set64(vb, 0, buckets)
+    raw_set64(vb, 8, 0)
+    b = alloc(buckets * 4)
+    mem_zero(b, buckets * 4)
+    raw_set64(vb, 16, b)
+    keypool = alloc(8000000)
+    raw_set64(vb, 24, keypool)
+    raw_set64(vb, 32, 0)
+    meta = alloc(200000 * 24)
+    raw_set64(vb, 40, meta)
+    gebe_zurueck 0
+Ende
+
+Funktion tok_vocab_insert(vb, seq, n, id)
+    buckets = raw_get64(vb, 0)
+    bucket = raw_get64(vb, 16)
+    keypool = raw_get64(vb, 24)
+    koff = raw_get64(vb, 32)
+    meta = raw_get64(vb, 40)
+    cnt = raw_get64(vb, 8)
+    raw_set64(keypool, koff, n)
+    i = 0
+    Solange i < n
+        raw_setbyte(keypool, koff + 8 + i * 2, raw_byteat(seq, i * 2))
+        raw_setbyte(keypool, koff + 8 + i * 2 + 1, raw_byteat(seq, i * 2 + 1))
+        i = i + 1
+    Ende
+    raw_set64(meta, cnt * 24 + 0, koff)
+    raw_set64(meta, cnt * 24 + 8, n)
+    raw_set64(meta, cnt * 24 + 16, id)
+    // 推进 keypool 偏移（关键：否则所有 token 覆盖到同一位置）
+    raw_set64(vb, 32, koff + 8 + n * 2)
+    h = tok_hash16(seq, n)
+    idx = h - (h / buckets) * buckets
+    Solange 1 == 1
+        cur = raw_get32(bucket, idx * 4)
+        Wenn cur == 0 dann
+            v = cnt + 1
+            raw_setbyte(bucket, idx * 4, v - (v / 256) * 256)
+            raw_setbyte(bucket, idx * 4 + 1, (v / 256) - (v / 65536) * 256)
+            raw_setbyte(bucket, idx * 4 + 2, (v / 65536) - (v / 16777216) * 256)
+            raw_setbyte(bucket, idx * 4 + 3, v / 16777216)
+            raw_set64(vb, 8, cnt + 1)
+            gebe_zurueck id
+        Sonst
+            e = cur - 1
+            eoff = raw_get64(meta, e * 24)
+            elen = raw_get64(meta, e * 24 + 8)
+            Wenn elen == n dann
+                eq = 1
+                j = 0
+                Solange j < n
+                    Wenn raw_byteat(keypool, eoff + 8 + j * 2) != raw_byteat(seq, j * 2) oder raw_byteat(keypool, eoff + 8 + j * 2 + 1) != raw_byteat(seq, j * 2 + 1) dann
+                        eq = 0
+                    Ende
+                    j = j + 1
+                Ende
+                Wenn eq == 1 dann
+                    raw_set64(meta, e * 24 + 16, id)
+                    gebe_zurueck id
+                Ende
+            Ende
+            idx = idx + 1
+            Wenn idx >= buckets dann
+                idx = 0
+            Ende
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 查找 token -> id；found 指向 8 字节标志（1=找到）
+Funktion tok_vocab_find(vb, seq, n, found)
+    buckets = raw_get64(vb, 0)
+    bucket = raw_get64(vb, 16)
+    keypool = raw_get64(vb, 24)
+    meta = raw_get64(vb, 40)
+    h = tok_hash16(seq, n)
+    idx = h - (h / buckets) * buckets
+    probes = 0
+    Solange probes < buckets
+        cur = raw_get32(bucket, idx * 4)
+        Wenn cur == 0 dann
+            raw_set64(found, 0, 0)
+            gebe_zurueck 0
+        Sonst
+            e = cur - 1
+            eoff = raw_get64(meta, e * 24)
+            elen = raw_get64(meta, e * 24 + 8)
+            Wenn elen == n dann
+                eq = 1
+                j = 0
+                Solange j < n
+                    Wenn raw_byteat(keypool, eoff + 8 + j * 2) != raw_byteat(seq, j * 2) oder raw_byteat(keypool, eoff + 8 + j * 2 + 1) != raw_byteat(seq, j * 2 + 1) dann
+                        eq = 0
+                    Ende
+                    j = j + 1
+                Ende
+                Wenn eq == 1 dann
+                    raw_set64(found, 0, 1)
+                    gebe_zurueck raw_get64(meta, e * 24 + 16)
+                Ende
+            Ende
+            idx = idx + 1
+            Wenn idx >= buckets dann
+                idx = 0
+            Ende
+            probes = probes + 1
+        Ende
+    Ende
+    raw_set64(found, 0, 0)
+    gebe_zurueck 0
+Ende
+
+// ---- ranks 哈希表：pair 拼接串(u16 序列) -> rank ----
+// 布局：rk[0]=buckets, rk[8]=count, rk[16]=bucket, rk[24]=keypool,
+//       rk[32]=keypool偏移, rk[40]=meta(off,len,rank 每项24字节)
+Funktion tok_ranks_init(rk, buckets)
+    raw_set64(rk, 0, buckets)
+    raw_set64(rk, 8, 0)
+    b = alloc(buckets * 4)
+    mem_zero(b, buckets * 4)
+    raw_set64(rk, 16, b)
+    keypool = alloc(8000000)
+    raw_set64(rk, 24, keypool)
+    raw_set64(rk, 32, 0)
+    meta = alloc(200000 * 24)
+    raw_set64(rk, 40, meta)
+    gebe_zurueck 0
+Ende
+
+Funktion tok_ranks_insert(rk, key, klen, rank)
+    buckets = raw_get64(rk, 0)
+    bucket = raw_get64(rk, 16)
+    keypool = raw_get64(rk, 24)
+    koff = raw_get64(rk, 32)
+    meta = raw_get64(rk, 40)
+    cnt = raw_get64(rk, 8)
+    raw_set64(keypool, koff, klen)
+    i = 0
+    Solange i < klen
+        raw_setbyte(keypool, koff + 8 + i * 2, raw_byteat(key, i * 2))
+        raw_setbyte(keypool, koff + 8 + i * 2 + 1, raw_byteat(key, i * 2 + 1))
+        i = i + 1
+    Ende
+    raw_set64(meta, cnt * 24 + 0, koff)
+    raw_set64(meta, cnt * 24 + 8, klen)
+    raw_set64(meta, cnt * 24 + 16, rank)
+    // 推进 keypool 偏移
+    raw_set64(rk, 32, koff + 8 + klen * 2)
+    h = tok_hash16(key, klen)
+    idx = h - (h / buckets) * buckets
+    Solange 1 == 1
+        cur = raw_get32(bucket, idx * 4)
+        Wenn cur == 0 dann
+            v = cnt + 1
+            raw_setbyte(bucket, idx * 4, v - (v / 256) * 256)
+            raw_setbyte(bucket, idx * 4 + 1, (v / 256) - (v / 65536) * 256)
+            raw_setbyte(bucket, idx * 4 + 2, (v / 65536) - (v / 16777216) * 256)
+            raw_setbyte(bucket, idx * 4 + 3, v / 16777216)
+            raw_set64(rk, 8, cnt + 1)
+            gebe_zurueck 0
+        Sonst
+            e = cur - 1
+            eoff = raw_get64(meta, e * 24)
+            eklen = raw_get64(meta, e * 24 + 8)
+            Wenn eklen == klen dann
+                eq = 1
+                j = 0
+                Solange j < klen
+                    Wenn raw_byteat(keypool, eoff + 8 + j * 2) != raw_byteat(key, j * 2) oder raw_byteat(keypool, eoff + 8 + j * 2 + 1) != raw_byteat(key, j * 2 + 1) dann
+                        eq = 0
+                    Ende
+                    j = j + 1
+                Ende
+                Wenn eq == 1 dann
+                    gebe_zurueck 0
+                Ende
+            Ende
+            idx = idx + 1
+            Wenn idx >= buckets dann
+                idx = 0
+            Ende
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 查找 pair rank；未找到返回 1000000000
+Funktion tok_ranks_find(rk, key, klen)
+    buckets = raw_get64(rk, 0)
+    bucket = raw_get64(rk, 16)
+    keypool = raw_get64(rk, 24)
+    meta = raw_get64(rk, 40)
+    h = tok_hash16(key, klen)
+    idx = h - (h / buckets) * buckets
+    probes = 0
+    Solange probes < buckets
+        cur = raw_get32(bucket, idx * 4)
+        Wenn cur == 0 dann
+            gebe_zurueck 1000000000
+        Sonst
+            e = cur - 1
+            eoff = raw_get64(meta, e * 24)
+            eklen = raw_get64(meta, e * 24 + 8)
+            Wenn eklen == klen dann
+                eq = 1
+                j = 0
+                Solange j < klen
+                    Wenn raw_byteat(keypool, eoff + 8 + j * 2) != raw_byteat(key, j * 2) oder raw_byteat(keypool, eoff + 8 + j * 2 + 1) != raw_byteat(key, j * 2 + 1) dann
+                        eq = 0
+                    Ende
+                    j = j + 1
+                Ende
+                Wenn eq == 1 dann
+                    gebe_zurueck raw_get64(meta, e * 24 + 16)
+                Ende
+            Ende
+            idx = idx + 1
+            Wenn idx >= buckets dann
+                idx = 0
+            Ende
+            probes = probes + 1
+        Ende
+    Ende
+    gebe_zurueck 1000000000
+Ende
+
+// ---- 文本(UTF-8 C 串) -> u16 序列（byte-level：逐字节经 btu 映射）----
+// 返回 u16 字符数（== 输入 UTF-8 字节数），写入 dst（cap 上限）
+Funktion tok_utf8_u16(s, btu, dst, cap)
+    n = 0
+    i = 0
+    Solange raw_byteat(s, i) != 0
+        c = raw_byteat(s, i)
+        nbytes = 1
+        Wenn c >= 224 dann
+            nbytes = 3
+        Sonst
+            Wenn c >= 192 dann
+                nbytes = 2
+            Ende
+        Ende
+        t = 0
+        Solange t < nbytes
+            b = raw_byteat(s, i + t)
+            u = raw_byteat(btu, b * 2) + raw_byteat(btu, b * 2 + 1) * 256
+            Wenn n < cap dann
+                raw_setbyte(dst, n * 2, u - (u / 256) * 256)
+                raw_setbyte(dst, n * 2 + 1, u / 256)
+            Ende
+            n = n + 1
+            t = t + 1
+        Ende
+        i = i + nbytes
+    Ende
+    gebe_zurueck n
+Ende
+
+// ---- 解析 vocab.json（C 串）-> 哈希表 vb ----
+// token key 直接 UTF-8 解码为码点 u16 序列（== btu 值序列，见文件头约定）
+Funktion tok_parse_vocab(v, vb)
+    i = 0
+    tokenbuf = alloc(512)
+    Solange raw_byteat(v, i) != 0
+        c = raw_byteat(v, i)
+        Wenn c == 34 dann
+            j = i + 1
+            nb = 0
+            Solange raw_byteat(v, j) != 34
+                c = raw_byteat(v, j)
+                Wenn c == 92 dann
+                    // 转义：\X -> X（JSON 里 token 只可能含 \" \\，近似按原字符）
+                    c2 = raw_byteat(v, j + 1)
+                    Wenn nb < 250 dann
+                        raw_setbyte(tokenbuf, nb * 2, c2)
+                        raw_setbyte(tokenbuf, nb * 2 + 1, 0)
+                    Ende
+                    nb = nb + 1
+                    j = j + 2
+                Sonst
+                    Wenn c < 128 dann
+                        Wenn nb < 250 dann
+                            raw_setbyte(tokenbuf, nb * 2, c)
+                            raw_setbyte(tokenbuf, nb * 2 + 1, 0)
+                        Ende
+                        nb = nb + 1
+                        j = j + 1
+                    Sonst
+                        Wenn c >= 224 dann
+                            c2 = raw_byteat(v, j + 1)
+                            c3 = raw_byteat(v, j + 2)
+                            vv = ((c - 224) * 4096) + ((c2 - 128) * 64) + (c3 - 128)
+                            Wenn nb < 250 dann
+                                raw_setbyte(tokenbuf, nb * 2, vv - (vv / 256) * 256)
+                                raw_setbyte(tokenbuf, nb * 2 + 1, vv / 256)
+                            Ende
+                            nb = nb + 1
+                            j = j + 3
+                        Sonst
+                            c2 = raw_byteat(v, j + 1)
+                            vv = ((c - 192) * 64) + (c2 - 128)
+                            Wenn nb < 250 dann
+                                raw_setbyte(tokenbuf, nb * 2, vv - (vv / 256) * 256)
+                                raw_setbyte(tokenbuf, nb * 2 + 1, vv / 256)
+                            Ende
+                            nb = nb + 1
+                            j = j + 2
+                        Ende
+                    Ende
+                Ende
+            Ende
+            i = j + 1
+            // 找冒号
+            Solange raw_byteat(v, i) != 58
+                i = i + 1
+            Ende
+            i = i + 1
+            // 读 id 数字
+            num = 0
+            Solange raw_byteat(v, i) >= 48 und raw_byteat(v, i) <= 57
+                num = num * 10 + (raw_byteat(v, i) - 48)
+                i = i + 1
+            Ende
+            tok_vocab_insert(vb, tokenbuf, nb, num)
+        Sonst
+            i = i + 1
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 读一行中一个 token（UTF-8 -> 码点 u16 序列），写到 dst（cap 16 字符）
+// ★ i 是值传递，必须返回新 i（token 结束位置），nb 写入 out_n（8 字节）。
+// 停在空格/换行（不消费）；遇 NUL 停止。
+Funktion tok_line_token(s, i, dst, out_n)
+    nb = 0
+    Solange raw_byteat(s, i) != 0
+        c = raw_byteat(s, i)
+        Wenn c == 32 oder c == 9 oder c == 10 dann
+            raw_set64(out_n, 0, nb)
+            gebe_zurueck i
+        Ende
+        Wenn c < 128 dann
+            Wenn nb < 96 dann
+                raw_setbyte(dst, nb * 2, c)
+                raw_setbyte(dst, nb * 2 + 1, 0)
+            Ende
+            nb = nb + 1
+            i = i + 1
+        Sonst
+            Wenn c >= 224 dann
+                c2 = raw_byteat(s, i + 1)
+                c3 = raw_byteat(s, i + 2)
+                vv = ((c - 224) * 4096) + ((c2 - 128) * 64) + (c3 - 128)
+                Wenn nb < 96 dann
+                    raw_setbyte(dst, nb * 2, vv - (vv / 256) * 256)
+                    raw_setbyte(dst, nb * 2 + 1, vv / 256)
+                Ende
+                nb = nb + 1
+                i = i + 3
+            Sonst
+                c2 = raw_byteat(s, i + 1)
+                vv = ((c - 192) * 64) + (c2 - 128)
+                Wenn nb < 96 dann
+                    raw_setbyte(dst, nb * 2, vv - (vv / 256) * 256)
+                    raw_setbyte(dst, nb * 2 + 1, vv / 256)
+                Ende
+                nb = nb + 1
+                i = i + 2
+            Ende
+        Ende
+    Ende
+    raw_set64(out_n, 0, nb)
+    gebe_zurueck i
+Ende
+
+// ---- 解析 merges.txt（C 串）-> 哈希表 rk（rank = 行序，从 0 起）----
+Funktion tok_parse_merges(m, rk)
+    i = 0
+    rank = 0
+    buf = alloc(512)
+    Solange raw_byteat(m, i) != 0
+        a = alloc(256)
+        b = alloc(256)
+        out_n = alloc(8)
+        i = tok_line_token(m, i, a, out_n)
+        na = raw_get64(out_n, 0)
+        Solange raw_byteat(m, i) == 32 oder raw_byteat(m, i) == 9
+            i = i + 1
+        Ende
+        i = tok_line_token(m, i, b, out_n)
+        nb = raw_get64(out_n, 0)
+        Wenn na >= 1 und nb >= 1 und (na + nb) < 200 dann
+            p = 0
+            t = 0
+            Solange t < na
+                raw_setbyte(buf, p * 2, raw_byteat(a, t * 2))
+                raw_setbyte(buf, p * 2 + 1, raw_byteat(a, t * 2 + 1))
+                p = p + 1
+                t = t + 1
+            Ende
+            t = 0
+            Solange t < nb
+                raw_setbyte(buf, p * 2, raw_byteat(b, t * 2))
+                raw_setbyte(buf, p * 2 + 1, raw_byteat(b, t * 2 + 1))
+                p = p + 1
+                t = t + 1
+            Ende
+            tok_ranks_insert(rk, buf, p, rank)
+            rank = rank + 1
+        Ende
+        Solange raw_byteat(m, i) != 10 und raw_byteat(m, i) != 0
+            i = i + 1
+        Ende
+        Wenn raw_byteat(m, i) == 10 dann
+            i = i + 1
+        Ende
+    Ende
+    gebe_zurueck rank
+Ende
+
+// ---- BPE 合并一个字（u16 序列，n 字符）-> 写 token id 到 ids，返回 token 数 ----
+// start/end/ids 均用 32 位（raw_set32/raw_get32），步进 4 字节。
+Funktion tok_bpe_word(word, n, vb, rk, ids, idcap)
+    start = alloc(n * 4 + 8)
+    end = alloc(n * 4 + 8)
+    keybuf = alloc(2048)
+    tbuf = alloc(2048)
+    tcount = n
+    i = 0
+    Solange i < n
+        raw_set32(start, i * 4, i)
+        raw_set32(end, i * 4, i + 1)
+        i = i + 1
+    Ende
+    weiter = 1
+    Solange weiter == 1
+        weiter = 0
+        best = 1000000000
+        besti = 0 - 1
+        j = 0
+        Solange j < tcount - 1
+            s1 = raw_get32(start, j * 4)
+            e1 = raw_get32(end, j * 4)
+            s2 = raw_get32(start, (j + 1) * 4)
+            e2 = raw_get32(end, (j + 1) * 4)
+            klen = (e1 - s1) + (e2 - s2)
+            p = 0
+            t = s1
+            Solange t < e1
+                raw_setbyte(keybuf, p * 2, raw_byteat(word, t * 2))
+                raw_setbyte(keybuf, p * 2 + 1, raw_byteat(word, t * 2 + 1))
+                p = p + 1
+                t = t + 1
+            Ende
+            t = s2
+            Solange t < e2
+                raw_setbyte(keybuf, p * 2, raw_byteat(word, t * 2))
+                raw_setbyte(keybuf, p * 2 + 1, raw_byteat(word, t * 2 + 1))
+                p = p + 1
+                t = t + 1
+            Ende
+            r = tok_ranks_find(rk, keybuf, klen)
+            Wenn r < best dann
+                best = r
+                besti = j
+            Ende
+            j = j + 1
+        Ende
+        Wenn besti >= 0 und best < 1000000000 dann
+            raw_set32(end, besti * 4, raw_get32(end, (besti + 1) * 4))
+            j = besti + 1
+            Solange j < tcount - 1
+                raw_set32(start, j * 4, raw_get32(start, (j + 1) * 4))
+                raw_set32(end, j * 4, raw_get32(end, (j + 1) * 4))
+                j = j + 1
+            Ende
+            tcount = tcount - 1
+            weiter = 1
+        Ende
+    Ende
+    nids = 0
+    j = 0
+    Solange j < tcount
+        s = raw_get32(start, j * 4)
+        e = raw_get32(end, j * 4)
+        len = e - s
+        p = 0
+        t = s
+        Solange t < e
+            raw_setbyte(tbuf, p * 2, raw_byteat(word, t * 2))
+            raw_setbyte(tbuf, p * 2 + 1, raw_byteat(word, t * 2 + 1))
+            p = p + 1
+            t = t + 1
+        Ende
+        found = alloc(8)
+        raw_set64(found, 0, 0)
+        idv = tok_vocab_find(vb, tbuf, len, found)
+        Wenn raw_get64(found, 0) == 1 dann
+            Wenn nids < idcap dann
+                raw_set32(ids, nids * 4, idv)
+            Ende
+            nids = nids + 1
+        Ende
+        j = j + 1
+    Ende
+    gebe_zurueck nids
+Ende
+
+// ---- 编码文本 -> token ids ----
+// ByteLevel 不预切分：整个文本作为一个 word 做 BPE（与 Qwen 官方一致）
+Funktion tok_encode(text_c, vb, rk, btu, ids, cap)
+    u = alloc(16384)
+    n = tok_utf8_u16(text_c, btu, u, 4096)
+    nids = 0
+    Wenn n > 0 dann
+        nids = tok_bpe_word(u, n, vb, rk, ids, cap)
+    Ende
+    gebe_zurueck nids
+Ende
+
+// ---- 解码 token ids -> UTF-8 C 串（新 C 串）----
+Funktion tok_decode(ids, n, vb, inv_btu)
+    bytes_buf = alloc(32768)
+    bp = 0
+    k = 0
+    Solange k < n
+        idv = raw_get32(ids, k * 4)
+        cnt = raw_get64(vb, 8)
+        meta = raw_get64(vb, 40)
+        keypool = raw_get64(vb, 24)
+        e = 0
+        Solange e < cnt
+            Wenn raw_get64(meta, e * 24 + 16) == idv dann
+                eoff = raw_get64(meta, e * 24)
+                elen = raw_get64(meta, e * 24 + 8)
+                j = 0
+                Solange j < elen
+                    vv = raw_byteat(keypool, eoff + 8 + j * 2) + raw_byteat(keypool, eoff + 8 + j * 2 + 1) * 256
+                    b = raw_byteat(inv_btu, vv)
+                    Wenn bp < 32767 dann
+                        raw_setbyte(bytes_buf, bp, b)
+                    Ende
+                    bp = bp + 1
+                    j = j + 1
+                Ende
+                e = cnt
+            Sonst
+                e = e + 1
+            Ende
+        Ende
+        k = k + 1
+    Ende
+    out = alloc(bp + 1)
+    t = 0
+    Solange t < bp
+        raw_setbyte(out, t, raw_byteat(bytes_buf, t))
+        t = t + 1
+    Ende
+    raw_setbyte(out, bp, 0)
+    gebe_zurueck out
+Ende

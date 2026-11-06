@@ -1,0 +1,185 @@
+// ============================================================================
+//  file_processing.staro —— language-bench 考题「File-processing」能力层
+//  铁律 E：能力全在 .staro。解析 49MB CSV（id,word,value 行），精确复现 lbgen ref_csv_words。
+//  词频统计用开放寻址哈希表（T=16384 槽，每槽 32 字节：len+word[16]+count[8]）。
+//  top 选取：最大词频，并列取字典序最小。
+//  file_run(buf, n) -> 返回 alloc(64)：[lines, sum, distinct, top_count, top_len,
+//                                       top[0], top[1], ...]（每项 8 字节）。
+// ============================================================================
+
+Funktion fpp_hash(buf, ws, we)
+    h = 0
+    i = ws
+    Solange i < we
+        h = (h * 31 + raw_byteat(buf, i)) % 16384
+        i = i + 1
+    Ende
+    gebe_zurueck h
+Ende
+
+Funktion fpp_occupied(tab, slot)
+    c = read_u64(tab, slot * 32 + 17)
+    Wenn c != 0 dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion fpp_word_eq(tab, slot, buf, ws, we)
+    l = raw_byteat(tab, slot * 32)
+    Wenn l != (we - ws) dann
+        gebe_zurueck 0
+    Ende
+    i = 0
+    Solange i < l
+        Wenn raw_byteat(tab, slot * 32 + 1 + i) != raw_byteat(buf, ws + i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 字典序比较：槽 s1 的 word < 槽 s2 的 word？
+Funktion fpp_lex_less(tab, s1, s2)
+    l1 = raw_byteat(tab, s1 * 32)
+    l2 = raw_byteat(tab, s2 * 32)
+    m = l1
+    Wenn l2 < m dann
+        m = l2
+    Ende
+    i = 0
+    Solange i < m
+        b1 = raw_byteat(tab, s1 * 32 + 1 + i)
+        b2 = raw_byteat(tab, s2 * 32 + 1 + i)
+        Wenn b1 != b2 dann
+            Wenn b1 < b2 dann
+                gebe_zurueck 1
+            Sonst
+                gebe_zurueck 0
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    Wenn l1 < l2 dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion file_run(buf, n)
+    tab = alloc(16384 * 32)
+    // 清零槽（count 置 0 即空槽；len/word 不必清）
+    i = 0
+    Solange i < 16384
+        write_u64(tab, i * 32 + 17, 0)
+        i = i + 1
+    Ende
+
+    lines = 0
+    sum = 0
+    i = 0
+    Solange i < n
+        // 行：跳过 id 数字到第一个 ','
+        Solange raw_byteat(buf, i) != 44
+            i = i + 1
+        Ende
+        // word: [ws, we) 到第二个 ','
+        ws = i + 1
+        i = ws
+        Solange raw_byteat(buf, i) != 44
+            i = i + 1
+        Ende
+        we = i
+        // value: 数字到 '\n'
+        i = i + 1
+        v = 0
+        cc = raw_byteat(buf, i)
+        Solange cc >= 48
+            Wenn cc <= 57 dann
+                v = v * 10 + (cc - 48)
+                i = i + 1
+                cc = raw_byteat(buf, i)
+            Sonst
+                cc = 0
+            Ende
+        Ende
+        // 跳过 '\n'
+        Solange raw_byteat(buf, i) != 10
+            i = i + 1
+        Ende
+        i = i + 1
+
+        lines = lines + 1
+        sum = sum + v
+
+        // 哈希查找 / 插入
+        h = fpp_hash(buf, ws, we)
+        slot = h
+        gefunden = 0
+        fertig = 0
+        Solange fertig == 0
+            Wenn fpp_occupied(tab, slot) == 0 dann
+                // 空槽：插入
+                l = we - ws
+                raw_setbyte(tab, slot * 32, l)
+                j = 0
+                Solange j < l
+                    raw_setbyte(tab, slot * 32 + 1 + j, raw_byteat(buf, ws + j))
+                    j = j + 1
+                Ende
+                write_u64(tab, slot * 32 + 17, 1)
+                fertig = 1
+            Sonst
+                Wenn fpp_word_eq(tab, slot, buf, ws, we) == 1 dann
+                    c = read_u64(tab, slot * 32 + 17)
+                    write_u64(tab, slot * 32 + 17, c + 1)
+                    fertig = 1
+                Sonst
+                    slot = (slot + 1) % 16384
+                Ende
+            Ende
+        Ende
+    Ende
+
+    // 统计 distinct / top
+    distinct = 0
+    top_count = 0
+    top_slot = -1
+    s = 0
+    Solange s < 16384
+        Wenn fpp_occupied(tab, s) == 1 dann
+            distinct = distinct + 1
+            c = read_u64(tab, s * 32 + 17)
+            Wenn c > top_count dann
+                top_count = c
+                top_slot = s
+            Sonst
+                Wenn c == top_count dann
+                    Wenn top_slot >= 0 dann
+                        Wenn fpp_lex_less(tab, s, top_slot) == 1 dann
+                            top_slot = s
+                        Ende
+                    Sonst
+                        top_slot = s
+                    Ende
+                Ende
+            Ende
+        Ende
+        s = s + 1
+    Ende
+
+    top_len = raw_byteat(tab, top_slot * 32)
+    out = alloc(168)
+    write_u64(out, 0, lines)
+    write_u64(out, 8, sum)
+    write_u64(out, 16, distinct)
+    write_u64(out, 24, top_count)
+    write_u64(out, 32, top_len)
+    j = 0
+    Solange j < top_len
+        write_u64(out, 40 + j * 8, raw_byteat(tab, top_slot * 32 + 1 + j))
+        j = j + 1
+    Ende
+    gebe_zurueck out
+Ende

@@ -1,0 +1,315 @@
+// inuos/off_voxel.staro - OFF 网格解析 + 体素化 (Universe)
+// 依赖: sys.staro (raw_*), softfloat.staro (f32_*), str.staro (str_len), tensor.staro (t_*)
+// 重要: StarC 编译器不支持跨函数全局变量, 所有跨函数状态用"指针参数 + 显式缓冲"传递.
+//   pos 用 8 字节缓冲存 (raw_set64/raw_get64), 函数内写回新位置.
+//
+// OFF 格式:
+//   OFF
+//   nV nF nE
+//   x y z (nV 行顶点)
+//   n v1 v2 ... (nF 行面, n=顶点数)
+// 体素化: 面片均匀采样 -> 占据体素. 归一化到 [0,1)^3 再映射到 V^3 网格.
+
+// ---- 读取下一个 int (跳过空白, pos 为 8 字节缓冲, 写回新位置) ----
+Funktion off_next_int(buf, posbuf)
+    pos = raw_get64(posbuf, 0)
+    // 跳过空白
+    Solange raw_byteat(buf, pos) == 32 oder raw_byteat(buf, pos) == 9 oder raw_byteat(buf, pos) == 10 oder raw_byteat(buf, pos) == 13
+        pos = pos + 1
+    Ende
+    neg = 0
+    Wenn raw_byteat(buf, pos) == 45 dann
+        neg = 1
+        pos = pos + 1
+    Ende
+    v = 0
+    Solange raw_byteat(buf, pos) >= 48 und raw_byteat(buf, pos) <= 57
+        v = v * 10 + (raw_byteat(buf, pos) - 48)
+        pos = pos + 1
+    Ende
+    Wenn neg == 1 dann
+        v = 0 - v
+    Ende
+    raw_set64(posbuf, 0, pos)
+    gebe_zurueck v
+Ende
+
+// ---- 读取下一个 float (跳过空白, 返回 fp32 位模式, pos 写回) ----
+Funktion off_next_float(buf, posbuf)
+    pos = raw_get64(posbuf, 0)
+    // 跳过空白
+    Solange raw_byteat(buf, pos) == 32 oder raw_byteat(buf, pos) == 9 oder raw_byteat(buf, pos) == 10 oder raw_byteat(buf, pos) == 13
+        pos = pos + 1
+    Ende
+    neg = 0
+    Wenn raw_byteat(buf, pos) == 45 dann
+        neg = 1
+        pos = pos + 1
+    Ende
+    intpart = 0
+    Solange raw_byteat(buf, pos) >= 48 und raw_byteat(buf, pos) <= 57
+        intpart = intpart * 10 + (raw_byteat(buf, pos) - 48)
+        pos = pos + 1
+    Ende
+    frac = 0
+    fracden = 1
+    Wenn raw_byteat(buf, pos) == 46 dann
+        pos = pos + 1
+        Solange raw_byteat(buf, pos) >= 48 und raw_byteat(buf, pos) <= 57
+            frac = frac * 10 + (raw_byteat(buf, pos) - 48)
+            fracden = fracden * 10
+            pos = pos + 1
+        Ende
+    Ende
+    val = s32_to_f32(intpart)
+    ffrac = f32_div(s32_to_f32(frac), s32_to_f32(fracden))
+    val = f32_add(val, ffrac)
+    Wenn neg == 1 dann
+        val = fs_neg(val)
+    Ende
+    raw_set64(posbuf, 0, pos)
+    gebe_zurueck val
+Ende
+
+// ---- 解析 OFF 头: 找 "OFF" 行, 读 nV nF nE ----
+// 返回 nV (顶点数). 状态经 posbuf 传递, 读完头后 posbuf 指向顶点数据起始.
+// 全局状态用 outbuf: [0..7]=nF, [8..15]=nE
+Funktion off_parse_header(buf, len, posbuf, outbuf)
+    pos = 0
+    found = 0
+    Solange pos < len und found == 0
+        Wenn raw_byteat(buf, pos) == 79 und raw_byteat(buf, pos + 1) == 70 und raw_byteat(buf, pos + 2) == 70 dann
+            // 只前进 3 字节 (跳过 "OFF"), 让 off_next_int 从后面读 nV nF nE
+            // 兼容三种变体: "OFF 2938 ..." / "OFF\n2938 ..." / "OFF2938 ..."
+            pos = pos + 3
+            found = 1
+        Sonst
+            pos = pos + 1
+        Ende
+    Ende
+    raw_set64(posbuf, 0, pos)
+    nV = off_next_int(buf, posbuf)
+    nF = off_next_int(buf, posbuf)
+    nE = off_next_int(buf, posbuf)
+    raw_set64(outbuf, 0, nF)
+    raw_set64(outbuf, 8, nE)
+    gebe_zurueck nV
+Ende
+
+// ---- 读取顶点数组 (nV 个 [x,y,z] fp32), 存到 verts 缓冲 ----
+// posbuf 传入/传出
+Funktion off_read_verts(buf, posbuf, verts, nV)
+    i = 0
+    Solange i < nV
+        x = off_next_float(buf, posbuf)
+        y = off_next_float(buf, posbuf)
+        z = off_next_float(buf, posbuf)
+        t_set(verts, i * 3 + 0, x)
+        t_set(verts, i * 3 + 1, y)
+        t_set(verts, i * 3 + 2, z)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 计算包围盒并归一化顶点到 [-0.45,0.45]^3 (留边距) ----
+// 全局状态经 stbuf: [0..7]=scale, [8..15]=cx, [16..23]=cy, [24..31]=cz
+Funktion off_normalize(verts, nV, stbuf)
+    minx = t_get(verts, 0)
+    maxx = minx
+    miny = t_get(verts, 1)
+    maxy = miny
+    minz = t_get(verts, 2)
+    maxz = minz
+    i = 1
+    Solange i < nV
+        x = t_get(verts, i * 3 + 0)
+        y = t_get(verts, i * 3 + 1)
+        z = t_get(verts, i * 3 + 2)
+        Wenn f32_lt(x, minx) dann
+            minx = x
+        Ende
+        Wenn f32_gt(x, maxx) dann
+            maxx = x
+        Ende
+        Wenn f32_lt(y, miny) dann
+            miny = y
+        Ende
+        Wenn f32_gt(y, maxy) dann
+            maxy = y
+        Ende
+        Wenn f32_lt(z, minz) dann
+            minz = z
+        Ende
+        Wenn f32_gt(z, maxz) dann
+            maxz = z
+        Ende
+        i = i + 1
+    Ende
+    dx = f32_sub(maxx, minx)
+    dy = f32_sub(maxy, miny)
+    dz = f32_sub(maxz, minz)
+    maxd = dx
+    Wenn f32_gt(dy, maxd) dann
+        maxd = dy
+    Ende
+    Wenn f32_gt(dz, maxd) dann
+        maxd = dz
+    Ende
+    scale = f32_div(s32_to_f32(9), f32_mul(maxd, s32_to_f32(10)))  // 0.9/maxd
+    cx = f32_mul(f32_add(minx, maxx), 1056964608)  // (min+max)/2
+    cy = f32_mul(f32_add(miny, maxy), 1056964608)
+    cz = f32_mul(f32_add(minz, maxz), 1056964608)
+    raw_set64(stbuf, 0, scale)
+    raw_set64(stbuf, 8, cx)
+    raw_set64(stbuf, 16, cy)
+    raw_set64(stbuf, 24, cz)
+    i = 0
+    Solange i < nV
+        x = f32_sub(t_get(verts, i * 3 + 0), cx)
+        y = f32_sub(t_get(verts, i * 3 + 1), cy)
+        z = f32_sub(t_get(verts, i * 3 + 2), cz)
+        t_set(verts, i * 3 + 0, f32_mul(x, scale))
+        t_set(verts, i * 3 + 1, f32_mul(y, scale))
+        t_set(verts, i * 3 + 2, f32_mul(z, scale))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 面片采样体素化 (三角形) ----
+// 重心坐标均匀采样, 标记占据体素. vox 缓冲 (V^3 fp32 0/1)
+Funktion voxelize_face(verts, v0, v1, v2, vox, V, samples)
+    ax = t_get(verts, v0 * 3 + 0)
+    ay = t_get(verts, v0 * 3 + 1)
+    az = t_get(verts, v0 * 3 + 2)
+    bx = t_get(verts, v1 * 3 + 0)
+    by = t_get(verts, v1 * 3 + 1)
+    bz = t_get(verts, v1 * 3 + 2)
+    cx = t_get(verts, v2 * 3 + 0)
+    cy = t_get(verts, v2 * 3 + 1)
+    cz = t_get(verts, v2 * 3 + 2)
+    si = 0
+    Solange si <= samples
+        sj = 0
+        Solange sj <= samples - si
+            u = f32_div(s32_to_f32(si), s32_to_f32(samples))
+            vv = f32_div(s32_to_f32(sj), s32_to_f32(samples))
+            w = f32_sub(f32_sub(1065353216, u), vv)  // 1-u-v
+            px = f32_add(f32_add(f32_mul(w, ax), f32_mul(u, bx)), f32_mul(vv, cx))
+            py = f32_add(f32_add(f32_mul(w, ay), f32_mul(u, by)), f32_mul(vv, cy))
+            pz = f32_add(f32_add(f32_mul(w, az), f32_mul(u, bz)), f32_mul(vv, cz))
+            // 坐标在 [-0.45,0.45]^3, 映射到 [0,V)^3: vx = floor((p+0.5)*V)
+            vx = f32_to_s32(f32_mul(f32_add(px, 1056964608), s32_to_f32(V)))
+            vy = f32_to_s32(f32_mul(f32_add(py, 1056964608), s32_to_f32(V)))
+            vz = f32_to_s32(f32_mul(f32_add(pz, 1056964608), s32_to_f32(V)))
+            Wenn vx >= 0 und vx < V und vy >= 0 und vy < V und vz >= 0 und vz < V dann
+                idx = (vz * V + vy) * V + vx
+                t_set(vox, idx, 1065353216)  // 1.0
+            Ende
+            sj = sj + 1
+        Ende
+        si = si + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 内部填充: 每 (y,z) 行沿 x 扫描, 在成对表面之间填充 ----
+// 对封闭曲面: 扫描 x, 计数穿越 (0->1), 奇数区间填充内部.
+// 简化: 对每 (y,z), 沿 x 收集占据, 用奇偶规则填充 0 到最后一个占据之间.
+Funktion voxel_fill_interior(vox, V)
+    y = 0
+    Solange y < V
+        z = 0
+        Solange z < V
+            // 沿 x 扫描, 找到第一个和最后一个占据, 中间填满
+            first = -1
+            last = -1
+            x = 0
+            Solange x < V
+                idx = (z * V + y) * V + x
+                Wenn t_get(vox, idx) != 0 dann
+                    Wenn first == -1 dann
+                        first = x
+                    Ende
+                    last = x
+                Ende
+                x = x + 1
+            Ende
+            // 填充 first..last
+            Wenn first != -1 dann
+                x = first
+                Solange x <= last
+                    idx = (z * V + y) * V + x
+                    t_set(vox, idx, 1065353216)
+                    x = x + 1
+                Ende
+            Ende
+            z = z + 1
+        Ende
+        y = y + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 从 OFF 文件体素化 (完整流程) ----
+// path: StarC 字符串, V: 体素分辨率, samples: 每边采样数, fill: 1=内部填充
+// 返回: 1 成功, 0 失败. vox 缓冲输出 (V^3 fp32)
+Funktion off_to_voxel(path, vox, V, samples, fill)
+    m = alloc(32)
+    r = file_mmap(path, m)
+    Wenn r != 1 dann
+        gebe_zurueck 0
+    Ende
+    base = raw_get64(m, 0)       // 文件内容基址 (无头部)
+    fsize = raw_get64(m, 24)     // 文件大小
+    data = base
+    posbuf = alloc(8)
+    raw_set64(posbuf, 0, 0)
+    outbuf = alloc(16)
+    raw_set64(outbuf, 0, 0)
+    raw_set64(outbuf, 8, 0)
+    nV = off_parse_header(data, fsize, posbuf, outbuf)
+    nF = raw_get64(outbuf, 0)
+    // 分配顶点
+    verts = t_alloc(nV * 3)
+    off_read_verts(data, posbuf, verts, nV)
+    // 归一化
+    stbuf = alloc(32)
+    off_normalize(verts, nV, stbuf)
+    // 清零体素
+    t_zero(vox, V * V * V)
+    // 遍历面 (fan 三角剖分: 任意 n>=3 多边形 -> 三角形 v0,vi,vi+1)
+    fi = 0
+    Solange fi < nF
+        n = off_next_int(data, posbuf)
+        Wenn n >= 3 dann
+            // 读第一个顶点
+            v0 = off_next_int(data, posbuf)
+            // 读后续顶点, fan 剖分
+            vi = 1
+            prev = v0
+            Solange vi < n
+                cur = off_next_int(data, posbuf)
+                Wenn vi >= 2 dann
+                    // 三角形 (v0, prev, cur)
+                    voxelize_face(verts, v0, prev, cur, vox, V, samples)
+                Ende
+                prev = cur
+                vi = vi + 1
+            Ende
+        Sonst
+            k = 0
+            Solange k < n
+                tmp = off_next_int(data, posbuf)
+                k = k + 1
+            Ende
+        Ende
+        fi = fi + 1
+    Ende
+    file_munmap(m)
+    Wenn fill == 1 dann
+        voxel_fill_interior(vox, V)
+    Ende
+    gebe_zurueck 1
+Ende

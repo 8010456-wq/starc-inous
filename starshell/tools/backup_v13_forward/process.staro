@@ -1,0 +1,37 @@
+// ============================================================================
+//  starshell :: inuos/process.staro
+//  StarShell V4 能力库 · 进程执行（编译/运行外部程序）
+//  铁律 E：能力在此 .staro 实现，用 linx-o 调 WinAPI/msvcrt。
+// ============================================================================
+
+linx-o msvcrt system
+
+// 执行命令行（StarC 字符串），返回退出码
+// 用于调起 starcc.exe 编译，也用于运行任意命令
+Funktion exec_process(scmd)
+    c = starc_to_cstr(scmd)
+    code = system(c)
+    gebe_zurueck code
+Ende
+
+// 执行 C 字符串命令行（用于编译命令构造后直接执行），返回退出码
+Funktion exec_process_cstr(ccmd)
+    code = system(ccmd)
+    gebe_zurueck code
+Ende
+
+// 编译 .starc -> .sc（调外部 starcc.exe，能力不在本进程内建）
+// 返回退出码：0 成功，非 0 失败
+Funktion compile_starc(src, ziel)
+    cmd = str_concat(str_concat("D:/starc/starcc.exe ", src), " -o ")
+    cmd = str_concat(cmd, ziel)
+    cmd = str_concat(cmd, " -v")
+    code = exec_process(cmd)
+    gebe_zurueck code
+Ende
+
+// Bildschirm leeren
+Funktion bild_leeren()
+    code = system("cls")
+    gebe_zurueck code
+Ende

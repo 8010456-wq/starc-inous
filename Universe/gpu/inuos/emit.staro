@@ -1,0 +1,52 @@
+// inuos/emit.staro - 汇编文本发射器 (写 .asm 到原始缓冲)
+// out: 原始缓冲 (offset 0 起), off: 当前写入位置, 返回新 off
+// 依赖: str.staro(str_len, int_to_str)
+
+// 写字符串数据到 out[off..], 返回新 off
+Funktion emit_str(out, off, s)
+    l = str_len(s)
+    i = 0
+    Solange i < l
+        raw_setbyte(out, off + i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    gebe_zurueck off + l
+Ende
+
+// 写数字的十进制到 out[off..], 返回新 off
+Funktion emit_int(out, off, num)
+    s = int_to_str(num)
+    off = emit_str(out, off, s)
+    gebe_zurueck off
+Ende
+
+// 写换行 \r\n, 返回新 off
+Funktion emit_nl(out, off)
+    raw_setbyte(out, off, 13)
+    raw_setbyte(out, off + 1, 10)
+    gebe_zurueck off + 2
+Ende
+
+// 写一行 (字符串 + \r\n), 返回新 off
+Funktion emit_line(out, off, s)
+    off = emit_str(out, off, s)
+    off = emit_nl(out, off)
+    gebe_zurueck off
+Ende
+
+// 写 "指令 操作数" 一行, 返回新 off
+Funktion emit_instr(out, off, op, operand)
+    off = emit_str(out, off, op)
+    off = emit_str(out, off, " ")
+    off = emit_int(out, off, operand)
+    off = emit_nl(out, off)
+    gebe_zurueck off
+Ende
+
+// 写注释行 "; ...", 返回新 off
+Funktion emit_comment(out, off, s)
+    off = emit_str(out, off, "; ")
+    off = emit_str(out, off, s)
+    off = emit_nl(out, off)
+    gebe_zurueck off
+Ende

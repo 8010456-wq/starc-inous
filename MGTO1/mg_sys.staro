@@ -1,0 +1,394 @@
+// ============================================================================
+//  MGTO1 :: mg_sys.staro —— 核心系统层（linx 统一声明 + 基础能力）
+//  仅依赖 kernel32 / ws2_32 / msvcrt（自研，零第三方）
+//  .starc 正文禁止 linx；全部能力在此层。raw_*/alloc 为编译器内建。
+// ============================================================================
+
+linx "kernel32.dll!GetStdHandle"
+linx "kernel32.dll!WriteFile"
+linx "kernel32.dll!GetCommandLineA"
+linx "kernel32.dll!GetTickCount"
+linx "kernel32.dll!GetCurrentProcessId"
+linx "kernel32.dll!GetProcessHeap"
+linx "kernel32.dll!HeapAlloc"
+linx "kernel32.dll!HeapFree"
+linx "kernel32.dll!CreateFileA"
+linx "kernel32.dll!ReadFile"
+linx "kernel32.dll!CloseHandle"
+linx "kernel32.dll!GetFileSize"
+linx "kernel32.dll!CreateFileMappingA"
+linx "kernel32.dll!MapViewOfFile"
+linx "kernel32.dll!UnmapViewOfFile"
+linx "kernel32.dll!GetFileAttributesA"
+linx "kernel32.dll!DeleteFileA"
+
+linx "ws2_32.dll!WSAStartup"
+linx "ws2_32.dll!WSACleanup"
+linx "ws2_32.dll!socket"
+linx "ws2_32.dll!bind"
+linx "ws2_32.dll!listen"
+linx "ws2_32.dll!accept"
+linx "ws2_32.dll!connect"
+linx "ws2_32.dll!recv"
+linx "ws2_32.dll!send"
+linx "ws2_32.dll!closesocket"
+linx "ws2_32.dll!setsockopt"
+linx "ws2_32.dll!WSAGetLastError"
+
+linx "msvcrt.dll!memset"
+linx "msvcrt.dll!memcpy"
+linx "msvcrt.dll!strlen"
+linx "msvcrt.dll!atof"
+linx "msvcrt.dll!sin"
+linx "msvcrt.dll!cos"
+linx "msvcrt.dll!exp"
+linx "msvcrt.dll!log"
+linx "msvcrt.dll!pow"
+linx "msvcrt.dll!sqrt"
+
+// ---------------- 常量 ----------------
+// 用字面量（无 Konstant 关键字）
+
+// ---------------- 输出 ----------------
+Funktion mg_stdout()
+    gebe_zurueck GetStdHandle(-11)   // STD_OUTPUT_HANDLE
+Ende
+
+Funktion mg_write_cstr(c)
+    h = GetStdHandle(-11)
+    n = strlen(c)
+    r = HeapAlloc(GetProcessHeap(), 0, 4)
+    raw_setbyte(r, 0, n % 256)
+    raw_setbyte(r, 1, (n / 256) % 256)
+    raw_setbyte(r, 2, (n / 65536) % 256)
+    raw_setbyte(r, 3, (n / 16777216) % 256)
+    WriteFile(h, c, n, r, 0)
+    HeapFree(GetProcessHeap(), 0, r)
+    gebe_zurueck 0
+Ende
+
+Funktion mg_write_str(s)
+    // StarC 字符串：数据从 offset 8 起，NUL 结尾
+    len = 0
+    Solange raw_byteat(s, 8 + len) != 0
+        len = len + 1
+    Ende
+    h = GetStdHandle(-11)
+    r = HeapAlloc(GetProcessHeap(), 0, 4)
+    raw_setbyte(r, 0, len % 256)
+    raw_setbyte(r, 1, (len / 256) % 256)
+    raw_setbyte(r, 2, (len / 65536) % 256)
+    raw_setbyte(r, 3, (len / 16777216) % 256)
+    WriteFile(h, s + 8, len, r, 0)
+    HeapFree(GetProcessHeap(), 0, r)
+    gebe_zurueck 0
+Ende
+
+Funktion mg_newline()
+    mg_write_str("\n")
+    gebe_zurueck 0
+Ende
+
+Funktion mg_write_int(v)
+    mg_write_cstr(cstr_from_int(v))
+    gebe_zurueck 0
+Ende
+
+// ---------------- C 字符串工具 ----------------
+
+// StarC 字符串（数据从 offset 8 起，NUL 结尾）→ 新 C 字符串
+Funktion mg_cstr(s)
+    n = 0
+    Solange raw_byteat(s, 8 + n) != 0
+        n = n + 1
+    Ende
+    q = alloc(n + 1)
+    i = 0
+    Solange i < n
+        raw_setbyte(q, i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(q, n, 0)
+    gebe_zurueck q
+Ende
+
+Funktion cstr_len(p)
+    n = 0
+    Solange raw_byteat(p, n) != 0
+        n = n + 1
+    Ende
+    gebe_zurueck n
+Ende
+
+Funktion cstr_eq(a, b)
+    i = 0
+    Solange 1 == 1
+        ca = raw_byteat(a, i)
+        cb = raw_byteat(b, i)
+        Wenn ca != cb dann
+            gebe_zurueck 0
+        Ende
+        Wenn ca == 0 dann
+            gebe_zurueck 1
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 分配并拷贝 C 字符串 → 新 C 字符串
+Funktion cstr_copy(p)
+    n = cstr_len(p)
+    q = alloc(n + 1)
+    i = 0
+    Solange i <= n
+        raw_setbyte(q, i, raw_byteat(p, i))
+        i = i + 1
+    Ende
+    gebe_zurueck q
+Ende
+
+// 追加 src 到 dest 尾部（dest 须有足够容量），返回新长度
+Funktion cstr_append(dest, off, src)
+    n = cstr_len(src)
+    i = 0
+    Solange i < n
+        raw_setbyte(dest, off + i, raw_byteat(src, i))
+        i = i + 1
+    Ende
+    raw_setbyte(dest, off + n, 0)
+    gebe_zurueck off + n
+Ende
+
+// 数字 → C 字符串（十进制，负数支持），返回新 C 字符串
+Funktion cstr_from_int(v)
+    b = alloc(32)
+    pos = 0
+    neg = 0
+    Wenn v < 0 dann
+        neg = 1
+        v = 0 - v
+    Ende
+    digits = alloc(24)
+    dn = 0
+    fertig = 0
+    Solange fertig == 0
+        d = v % 10
+        raw_setbyte(digits, dn, 48 + d)
+        dn = dn + 1
+        v = v / 10
+        Wenn v == 0 dann
+            fertig = 1
+        Ende
+    Ende
+    Wenn neg == 1 dann
+        raw_setbyte(b, pos, 45)
+        pos = pos + 1
+    Ende
+    i = dn - 1
+    Solange i >= 0
+        raw_setbyte(b, pos, raw_byteat(digits, i))
+        pos = pos + 1
+        i = i - 1
+    Ende
+    raw_setbyte(b, pos, 0)
+    gebe_zurueck b
+Ende
+
+// ---------------- 网络（服务端/客户端，裸 TCP） ----------------
+Funktion mg_wsa()
+    wsa = alloc(512)
+    i = 0
+    Solange i < 512
+        raw_setbyte(wsa, i, 0)
+        i = i + 1
+    Ende
+    r = WSAStartup(514, wsa)
+    gebe_zurueck r
+Ende
+
+Funktion mg_cleanup()
+    WSACleanup()
+    gebe_zurueck 0
+Ende
+
+// 监听 0.0.0.0:port；返回 srv（<0 失败）
+Funktion mg_listen(port)
+    srv = socket(2, 1, 6)          // AF_INET, SOCK_STREAM, IPPROTO_TCP
+    Wenn srv < 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    addr = alloc(16)
+    i = 0
+    Solange i < 16
+        raw_setbyte(addr, i, 0)
+        i = i + 1
+    Ende
+    raw_setbyte(addr, 0, 2)         // AF_INET 低字节
+    hi = port / 256
+    lo = port - hi * 256
+    raw_setbyte(addr, 2, hi)
+    raw_setbyte(addr, 3, lo)
+    r = bind(srv, addr, 16)
+    Wenn r != 0 dann
+        closesocket(srv)
+        gebe_zurueck 0 - 2
+    Ende
+    r = listen(srv, 32)
+    Wenn r != 0 dann
+        closesocket(srv)
+        gebe_zurueck 0 - 3
+    Ende
+    gebe_zurueck srv
+Ende
+
+Funktion mg_accept(srv)
+    c = accept(srv, 0, 0)
+    gebe_zurueck c
+Ende
+
+Funktion mg_recv(s, buf, max)
+    n = recv(s, buf, max, 0)
+    gebe_zurueck n
+Ende
+
+Funktion mg_send(s, ptr, len)
+    n = send(s, ptr, len, 0)
+    gebe_zurueck n
+Ende
+
+Funktion mg_close(s)
+    Wenn s >= 0 dann
+        closesocket(s)
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------------- 内存清零 ----------------
+Funktion mem_zero(p, n)
+    i = 0
+    Solange i < n
+        raw_setbyte(p, i, 0)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------------- 有符号判定 ----------------
+// linx 返回值在 StarC 里按无符号看：-1 变成 4294967295（0xFFFFFFFF）。
+// 对 socket/文件 API 的返回值，凡「> 1000000」或「< 0」都视为错误码。
+// ★ 不能用 `v >= 2147483648`：编译器把 ≥2^31 常量截断为 int32（变负数），
+//   导致 `256 >= 2147483648` 恒真。故用 1000000 阈值（任何有效 socket 结果 < 1000000）。
+Funktion isneg(v)
+    Wenn v > 1000000 dann
+        gebe_zurueck 1
+    Sonst
+        Wenn v < 0 dann
+            gebe_zurueck 1
+        Sonst
+            gebe_zurueck 0
+        Ende
+    Ende
+Ende
+
+// ---------------- 64 位小端读写 ----------------
+// ★ 用户函数（非内建）：在 .staro 里必须定义，否则编译器生成返回 0 的桩 ★
+// ★ 只用 256 的除法/乘法：编译器对大常数（≥2^31）的除法/乘法有 bug
+//   （实测 v/4294967296 错值、*65536 错值），故逐字节用 /256 移位。
+Funktion raw_set64(ptr, off, val)
+    v = val
+    raw_setbyte(ptr, off + 0, v - (v / 256) * 256)
+    v = v / 256
+    raw_setbyte(ptr, off + 1, v - (v / 256) * 256)
+    v = v / 256
+    raw_setbyte(ptr, off + 2, v - (v / 256) * 256)
+    v = v / 256
+    raw_setbyte(ptr, off + 3, v - (v / 256) * 256)
+    v = v / 256
+    raw_setbyte(ptr, off + 4, v - (v / 256) * 256)
+    v = v / 256
+    raw_setbyte(ptr, off + 5, v - (v / 256) * 256)
+    v = v / 256
+    raw_setbyte(ptr, off + 6, v - (v / 256) * 256)
+    v = v / 256
+    raw_setbyte(ptr, off + 7, v)
+    gebe_zurueck 0
+Ende
+
+Funktion raw_get64(ptr, off)
+    v = raw_byteat(ptr, off + 7)
+    v = v * 256 + raw_byteat(ptr, off + 6)
+    v = v * 256 + raw_byteat(ptr, off + 5)
+    v = v * 256 + raw_byteat(ptr, off + 4)
+    v = v * 256 + raw_byteat(ptr, off + 3)
+    v = v * 256 + raw_byteat(ptr, off + 2)
+    v = v * 256 + raw_byteat(ptr, off + 1)
+    v = v * 256 + raw_byteat(ptr, off + 0)
+    gebe_zurueck v
+Ende
+
+// 读 4 字节小端 u32（raw_get32 不是编译器内建，必须显式定义）
+Funktion raw_get32(ptr, off)
+    v = raw_byteat(ptr, off + 3)
+    v = v * 256 + raw_byteat(ptr, off + 2)
+    v = v * 256 + raw_byteat(ptr, off + 1)
+    v = v * 256 + raw_byteat(ptr, off + 0)
+    gebe_zurueck v
+Ende
+
+// 写 4 字节小端 u32
+Funktion raw_set32(ptr, off, v)
+    raw_setbyte(ptr, off, v - (v / 256) * 256)
+    raw_setbyte(ptr, off + 1, (v / 256) - (v / 65536) * 256)
+    raw_setbyte(ptr, off + 2, (v / 65536) - (v / 16777216) * 256)
+    raw_setbyte(ptr, off + 3, v / 16777216)
+    gebe_zurueck 0
+Ende
+
+// ---------------- 写文件（整块） ----------------
+// name_c 为 C 串裸指针；buf 为数据裸指针；len 为字节数。返回 0 成功 / 负错误码。
+// CREATE_ALWAYS=2, GENERIC_WRITE=0x40000000=1073741824, FILE_SHARE_READ=1,
+// FILE_ATTRIBUTE_NORMAL=0x80=128。
+Funktion mg_write_file(name_c, buf, len)
+    h = CreateFileA(name_c, 1073741824, 1, 0, 2, 128, 0)
+    Wenn h <= 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    nb = alloc(8)
+    mem_zero(nb, 8)
+    ok = WriteFile(h, buf, len, nb, 0)
+    CloseHandle(h)
+    Wenn ok == 0 dann
+        gebe_zurueck 0 - 2
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------------- 读文件（整块，NUL 结尾） ----------------
+// 返回数据缓冲指针；0=失败。out_size 指向 8 字节，写入文件大小。
+// CREATE_OPEN_EXISTING=3, GENERIC_READ=0x80000000=2147483648, FILE_SHARE_READ=1。
+Funktion mg_read_file(name_c, out_size)
+    h = CreateFileA(name_c, 2147483648, 1, 0, 3, 128, 0)
+    Wenn h <= 0 dann
+        raw_set64(out_size, 0, 0)
+        gebe_zurueck 0
+    Ende
+    sz = GetFileSize(h, 0)
+    Wenn sz <= 0 dann
+        CloseHandle(h)
+        raw_set64(out_size, 0, 0)
+        gebe_zurueck 0
+    Ende
+    buf = alloc(sz + 1)
+    nb = alloc(8)
+    mem_zero(nb, 8)
+    ok = ReadFile(h, buf, sz, nb, 0)
+    CloseHandle(h)
+    Wenn ok == 0 dann
+        raw_set64(out_size, 0, 0)
+        gebe_zurueck 0
+    Ende
+    raw_setbyte(buf, sz, 0)
+    raw_set64(out_size, 0, sz)
+    gebe_zurueck buf
+Ende

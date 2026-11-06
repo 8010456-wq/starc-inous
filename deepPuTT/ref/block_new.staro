@@ -1,0 +1,1183 @@
+// inuos/block.staro - DeepSeek-V4-Flash 完整 Block (mHC + attn + moe) 自研引擎库
+// 依赖: sys str file safetensors quant fp8 bf16 softfloat math cuda
+//       fp4_kernel fp8_kernel fp32_kernel mhc
+// 镜像 modeling_deepseek_v4.py DeepseekV4Block.forward (moe0/attn0 已验证算子)
+//
+// 上下文 ctx 布局 (u64 指针, 由 block0_test.starc 填充):
+//   0   data_start      8   wqa        16  wqas       24  wqb
+//   32  wqbs            40  wkv        48  wkvs       56  woa
+//   64  woas            72  wob        80  wobs       88  qn
+//   96  kvn            104  sink       112 attn_norm_w 120 ffn_norm_w
+//   128 hc_attn_fn     136 hc_attn_base 144 hc_attn_scale
+//   152 hc_ffn_fn      160 hc_ffn_base  168 hc_ffn_scale
+//   176 gatew          184 tid        192 eoff
+//   200 shw1           208 shw1s      216 shw2        224 shw2s
+//   232 shw3           240 shw3s      248 cossin
+//   256 mod4           264 func4      272 mod8        280 func8
+//   288 modb           296 funcb      304 gpu_lut4     312 gpu_lut8
+//   320 mod32          328 func32
+
+// ---- GPU 权重常驻缓存 (wbase -> gpu_w/gpu_pow) ----
+// 缓存策略: 每层 cache_clear 回退池游标 (不释放 GPU 内存, 无 alloc 抖动)
+//   权重从 gpu_wpool 顺序分配; fp4 的 pow 由 powgen GPU 内核现算 (消灭 StarC 软浮点)
+// cache 布局: +0 gpu_act_pool | +8 gpu_out_pool | +16 gpu_wpool | +24 wpool_cursor
+//   +32 gpu_sbpool | +40 sbpool_cursor | +48 powgen_func | +56 head_gpu_w
+//   条目区从 +64 起, 每 48 字节
+//   条目: +0 wbase u64 | +8 gpu_w u64 | +16 sbase u64 | +24 gpu_pow u64
+//         +32 wsize u32 | +36 powsize u32 | +40 valid u32
+Funktion cache_find(cache, cap, wbase)
+    i = 0
+    Solange i < cap
+        Wenn raw_get32(cache, 64 + i * 48 + 40) == 1 dann
+            Wenn raw_get64(cache, 64 + i * 48 + 0) == wbase dann
+                gebe_zurueck i
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck -1
+Ende
+
+Funktion cache_slot(cache, cap)
+    i = 0
+    Solange i < cap
+        Wenn raw_get32(cache, 64 + i * 48 + 40) == 0 dann
+            gebe_zurueck i
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck -1
+Ende
+
+// 回退游标 + 作废条目, 不释放 GPU 内存 (消除每层 alloc/free 抖动)
+Funktion cache_clear(cache, cap)
+    raw_set64(cache, 24, 0)
+    raw_set64(cache, 40, 0)
+    i = 0
+    Solange i < cap
+        raw_set32(cache, 64 + i * 48 + 40, 0)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 一次性分配大池 (act/out/权重/尺度), 后续全部 bump, 不再逐权重 cuda_mem_alloc
+Funktion cache_pool(cache)
+    Wenn raw_get64(cache, 0) == 0 dann
+        p0 = cuda_mem_alloc(40960)
+        raw_set64(cache, 0, p0)
+        p1 = cuda_mem_alloc(614400)
+        raw_set64(cache, 8, p1)
+        p2 = cuda_mem_alloc(512 * 1024 * 1024)
+        raw_set64(cache, 16, p2)
+        p3 = cuda_mem_alloc(64 * 1024 * 1024)
+        raw_set64(cache, 32, p3)
+        mi = alloc(16)
+        cuda_mem_info(mi)
+        Ausgeben "DBG pool_act="
+        Ausgeben p0
+        Ausgeben " gout="
+        Ausgeben p1
+        Ausgeben " gw="
+        Ausgeben p2
+        Ausgeben " gsb="
+        Ausgeben p3
+        Ausgeben " free="
+        Ausgeben raw_get64(mi, 0)
+        Ausgeben ""
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion gemv_fp4(wbase, sbase, act, out, M, K, ncb32, gpu_lut, mod, func, scratch, cache, cap)
+    cache_pool(cache)  // 必须先分配 gpu_wpool/sbpool, 否则 cache_find 分支用垃圾 gpu_w/gpu_pow
+    wbytes = M * (K / 2)
+    nsc = M * ncb32
+    pbytes = nsc * 4
+    idx = cache_find(cache, cap, wbase)
+    Wenn idx < 0 dann
+        idx = cache_slot(cache, cap)
+        Wenn idx < 0 dann
+            cache_clear(cache, cap)
+            idx = cache_slot(cache, cap)
+        Ende
+        // 权重从池 bump 分配
+        wcur = raw_get64(cache, 24)
+        raw_set32(cache, 3240, raw_get32(cache, 3240) + 1)
+        gpu_w = raw_get64(cache, 16) + wcur
+        raw_set64(cache, 24, wcur + wbytes)
+        cuda_memcpy_htod(gpu_w, wbase, wbytes)
+        // powgen GPU 内核: pow[i] = 2^(sbase[i]-127), sbase 上传临时区, pow 落尺度池
+        sb_gpu = raw_get64(cache, 32)
+        cuda_memcpy_htod(sb_gpu, sbase, nsc)
+        scur = raw_get64(cache, 40)
+        gpu_pow = raw_get64(cache, 32) + 524288 + scur
+        raw_set64(cache, 40, scur + pbytes)
+        ps = scratch + 1500100
+        raw_set64(ps, 0, sb_gpu)
+        pp2 = scratch + 1500108
+        raw_set64(pp2, 0, gpu_pow)
+        pn = scratch + 1500116
+        raw_set32(pn, 0, nsc)
+        pparams = scratch + 1500120
+        raw_set64(pparams, 0, ps)
+        raw_set64(pparams, 8, pp2)
+        raw_set64(pparams, 16, pn)
+        pgrid = (nsc + 255) / 256
+        cuda_launch(raw_get64(cache, 48), pgrid, 1, 1, 256, 1, 1, 0, 0, pparams)
+        raw_set64(cache, 64 + idx * 48 + 0, wbase)
+        raw_set64(cache, 64 + idx * 48 + 8, gpu_w)
+        raw_set64(cache, 64 + idx * 48 + 16, sbase)
+        raw_set64(cache, 64 + idx * 48 + 24, gpu_pow)
+        raw_set32(cache, 64 + idx * 48 + 32, wbytes)
+        raw_set32(cache, 64 + idx * 48 + 36, pbytes)
+        raw_set32(cache, 64 + idx * 48 + 40, 1)
+    Sonst
+        gpu_w = raw_get64(cache, 64 + idx * 48 + 8)
+        gpu_pow = raw_get64(cache, 64 + idx * 48 + 24)
+    Ende
+    cache_pool(cache)
+    gpu_act = raw_get64(cache, 0)
+    gpu_out = raw_get64(cache, 8)
+    cuda_memcpy_htod(gpu_act, act, K * 4)
+    pw = scratch + 1500000
+    raw_set64(pw, 0, gpu_w)
+    pl = scratch + 1500008
+    raw_set64(pl, 0, gpu_lut)
+    pp = scratch + 1500016
+    raw_set64(pp, 0, gpu_pow)
+    pa = scratch + 1500024
+    raw_set64(pa, 0, gpu_act)
+    po = scratch + 1500032
+    raw_set64(po, 0, gpu_out)
+    pM = scratch + 1500040
+    raw_set32(pM, 0, M)
+    pK = scratch + 1500044
+    raw_set32(pK, 0, K)
+    pn = scratch + 1500048
+    raw_set32(pn, 0, ncb32)
+    params = scratch + 1500064
+    raw_set64(params, 0, pw)
+    raw_set64(params, 8, pl)
+    raw_set64(params, 16, pp)
+    raw_set64(params, 24, pa)
+    raw_set64(params, 32, po)
+    raw_set64(params, 40, pM)
+    raw_set64(params, 48, pK)
+    raw_set64(params, 56, pn)
+    grid = (M + 255) / 256
+    cuda_launch(func, grid, 1, 1, 256, 1, 1, 0, 0, params)
+    cuda_memcpy_dtoh(out, gpu_out, M * 4)
+    gebe_zurueck 0
+Ende
+
+Funktion gemv_fp8(wbase, sbase, act, out, M, K, ncb, gpu_lut, mod, func, scratch, cache, cap)
+    cache_pool(cache)  // 必须先分配 gpu_wpool/sbpool, 否则 cache_find 分支用垃圾 gpu_w/gpu_pow
+    wbytes = M * K
+    nsc = (M / 128) * (K / 128)
+    pbytes = nsc * 4
+    idx = cache_find(cache, cap, wbase)
+    Wenn idx < 0 dann
+        idx = cache_slot(cache, cap)
+        Wenn idx < 0 dann
+            cache_clear(cache, cap)
+            idx = cache_slot(cache, cap)
+        Ende
+        wcur = raw_get64(cache, 24)
+        raw_set32(cache, 3240, raw_get32(cache, 3240) + 1)
+        gpu_w = raw_get64(cache, 16) + wcur
+        raw_set64(cache, 24, wcur + wbytes)
+        cuda_memcpy_htod(gpu_w, wbase, wbytes)
+        // fp8 pow 小 (<=2048), StarC 现算, 落尺度池 bump
+        // 用 scratch 后半 (1MB 起), 避免覆盖 block_forward/attn/moe 的临时缓冲池 (scratch[0..1MB))
+        powbuf = scratch + 1048576
+        g = 0
+        Solange g < nsc
+            raw_set32(powbuf, g * 4, fp32_mul_pow2(1065353216, e8m0_exp(raw_byteat(sbase, g))))
+            g = g + 1
+        Ende
+        scur = raw_get64(cache, 40)
+        gpu_pow = raw_get64(cache, 32) + 524288 + scur
+        raw_set64(cache, 40, scur + pbytes)
+        cuda_memcpy_htod(gpu_pow, powbuf, pbytes)
+        raw_set64(cache, 64 + idx * 48 + 0, wbase)
+        raw_set64(cache, 64 + idx * 48 + 8, gpu_w)
+        raw_set64(cache, 64 + idx * 48 + 16, sbase)
+        raw_set64(cache, 64 + idx * 48 + 24, gpu_pow)
+        raw_set32(cache, 64 + idx * 48 + 32, wbytes)
+        raw_set32(cache, 64 + idx * 48 + 36, pbytes)
+        raw_set32(cache, 64 + idx * 48 + 40, 1)
+    Sonst
+        gpu_w = raw_get64(cache, 64 + idx * 48 + 8)
+        gpu_pow = raw_get64(cache, 64 + idx * 48 + 24)
+    Ende
+    cache_pool(cache)
+    gpu_act = raw_get64(cache, 0)
+    gpu_out = raw_get64(cache, 8)
+    cuda_memcpy_htod(gpu_act, act, K * 4)
+    // GPU 内核参数缓冲固定 (scratch+1500000 起, 顺序调用 cuda_launch 同步后覆盖安全)
+    pw = scratch + 1500000
+    raw_set64(pw, 0, gpu_w)
+    pl = scratch + 1500008
+    raw_set64(pl, 0, gpu_lut)
+    pp = scratch + 1500016
+    raw_set64(pp, 0, gpu_pow)
+    pa = scratch + 1500024
+    raw_set64(pa, 0, gpu_act)
+    po = scratch + 1500032
+    raw_set64(po, 0, gpu_out)
+    pM = scratch + 1500040
+    raw_set32(pM, 0, M)
+    pK = scratch + 1500044
+    raw_set32(pK, 0, K)
+    pn = scratch + 1500048
+    raw_set32(pn, 0, ncb)
+    params = scratch + 1500064
+    raw_set64(params, 0, pw)
+    raw_set64(params, 8, pl)
+    raw_set64(params, 16, pp)
+    raw_set64(params, 24, pa)
+    raw_set64(params, 32, po)
+    raw_set64(params, 40, pM)
+    raw_set64(params, 48, pK)
+    raw_set64(params, 56, pn)
+    grid = (M + 255) / 256
+    cuda_launch(func, grid, 1, 1, 256, 1, 1, 0, 0, params)
+    cuda_memcpy_dtoh(out, gpu_out, M * 4)
+    gebe_zurueck 0
+Ende
+
+Funktion gemv_bf16(wbase, act, out, M, K, mod, func)
+    gpu_w = cuda_mem_alloc(M * K * 2)
+    gpu_act = cuda_mem_alloc(K * 4)
+    gpu_out = cuda_mem_alloc(M * 4)
+    cuda_memcpy_htod(gpu_w, wbase, M * K * 2)
+    cuda_memcpy_htod(gpu_act, act, K * 4)
+    pw = alloc(8)
+    raw_set64(pw, 0, gpu_w)
+    pa = alloc(8)
+    raw_set64(pa, 0, gpu_act)
+    po = alloc(8)
+    raw_set64(po, 0, gpu_out)
+    pM = alloc(4)
+    raw_set32(pM, 0, M)
+    pK = alloc(4)
+    raw_set32(pK, 0, K)
+    params = alloc(40)
+    raw_set64(params, 0, pw)
+    raw_set64(params, 8, pa)
+    raw_set64(params, 16, po)
+    raw_set64(params, 24, pM)
+    raw_set64(params, 32, pK)
+    grid = (M + 255) / 256
+    cuda_launch(func, grid, 1, 1, 256, 1, 1, 0, 0, params)
+    cuda_memcpy_dtoh(out, gpu_out, M * 4)
+    cuda_mem_free(gpu_w)
+    cuda_mem_free(gpu_act)
+    cuda_mem_free(gpu_out)
+    gebe_zurueck 0
+Ende
+
+// 常驻版 BF16 GEMV (gate 路由权重, 权重首次上传后复用, act/out 池化)
+Funktion gemv_bf16p(wbase, act, out, M, K, mod, func, cache, cap, scratch)
+    wbytes = M * K * 2
+    idx = cache_find(cache, cap, wbase)
+    Wenn idx < 0 dann
+        idx = cache_slot(cache, cap)
+        Wenn idx < 0 dann
+            cache_clear(cache, cap)
+            idx = cache_slot(cache, cap)
+        Ende
+        wcur = raw_get64(cache, 24)
+        raw_set32(cache, 3240, raw_get32(cache, 3240) + 1)
+        gpu_w = raw_get64(cache, 16) + wcur
+        raw_set64(cache, 24, wcur + wbytes)
+        cuda_memcpy_htod(gpu_w, wbase, wbytes)
+        raw_set64(cache, 64 + idx * 48 + 0, wbase)
+        raw_set64(cache, 64 + idx * 48 + 8, gpu_w)
+        raw_set64(cache, 64 + idx * 48 + 16, 0)
+        raw_set64(cache, 64 + idx * 48 + 24, 0)
+        raw_set32(cache, 64 + idx * 48 + 32, wbytes)
+        raw_set32(cache, 64 + idx * 48 + 36, 0)
+        raw_set32(cache, 64 + idx * 48 + 40, 1)
+    Sonst
+        gpu_w = raw_get64(cache, 64 + idx * 48 + 8)
+    Ende
+    cache_pool(cache)
+    gpu_act = raw_get64(cache, 0)
+    gpu_out = raw_get64(cache, 8)
+    cuda_memcpy_htod(gpu_act, act, K * 4)
+    pw = scratch + 1500000
+    raw_set64(pw, 0, gpu_w)
+    pa = scratch + 1500008
+    raw_set64(pa, 0, gpu_act)
+    po = scratch + 1500016
+    raw_set64(po, 0, gpu_out)
+    pM = scratch + 1500024
+    raw_set32(pM, 0, M)
+    pK = scratch + 1500028
+    raw_set32(pK, 0, K)
+    params = scratch + 1500032
+    raw_set64(params, 0, pw)
+    raw_set64(params, 8, pa)
+    raw_set64(params, 16, po)
+    raw_set64(params, 24, pM)
+    raw_set64(params, 32, pK)
+    grid = (M + 255) / 256
+    cuda_launch(func, grid, 1, 1, 256, 1, 1, 0, 0, params)
+    cuda_memcpy_dtoh(out, gpu_out, M * 4)
+    gebe_zurueck 0
+Ende
+
+// 头 GEMV: 权重持久化 (cache+56, 仅首次上传, 不被 cache_clear 动)
+Funktion gemv_bf16_head(wbase, act, out, M, K, mod, func, cache, scratch)
+    gw = raw_get64(cache, 56)
+    Wenn gw == 0 dann
+        gw = cuda_mem_alloc(M * K * 2)
+        cuda_memcpy_htod(gw, wbase, M * K * 2)
+        raw_set64(cache, 56, gw)
+        Ausgeben "HEADGW="
+        Ausgeben gw
+        Ausgeben ""
+    Ende
+    gpu_act = raw_get64(cache, 0)
+    gpu_out = raw_get64(cache, 8)
+    cuda_memcpy_htod(gpu_act, act, K * 4)
+    pw = scratch + 1500000
+    raw_set64(pw, 0, gw)
+    pa = scratch + 1500008
+    raw_set64(pa, 0, gpu_act)
+    po = scratch + 1500016
+    raw_set64(po, 0, gpu_out)
+    pM = scratch + 1500024
+    raw_set32(pM, 0, M)
+    pK = scratch + 1500028
+    raw_set32(pK, 0, K)
+    params = scratch + 1500032
+    raw_set64(params, 0, pw)
+    raw_set64(params, 8, pa)
+    raw_set64(params, 16, po)
+    raw_set64(params, 24, pM)
+    raw_set64(params, 32, pK)
+    grid = (M + 255) / 256
+    cuda_launch(func, grid, 1, 1, 256, 1, 1, 0, 0, params)
+    cuda_memcpy_dtoh(out, gpu_out, M * 4)
+    gebe_zurueck 0
+Ende
+
+// RMSNorm 带 BF16 weight
+Funktion rmsnorm_w(wb, x, n)
+    acc = 0
+    i = 0
+    Solange i < n
+        v = raw_get32(x, i * 4)
+        acc = f32_add(acc, f32_mul(v, v))
+        i = i + 1
+    Ende
+    r = f32_div(1065353216, f32_sqrt(f32_add(f32_div(acc, s32_to_f32(n)), 897988541)))
+    i = 0
+    Solange i < n
+        v = raw_get32(x, i * 4)
+        w = decode_bf16(wb, i * 2)
+        raw_set32(x, i * 4, f32_mul(f32_mul(v, r), w))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 无权重逐头 RMSNorm (q_b_norm)
+Funktion rmsnorm_u(x, roff, n)
+    acc = 0
+    i = 0
+    Solange i < n
+        v = raw_get32(x, (roff + i) * 4)
+        acc = f32_add(acc, f32_mul(v, v))
+        i = i + 1
+    Ende
+    r = f32_div(1065353216, f32_sqrt(f32_add(f32_div(acc, s32_to_f32(n)), 897988541)))
+    i = 0
+    Solange i < n
+        v = raw_get32(x, (roff + i) * 4)
+        raw_set32(x, (roff + i) * 4, f32_mul(v, r))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 部分 RoPE (后 64 维)
+Funktion rope_apply(x, roff, cossin, pos)
+    base = pos * 64
+    i = 0
+    Solange i < 32
+        c = raw_get32(cossin, (base + i) * 4)
+        s = raw_get32(cossin, (base + 32 + i) * 4)
+        x0 = raw_get32(x, (roff + 2 * i) * 4)
+        x1 = raw_get32(x, (roff + 2 * i + 1) * 4)
+        raw_set32(x, (roff + 2 * i) * 4, f32_sub(f32_mul(x0, c), f32_mul(x1, s)))
+        raw_set32(x, (roff + 2 * i + 1) * 4, f32_add(f32_mul(x0, s), f32_mul(x1, c)))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion rope_reverse(x, roff, cossin, pos)
+    base = pos * 64
+    i = 0
+    Solange i < 32
+        c = raw_get32(cossin, (base + i) * 4)
+        s = raw_get32(cossin, (base + 32 + i) * 4)
+        x0 = raw_get32(x, (roff + 2 * i) * 4)
+        x1 = raw_get32(x, (roff + 2 * i + 1) * 4)
+        raw_set32(x, (roff + 2 * i) * 4, f32_add(f32_mul(x0, c), f32_mul(x1, s)))
+        raw_set32(x, (roff + 2 * i + 1) * 4, f32_sub(f32_mul(x1, c), f32_mul(x0, s)))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// MLA 注意力 (单 token t 对 kv_cache[0..t], 滑动窗口)
+Funktion attn_forward(x, kv_cache, t, ctx, scratch, cache, cap)
+    wqa = raw_get64(ctx, 8)
+    wqas = raw_get64(ctx, 16)
+    wqb = raw_get64(ctx, 24)
+    wqbs = raw_get64(ctx, 32)
+    wkv = raw_get64(ctx, 40)
+    wkvs = raw_get64(ctx, 48)
+    woa = raw_get64(ctx, 56)
+    woas = raw_get64(ctx, 64)
+    wob = raw_get64(ctx, 72)
+    wobs = raw_get64(ctx, 80)
+    qn = raw_get64(ctx, 88)
+    kvn = raw_get64(ctx, 96)
+    sink = raw_get64(ctx, 104)
+    cossin = raw_get64(ctx, 248)
+    gpu_lut8 = raw_get64(ctx, 312)
+    mod8 = raw_get64(ctx, 272)
+    func8 = raw_get64(ctx, 280)
+
+    // 临时缓冲从 scratch+98304 起 bump (避免运行时 host alloc 越过已 COMMIT 堆区)
+    // 布局: qres|qbuf|kvbuf|attn_buf|y|out, 总计 ~310KB < 1MB
+    sp = scratch + 98304
+    qres = sp
+    sp = sp + 4096
+    qbuf = sp
+    sp = sp + 131072
+    kvbuf = sp
+    sp = sp + 2048
+    attn_buf = sp
+    sp = sp + 131072
+    y = sp
+    sp = sp + 32768
+    out = sp
+    sp = sp + 16384
+
+    // q_residual = q_norm(wq_a @ x)
+    gemv_fp8(wqa, wqas, x, qres, 1024, 4096, 32, gpu_lut8, mod8, func8, scratch, cache, cap)
+    Wenn raw_get32(cache, 3220) == 1 dann
+        qm = 0
+        qi = 0
+        Solange qi < 1024
+            qv = raw_get32(qres, qi * 4)
+            qa = qv
+            Wenn fs_sign(qa) == 1 dann
+                qa = fs_neg(qa)
+            Ende
+            Wenn f32_gt(qa, qm) dann
+                qm = qa
+            Ende
+            qi = qi + 1
+        Ende
+        Ausgeben "DBG qresmax@t"
+        Ausgeben t
+        Ausgeben "="
+        Ausgeben qm
+        Ausgeben ""
+        Ausgeben "DBG wcache@t"
+        Ausgeben t
+        Ausgeben " wcur="
+        Ausgeben raw_get64(cache, 24)
+        Ausgeben " scur="
+        Ausgeben raw_get64(cache, 40)
+        Ausgeben " wpool="
+        Ausgeben raw_get64(cache, 16)
+        Ausgeben ""
+    Ende
+    Wenn t == 0 dann
+        qm = 0
+        qi = 0
+        Solange qi < 1024
+            qv = raw_get32(qres, qi * 4)
+            qa = qv
+            Wenn fs_sign(qa) == 1 dann
+                qa = fs_neg(qa)
+            Ende
+            Wenn f32_gt(qa, qm) dann
+                qm = qa
+            Ende
+            qi = qi + 1
+        Ende
+        Ausgeben "DBG qresmax="
+        Ausgeben qm
+        Ausgeben ""
+        // dump cache gpu 池槽 + 游标 (定位 gemv_fp8 gpu 指针)
+        Ausgeben "DBG cache_gact="
+        Ausgeben raw_get64(cache, 0)
+        Ausgeben " gout="
+        Ausgeben raw_get64(cache, 8)
+        Ausgeben " gwpool="
+        Ausgeben raw_get64(cache, 16)
+        Ausgeben " gsbpool="
+        Ausgeben raw_get64(cache, 32)
+        Ausgeben " wcur="
+        Ausgeben raw_get64(cache, 24)
+        Ausgeben " sbcur="
+        Ausgeben raw_get64(cache, 40)
+        Ausgeben ""
+        Ausgeben "DBG qres[0..3]="
+        Ausgeben raw_get32(qres, 0)
+        Ausgeben ","
+        Ausgeben raw_get32(qres, 4)
+        Ausgeben ","
+        Ausgeben raw_get32(qres, 8)
+        Ausgeben ","
+        Ausgeben raw_get32(qres, 12)
+        Ausgeben ""
+        Ausgeben "DBG wqa="
+        Ausgeben wqa
+        Ausgeben " wqas="
+        Ausgeben wqas
+        Ausgeben ""
+        smx = 0
+        smi = 0
+        si = 0
+        Solange si < 256
+            sb = raw_byteat(wqas, si)
+            Wenn sb > smx dann
+                smx = sb
+                smi = si
+            Ende
+            si = si + 1
+        Ende
+        Ausgeben "DBG wqas_max="
+        Ausgeben smx
+        Ausgeben "@"
+        Ausgeben smi
+        Ausgeben ""
+        // 扫描 wq_a weight (1024*4096) 找 max 字节
+        wmx = 0
+        wmi = 0
+        wi = 0
+        Solange wi < 4096
+            wb = raw_byteat(wqa, wi)
+            Wenn wb > wmx dann
+                wmx = wb
+                wmi = wi
+            Ende
+            wi = wi + 1
+        Ende
+        Ausgeben "DBG wqa_wmax="
+        Ausgeben wmx
+        Ausgeben "@"
+        Ausgeben wmi
+        Ausgeben ""
+        // 该字节对应 scale: blk=(m/128)*32+(k/128)
+        Ausgeben "DBG wqa_wrow="
+        Ausgeben wmi / 4096
+        Ausgeben ""
+        Ausgeben "DBG wqa_wblk="
+        Ausgeben (wmi / 128) % 32
+        Ausgeben ""
+    Ende
+    rmsnorm_w(qn, qres, 1024)
+    // q = wq_b @ q_res
+    gemv_fp8(wqb, wqbs, qres, qbuf, 32768, 1024, 8, gpu_lut8, mod8, func8, scratch, cache, cap)
+    Wenn raw_get32(cache, 3220) == 1 dann
+        qm = 0
+        qi = 0
+        Solange qi < 32768
+            qv = raw_get32(qbuf, qi * 4)
+            qa = qv
+            Wenn fs_sign(qa) == 1 dann
+                qa = fs_neg(qa)
+            Ende
+            Wenn f32_gt(qa, qm) dann
+                qm = qa
+            Ende
+            qi = qi + 1
+        Ende
+        Ausgeben "DBG qmax@t"
+        Ausgeben t
+        Ausgeben "="
+        Ausgeben qm
+        Ausgeben ""
+    Ende
+    Wenn t == 0 dann
+        qm = 0
+        qi = 0
+        Solange qi < 32768
+            qv = raw_get32(qbuf, qi * 4)
+            qa = qv
+            Wenn fs_sign(qa) == 1 dann
+                qa = fs_neg(qa)
+            Ende
+            Wenn f32_gt(qa, qm) dann
+                qm = qa
+            Ende
+            qi = qi + 1
+        Ende
+        Ausgeben "DBG qmax="
+        Ausgeben qm
+        Ausgeben ""
+    Ende
+    hh = 0
+    Solange hh < 64
+        rmsnorm_u(qbuf, hh * 512, 512)
+        rope_apply(qbuf, hh * 512 + 448, cossin, t)
+        hh = hh + 1
+    Ende
+    // kv = kv_norm(wkv @ x)
+    gemv_fp8(wkv, wkvs, x, kvbuf, 512, 4096, 32, gpu_lut8, mod8, func8, scratch, cache, cap)
+    rmsnorm_w(kvn, kvbuf, 512)
+    Wenn raw_get32(cache, 3220) == 1 dann
+        qm = 0
+        qi = 0
+        Solange qi < 512
+            qv = raw_get32(kvbuf, qi * 4)
+            qa = qv
+            Wenn fs_sign(qa) == 1 dann
+                qa = fs_neg(qa)
+            Ende
+            Wenn f32_gt(qa, qm) dann
+                qm = qa
+            Ende
+            qi = qi + 1
+        Ende
+        Ausgeben "DBG kvmax="
+        Ausgeben qm
+        Ausgeben ""
+    Ende
+    rope_apply(kvbuf, 448, cossin, t)
+    cuda_memcpy_htod(kv_cache + (t % 128) * 512 * 4, kvbuf, 512 * 4)
+    // ---- GPU 注意力 (消灭 O(t) CPU 循环): attn_dot + attn_softmax + attn_out ----
+    gpu_q = raw_get64(cache, 3152)
+    gpu_s = raw_get64(cache, 3160)
+    gpu_w = raw_get64(cache, 3168)
+    gpu_sink = raw_get64(cache, 3176)
+    gpu_outa = raw_get64(cache, 3184)
+    adf = raw_get64(cache, 3192)
+    asf = raw_get64(cache, 3200)
+    aof = raw_get64(cache, 3208)
+    // 滑动窗口: 只扫最近 min(t+1,128) 个位置; ring = 窗口最老位置的环形槽位
+    Wenn t < 128 dann
+        n = t + 1
+        ring = 0
+    Sonst
+        n = 128
+        ring = (t - 127) % 128
+    Ende
+    cuda_memcpy_htod(gpu_q, qbuf, 32768 * 4)
+    cuda_memcpy_htod(gpu_sink, sink, 64 * 4)
+    // attn_dot(q, kv, s, n, hh, scale)  scale=0.04419417f (1/sqrt(512))
+    pq = scratch + 1300000
+    raw_set64(pq, 0, gpu_q)
+    pkv = scratch + 1300008
+    raw_set64(pkv, 0, kv_cache)
+    ps = scratch + 1300016
+    raw_set64(ps, 0, gpu_s)
+    pn = scratch + 1300024
+    raw_set32(pn, 0, n)
+    phh = scratch + 1300028
+    raw_set32(phh, 0, 64)
+    psc = scratch + 1300032
+    raw_set32(psc, 0, 1026883059)
+    pring = scratch + 1300036
+    raw_set32(pring, 0, ring)
+    p1 = scratch + 1300040
+    raw_set64(p1, 0, pq)
+    raw_set64(p1, 8, pkv)
+    raw_set64(p1, 16, ps)
+    raw_set64(p1, 24, pn)
+    raw_set64(p1, 32, phh)
+    raw_set64(p1, 40, psc)
+    raw_set64(p1, 48, pring)
+    g1 = (64 * n + 255) / 256
+    cuda_launch(adf, g1, 1, 1, 256, 1, 1, 0, 0, p1)
+    // attn_softmax(s, sink, w, n, hh)
+    ps2 = scratch + 1300096
+    raw_set64(ps2, 0, gpu_s)
+    psk = scratch + 1300104
+    raw_set64(psk, 0, gpu_sink)
+    pw = scratch + 1300112
+    raw_set64(pw, 0, gpu_w)
+    pn2 = scratch + 1300120
+    raw_set32(pn2, 0, n)
+    ph2 = scratch + 1300124
+    raw_set32(ph2, 0, 64)
+    p2 = scratch + 1300128
+    raw_set64(p2, 0, ps2)
+    raw_set64(p2, 8, psk)
+    raw_set64(p2, 16, pw)
+    raw_set64(p2, 24, pn2)
+    raw_set64(p2, 32, ph2)
+    cuda_launch(asf, 64, 1, 1, 1, 1, 1, 0, 0, p2)
+    // attn_out(w, kv, out, n, hh)
+    pw2 = scratch + 1300176
+    raw_set64(pw2, 0, gpu_w)
+    pkv2 = scratch + 1300184
+    raw_set64(pkv2, 0, kv_cache)
+    po = scratch + 1300192
+    raw_set64(po, 0, gpu_outa)
+    pn3 = scratch + 1300200
+    raw_set32(pn3, 0, n)
+    ph3 = scratch + 1300204
+    raw_set32(ph3, 0, 64)
+    pring3 = scratch + 1300208
+    raw_set32(pring3, 0, ring)
+    p3 = scratch + 1300216
+    raw_set64(p3, 0, pw2)
+    raw_set64(p3, 8, pkv2)
+    raw_set64(p3, 16, po)
+    raw_set64(p3, 24, pn3)
+    raw_set64(p3, 32, ph3)
+    raw_set64(p3, 40, pring3)
+    cuda_launch(aof, 128, 1, 1, 256, 1, 1, 0, 0, p3)
+    cuda_memcpy_dtoh(attn_buf, gpu_outa, 32768 * 4)
+    hh = 0
+    Solange hh < 64
+        rope_reverse(attn_buf, hh * 512 + 448, cossin, t)
+        hh = hh + 1
+    Ende
+    Wenn raw_get32(cache, 3220) == 1 dann
+        qm = 0
+        qi = 0
+        Solange qi < 32768
+            qv = raw_get32(attn_buf, qi * 4)
+            qa = qv
+            Wenn fs_sign(qa) == 1 dann
+                qa = fs_neg(qa)
+            Ende
+            Wenn f32_gt(qa, qm) dann
+                qm = qa
+            Ende
+            qi = qi + 1
+        Ende
+        Ausgeben "DBG attn_bufmax="
+        Ausgeben qm
+        Ausgeben ""
+    Ende
+    // 分组 wo_a -> [8192] -> wo_b -> [4096]
+    g = 0
+    Solange g < 8
+        gemv_fp8(woa + g * 4194304, woas + g * 256, attn_buf + g * 4096 * 4, y + g * 1024 * 4, 1024, 4096, 32, gpu_lut8, mod8, func8, scratch, cache, cap)
+        g = g + 1
+    Ende
+    gemv_fp8(wob, wobs, y, out, 4096, 8192, 64, gpu_lut8, mod8, func8, scratch, cache, cap)
+    Wenn t == 0 dann
+        qm = 0
+        qi = 0
+        Solange qi < 4096
+            qv = raw_get32(out, qi * 4)
+            qa = qv
+            Wenn fs_sign(qa) == 1 dann
+                qa = fs_neg(qa)
+            Ende
+            Wenn f32_gt(qa, qm) dann
+                qm = qa
+            Ende
+            qi = qi + 1
+        Ende
+        Ausgeben "DBG outmax="
+        Ausgeben qm
+        Ausgeben ""
+    Ende
+    // 复制 out -> x
+    d = 0
+    Solange d < 4096
+        raw_set32(x, d * 4, raw_get32(out, d * 4))
+        d = d + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// MoE (单 token, hash 路由层0-2 / topk 路由层3+ + 6 专家 FP4 + shared FP8)
+Funktion moe_forward(x, token, ctx, scratch, cache, cap)
+    gatew = raw_get64(ctx, 176)
+    tid = raw_get64(ctx, 184)
+    eoff = raw_get64(ctx, 192)
+    data_start = raw_get64(ctx, 0)
+    shw1 = raw_get64(ctx, 200)
+    shw1s = raw_get64(ctx, 208)
+    shw2 = raw_get64(ctx, 216)
+    shw2s = raw_get64(ctx, 224)
+    shw3 = raw_get64(ctx, 232)
+    shw3s = raw_get64(ctx, 240)
+    mod4 = raw_get64(ctx, 256)
+    func4 = raw_get64(ctx, 264)
+    mod8 = raw_get64(ctx, 272)
+    func8 = raw_get64(ctx, 280)
+    modb = raw_get64(ctx, 288)
+    funcb = raw_get64(ctx, 296)
+    gpu_lut4 = raw_get64(ctx, 304)
+    gpu_lut8 = raw_get64(ctx, 312)
+    mode = raw_get32(ctx, 336)
+    gateb = raw_get64(ctx, 344)
+
+    HID = 4096
+    MID = 2048
+    TOPK = 6
+    LIMIT = 1092616192
+    NEGLIM = 3240099840
+    ROUTE = 1069547520
+    EPS = 841731191
+
+    scores = scratch + 98304
+    gemv_bf16p(gatew, x, scores, 256, HID, modb, funcb, cache, cap, scratch)
+    e = 0
+    Solange e < 256
+        sv = raw_get32(scores, e * 4)
+        sq = f32_sqrtsoftplus(sv)
+        raw_set32(scores, e * 4, sq)
+        e = e + 1
+    Ende
+    chosen = scratch + 99328
+    wts = scratch + 99352
+    sum = 0
+    Wenn mode == 0 dann
+        // hash 路由 (层0-2): eid = tid2eid[token*6+i]
+        i = 0
+        Solange i < 6
+            eid = raw_get64(tid, (token * 6 + i) * 8)
+            raw_set32(chosen, i * 4, eid)
+            sc = raw_get32(scores, eid * 4)
+            raw_set32(wts, i * 4, sc)
+            sum = f32_add(sum, sc)
+            i = i + 1
+        Ende
+    Sonst
+        // 普通 topk 路由 (层3+): key[e]=scores[e]+bias[e], 6 轮 argmax
+        key = scratch + 99376
+        e = 0
+        Solange e < 256
+            kv = f32_add(raw_get32(scores, e * 4), raw_get32(gateb, e * 4))
+            raw_set32(key, e * 4, kv)
+            e = e + 1
+        Ende
+        i = 0
+        Solange i < 6
+            maxk = raw_get32(key, 0)
+            maxi = 0
+            e = 1
+            Solange e < 256
+                kv = raw_get32(key, e * 4)
+                Wenn f32_gt(kv, maxk) dann
+                    maxk = kv
+                    maxi = e
+                Ende
+                e = e + 1
+            Ende
+            raw_set32(chosen, i * 4, maxi)
+            sc = raw_get32(scores, maxi * 4)
+            raw_set32(wts, i * 4, sc)
+            sum = f32_add(sum, sc)
+            raw_set32(key, maxi * 4, 4286578687)
+            i = i + 1
+        Ende
+    Ende
+    denom = f32_add(sum, EPS)
+    i = 0
+    Solange i < 6
+        w = raw_get32(wts, i * 4)
+        w = f32_mul(f32_div(w, denom), ROUTE)
+        raw_set32(wts, i * 4, w)
+        i = i + 1
+    Ende
+    y = scratch + 100400
+    d = 0
+    Solange d < HID
+        raw_set32(y, d * 4, 0)
+        d = d + 1
+    Ende
+    i = 0
+    Solange i < 6
+        eid = raw_get32(chosen, i * 4)
+        wo1 = data_start + raw_get64(eoff, (eid * 6 + 0) * 8)
+        wo2 = data_start + raw_get64(eoff, (eid * 6 + 1) * 8)
+        wo3 = data_start + raw_get64(eoff, (eid * 6 + 2) * 8)
+        so1 = data_start + raw_get64(eoff, (eid * 6 + 3) * 8)
+        so2 = data_start + raw_get64(eoff, (eid * 6 + 4) * 8)
+        so3 = data_start + raw_get64(eoff, (eid * 6 + 5) * 8)
+        gate = scratch + 116784
+        up = scratch + 124976
+        gemv_fp4(wo1, so1, x, gate, MID, HID, 128, gpu_lut4, mod4, func4, scratch, cache, cap)
+        gemv_fp4(wo3, so3, x, up, MID, HID, 128, gpu_lut4, mod4, func4, scratch, cache, cap)
+        d = 0
+        Solange d < MID
+            g = raw_get32(gate, d * 4)
+            u = raw_get32(up, d * 4)
+            Wenn fs_sign(g) == 0 dann
+                Wenn f32_gt(g, LIMIT) dann
+                    g = LIMIT
+                Ende
+            Ende
+            Wenn fs_sign(u) == 0 dann
+                Wenn f32_gt(u, LIMIT) dann
+                    u = LIMIT
+                Ende
+            Sonst
+                Wenn f32_lt(u, NEGLIM) dann
+                    u = NEGLIM
+                Ende
+            Ende
+            raw_set32(gate, d * 4, f32_mul(f32_silu(g), u))
+            d = d + 1
+        Ende
+        eo = scratch + 133168
+        gemv_fp4(wo2, so2, gate, eo, HID, MID, 64, gpu_lut4, mod4, func4, scratch, cache, cap)
+        wi = raw_get32(wts, i * 4)
+        d = 0
+        Solange d < HID
+            raw_set32(y, d * 4, f32_add(raw_get32(y, d * 4), f32_mul(wi, raw_get32(eo, d * 4))))
+            d = d + 1
+        Ende
+        i = i + 1
+    Ende
+    sgate = scratch + 149552
+    sup = scratch + 157744
+    gemv_fp8(shw1, shw1s, x, sgate, MID, HID, 32, gpu_lut8, mod8, func8, scratch, cache, cap)
+    gemv_fp8(shw3, shw3s, x, sup, MID, HID, 32, gpu_lut8, mod8, func8, scratch, cache, cap)
+    d = 0
+    Solange d < MID
+        g = raw_get32(sgate, d * 4)
+        u = raw_get32(sup, d * 4)
+        Wenn fs_sign(g) == 0 dann
+            Wenn f32_gt(g, LIMIT) dann
+                g = LIMIT
+            Ende
+        Ende
+        Wenn fs_sign(u) == 0 dann
+            Wenn f32_gt(u, LIMIT) dann
+                u = LIMIT
+            Ende
+        Sonst
+            Wenn f32_lt(u, NEGLIM) dann
+                u = NEGLIM
+            Ende
+        Ende
+        raw_set32(sgate, d * 4, f32_mul(f32_silu(g), u))
+        d = d + 1
+    Ende
+    shout = scratch + 165936
+    gemv_fp8(shw2, shw2s, sgate, shout, HID, MID, 16, gpu_lut8, mod8, func8, scratch, cache, cap)
+    d = 0
+    Solange d < HID
+        raw_set32(y, d * 4, f32_add(raw_get32(y, d * 4), raw_get32(shout, d * 4)))
+        d = d + 1
+    Ende
+    d = 0
+    Solange d < HID
+        raw_set32(x, d * 4, raw_get32(y, d * 4))
+        d = d + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 完整 Block: hidden[4,4096] 进 -> hidden[4,4096] 出 (原地)
+// head HC: 4 通道(16384) -> 4 门 -> y[4096] (复刻 mhc_pre prew 公式, 无 postw/comb)
+// x4: 16384 float 主机缓冲; hc_head_fn[4,16384]; hc_head_base[4]; hc_head_scale[1]; y: 4096 float
+Funktion hc_head_apply(x4, hc_head_fn, hc_head_base, hc_head_scale, y, mod32, func32, scratch)
+    gpu_w = cuda_mem_alloc(4 * 16384 * 4)
+    gpu_act = cuda_mem_alloc(16384 * 4)
+    gpu_out = cuda_mem_alloc(4 * 4)
+    cuda_memcpy_htod(gpu_w, hc_head_fn, 4 * 16384 * 4)
+    cuda_memcpy_htod(gpu_act, x4, 16384 * 4)
+    pw = scratch + 1310000
+    raw_set64(pw, 0, gpu_w)
+    pa = scratch + 1310008
+    raw_set64(pa, 0, gpu_act)
+    po = scratch + 1310016
+    raw_set64(po, 0, gpu_out)
+    pM = scratch + 1310024
+    raw_set32(pM, 0, 4)
+    pK = scratch + 1310028
+    raw_set32(pK, 0, 16384)
+    params = scratch + 1310032
+    raw_set64(params, 0, pw)
+    raw_set64(params, 8, pa)
+    raw_set64(params, 16, po)
+    raw_set64(params, 24, pM)
+    raw_set64(params, 32, pK)
+    cuda_launch(func32, 1, 1, 1, 32, 1, 1, 0, 0, params)
+    mixes = scratch + 1310080
+    cuda_memcpy_dtoh(mixes, gpu_out, 4 * 4)
+    cuda_mem_free(gpu_w)
+    cuda_mem_free(gpu_act)
+    cuda_mem_free(gpu_out)
+    // rsqrt = 1/sqrt(mean(x4^2) + norm_eps), 复刻参考 HyperConnectionHead
+    hacc = 0
+    hi = 0
+    Solange hi < 16384
+        hv = raw_get32(x4, hi * 4)
+        hacc = f32_add(hacc, f32_mul(hv, hv))
+        hi = hi + 1
+    Ende
+    hmean = f32_div(hacc, s32_to_f32(16384))
+    hrsqrt = f32_div(1065353216, f32_sqrt(f32_add(hmean, 897988541)))
+    // mixes *= rsqrt
+    mc = 0
+    Solange mc < 4
+        raw_set32(mixes, mc * 4, f32_mul(raw_get32(mixes, mc * 4), hrsqrt))
+        mc = mc + 1
+    Ende
+    s = raw_get32(hc_head_scale, 0)
+    eps = 897988541
+    gate = scratch + 1310096
+    c = 0
+    Solange c < 4
+        v = raw_get32(mixes, c * 4)
+        b = raw_get32(hc_head_base, c * 4)
+        raw_set32(gate, c * 4, f32_add(sigmoid_bits(f32_add(f32_mul(v, s), b)), eps))
+        c = c + 1
+    Ende
+    d = 0
+    Solange d < 4096
+        a = 0
+        c = 0
+        Solange c < 4
+            a = f32_add(a, f32_mul(raw_get32(gate, c * 4), raw_get32(x4, (c * 4096 + d) * 4)))
+            c = c + 1
+        Ende
+        raw_set32(y, d * 4, a)
+        d = d + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion block_forward(ctx, hidden, kv_cache, t, token, scratch, cache, cap)
+    hc_attn_fn = raw_get64(ctx, 128)
+    hc_attn_base = raw_get64(ctx, 136)
+    hc_attn_scale = raw_get64(ctx, 144)
+    hc_ffn_fn = raw_get64(ctx, 152)
+    hc_ffn_base = raw_get64(ctx, 160)
+    hc_ffn_scale = raw_get64(ctx, 168)
+    attn_norm_w = raw_get64(ctx, 112)
+    ffn_norm_w = raw_get64(ctx, 120)
+    mod32 = raw_get64(ctx, 320)
+    func32 = raw_get64(ctx, 328)
+
+    // 临时缓冲全部从 scratch 池分配 (避免 gen 0 运行时 host alloc 越过已 COMMIT 堆区)
+    // 布局: x=scratch[0..16KB] | hidden_mid=scratch[16KB..80KB] | prew/postw/comb/prew2/postw2/comb2=[80KB..81KB]
+    //       attn_forward/moe_forward 从 scratch+98304 起, gemv_fp8 powbuf 从 scratch+1048576 起
+    sp = scratch
+    x = sp
+    sp = sp + 16384
+    hidden_mid = sp
+    sp = sp + 65536
+    prew = sp
+    sp = sp + 16
+    postw = sp
+    sp = sp + 16
+    comb = sp
+    sp = sp + 64
+    prew2 = sp
+    sp = sp + 16
+    postw2 = sp
+    sp = sp + 16
+    comb2 = sp
+    sp = sp + 64
+    // hc_mult=4: 每个位置 t 有 4 个并行隐藏态副本 [copy,4096] = 16384 浮点
+    //   布局: 位置 t 的 4 副本在 hidden + t*65536 (65536 字节 = 16384 浮点)
+    //   (参考模型 hidden_states [seq, hc_mult, hidden], 嵌入后 4 副本为广播复制)
+    hb = hidden + t * 65536
+
+    // ---- Attention 半 ----
+    ta = tick_ms()
+    mhc_pre(hb, hc_attn_fn, hc_attn_base, hc_attn_scale, prew, postw, comb, x, 0, mod32, func32)
+    Wenn raw_get32(cache, 3220) == 1 dann
+        xm = 0
+        xi = 0
+        Solange xi < 4096
+            xv = raw_get32(x, xi * 4)
+            xa = xv
+            Wenn fs_sign(xa) == 1 dann
+                xa = fs_neg(xa)
+            Ende
+            Wenn f32_gt(xa, xm) dann
+                xm = xa
+            Ende
+            xi = xi + 1
+        Ende
+        Ausgeben "DBG xmax@t"
+        Ausgeben t
+        Ausgeben "="
+        Ausgeben xm
+        Ausgeben ""
+    Ende
+    Wenn t == 0 dann
+        xm = 0
+        xi = 0
+        Solange xi < 4096
+            xv = raw_get32(x, xi * 4)
+            xa = xv
+            Wenn fs_sign(xa) == 1 dann
+                xa = fs_neg(xa)
+            Ende
+            Wenn f32_gt(xa, xm) dann
+                xm = xa
+            Ende
+            xi = xi + 1
+        Ende
+        Ausgeben "DBG pre_attn max="
+        Ausgeben xm
+        Ausgeben ""
+    Ende
+    rmsnorm_w(attn_norm_w, x, 4096)
+    attn_forward(x, kv_cache, t, ctx, scratch, cache, cap)
+    Wenn t == 0 dann
+        xm = 0
+        xi = 0
+        Solange xi < 4096
+            xv = raw_get32(x, xi * 4)
+            xa = xv
+            Wenn fs_sign(xa) == 1 dann
+                xa = fs_neg(xa)
+            Ende
+            Wenn f32_gt(xa, xm) dann
+                xm = xa
+            Ende
+            xi = xi + 1
+        Ende
+        Ausgeben "DBG post_attn max="
+        Ausgeben xm
+        Ausgeben ""
+    Ende
+    mhc_post(x, hb, postw, comb, hidden_mid)
+    tattn = tick_ms() - ta
+    // ---- FFN/MoE 半 ----
+    tm = tick_ms()
+    mhc_pre(hidden_mid, hc_ffn_fn, hc_ffn_base, hc_ffn_scale, prew2, postw2, comb2, x, 0, mod32, func32)
+    rmsnorm_w(ffn_norm_w, x, 4096)
+    moe_forward(x, token, ctx, scratch, cache, cap)
+    Wenn t == 0 dann
+        xm = 0
+        xi = 0
+        Solange xi < 4096
+            xv = raw_get32(x, xi * 4)
+            xa = xv
+            Wenn fs_sign(xa) == 1 dann
+                xa = fs_neg(xa)
+            Ende
+            Wenn f32_gt(xa, xm) dann
+                xm = xa
+            Ende
+            xi = xi + 1
+        Ende
+        Ausgeben "DBG post_moe max="
+        Ausgeben xm
+        Ausgeben ""
+    Ende
+    mhc_post(x, hidden_mid, postw2, comb2, hb)
+    tmoe = tick_ms() - tm
+    raw_set64(cache, 3136, raw_get64(cache, 3136) + tattn)
+    raw_set64(cache, 3144, raw_get64(cache, 3144) + tmoe)
+    gebe_zurueck 0
+Ende

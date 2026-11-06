@@ -1,0 +1,415 @@
+// html.staro - HTML 解析模块
+
+Funktion strip_html_tags(html)
+    len = str_len(html)
+    result = alloc(8 + len + 1)
+    pos = 0
+    i = 0
+    in_tag = 0
+
+    Solange i < len
+        ch = str_at(html, i)
+        Wenn in_tag == 0
+            Wenn ch == 60
+                in_tag = 1
+                i = i + 1
+            Sonst
+                Wenn ch > 32
+                    raw_setbyte(result, 8 + pos, ch)
+                    pos = pos + 1
+                Sonst
+                    raw_setbyte(result, 8 + pos, 32)
+                    pos = pos + 1
+                Ende
+                i = i + 1
+            Ende
+        Sonst
+            Wenn ch == 62
+                in_tag = 0
+                raw_setbyte(result, 8 + pos, 32)
+                pos = pos + 1
+            Ende
+            i = i + 1
+        Ende
+    Ende
+
+    raw_setbyte(result, 0, pos % 256)
+    raw_setbyte(result, 1, (pos / 256) % 256)
+    raw_setbyte(result, 2, (pos / 65536) % 256)
+    raw_setbyte(result, 3, (pos / 16777216) % 256)
+    raw_setbyte(result, 8 + pos, 0)
+    gebe_zurueck result
+Ende
+
+Funktion remove_extra_spaces(str)
+    len = str_len(str)
+    result = alloc(8 + len + 1)
+    pos = 0
+    i = 0
+    last_space = 1
+
+    Solange i < len
+        ch = str_at(str, i)
+        Wenn ch == 32
+            Wenn last_space == 0
+                raw_setbyte(result, 8 + pos, 32)
+                pos = pos + 1
+                last_space = 1
+            Ende
+        Sonst
+            raw_setbyte(result, 8 + pos, ch)
+            pos = pos + 1
+            last_space = 0
+        Ende
+        i = i + 1
+    Ende
+
+    raw_setbyte(result, 0, pos % 256)
+    raw_setbyte(result, 1, (pos / 256) % 256)
+    raw_setbyte(result, 2, (pos / 65536) % 256)
+    raw_setbyte(result, 3, (pos / 16777216) % 256)
+    raw_setbyte(result, 8 + pos, 0)
+    gebe_zurueck result
+Ende
+
+// 移除 <script> 和 <style> 块及其内容
+Funktion remove_script_style(html)
+    len = str_len(html)
+    result = alloc(8 + len + 1)
+    pos = 0
+    i = 0
+    skip_mode = 0  // 0=normal, 1=skip_script, 2=skip_style
+
+    Solange i < len
+        ch = str_at(html, i)
+
+        Wenn skip_mode == 0
+            // 检查是否是 <script 或 <style 开始
+            Wenn ch == 60
+                // 查找 script 或 style
+                Wenn i + 7 < len und str_ieq_at(html, i + 1, "script")
+                    // 跳到 > 之后
+                    Solange i < len und str_at(html, i) != 62
+                        i = i + 1
+                    Ende
+                    i = i + 1
+                    skip_mode = 1
+                Sonst
+                    Wenn i + 6 < len und str_ieq_at(html, i + 1, "style")
+                        // 跳到 > 之后
+                        Solange i < len und str_at(html, i) != 62
+                            i = i + 1
+                        Ende
+                        i = i + 1
+                        skip_mode = 2
+                    Sonst
+                        raw_setbyte(result, 8 + pos, ch)
+                        pos = pos + 1
+                        i = i + 1
+                    Ende
+                Ende
+            Sonst
+                raw_setbyte(result, 8 + pos, ch)
+                pos = pos + 1
+                i = i + 1
+            Ende
+        Sonst
+            // 查找结束标签
+            Wenn skip_mode == 1
+                // 查找 </script>
+                Wenn i + 9 < len und str_ieq_at(html, i, "</script>")
+                    i = i + 9
+                    skip_mode = 0
+                Sonst
+                    i = i + 1
+                Ende
+            Sonst
+                // skip_mode == 2, 查找 </style>
+                Wenn i + 8 < len und str_ieq_at(html, i, "</style>")
+                    i = i + 8
+                    skip_mode = 0
+                Sonst
+                    i = i + 1
+                Ende
+            Ende
+        Ende
+    Ende
+
+    raw_setbyte(result, 0, pos % 256)
+    raw_setbyte(result, 1, (pos / 256) % 256)
+    raw_setbyte(result, 2, (pos / 65536) % 256)
+    raw_setbyte(result, 3, (pos / 16777216) % 256)
+    raw_setbyte(result, 8 + pos, 0)
+   gebe_zurueck result
+Ende
+
+// 提取所有 href 链接
+Funktion extract_all_links(html)
+    len = str_len(html)
+    result = alloc(8 + len + 1)
+    pos = 0
+    i = 0
+
+    Solange i < len
+        // 查找 "href=" (5 chars)
+        Wenn i + 4 < len und str_ieq_at(html, i, "href=")
+            j = i + 5
+            // 跳过空格
+            Solange j < len und str_at(html, j) == 32
+                j = j + 1
+            Ende
+            // 检查双引号
+            Wenn j < len und str_at(html, j) == 34
+                j = j + 1
+                url_start = j
+                // 找到闭合引号
+                Solange j < len und str_at(html, j) != 34
+                    j = j + 1
+                Ende
+                url_len = j - url_start
+                // 复制 URL
+                k = 0
+                Solange k < url_len
+                    raw_setbyte(result, 8 + pos, str_at(html, url_start + k))
+                    pos = pos + 1
+                    k = k + 1
+                Ende
+                raw_setbyte(result, 8 + pos, 10)  // 换行
+                pos = pos + 1
+                i = j + 1
+            Sonst
+                i = i + 1
+            Ende
+        Sonst
+            i = i + 1
+        Ende
+    Ende
+
+    raw_setbyte(result, 0, pos % 256)
+    raw_setbyte(result, 1, (pos / 256) % 256)
+    raw_setbyte(result, 2, (pos / 65536) % 256)
+    raw_setbyte(result, 3, (pos / 16777216) % 256)
+    raw_setbyte(result, 8 + pos, 0)
+    gebe_zurueck result
+Ende
+
+Funktion extract_href(html)
+   gebe_zurueck ""
+Ende
+
+Funktion extract_href_at(html, start)
+   gebe_zurueck ""
+Ende
+
+// 提取时间信息 - 查找日期时间模式
+Funktion extract_time_info(html)
+    // 先去除 HTML 标签
+    text = strip_html_tags(html)
+    text = remove_extra_spaces(text)
+    len = str_len(text)
+
+    result = alloc(8 + len + 1)
+    pos = 0
+    i = 0
+    found_any = 0
+
+    Solange i < len
+        ch = str_at(text, i)
+
+        // 查找 "年" (UTF-8: E5 8D 87)
+        Wenn i + 2 < len und str_at(text, i) == 229 und str_at(text, i+1) == 141 und str_at(text, i+2) == 135
+            // 提取前后文本
+            start = i - 5
+            Wenn start < 0
+                start = 0
+            Ende
+            end = i + 5
+            Wenn end > len - 1
+                end = len - 1
+            Ende
+            extract_len = end - start + 1
+            k = 0
+            Solange k < extract_len
+                raw_setbyte(result, 8 + pos, str_at(text, start + k))
+                pos = pos + 1
+                k = k + 1
+            Ende
+            raw_setbyte(result, 8 + pos, 10)
+            pos = pos + 1
+            found_any = 1
+            i = i + 3
+        Sonst
+            // 查找时间模式 HH:MM (数字:数字)
+            Wenn i + 4 < len und str_at(text, i+1) == 58
+                // 检查 i 和 i+2 是数字
+                d1 = str_at(text, i)
+                d2 = str_at(text, i+2)
+                Wenn d1 >= 48 und d1 <= 57 und d2 >= 48 und d2 <= 57
+                    start = i - 2
+                    Wenn start < 0
+                        start = 0
+                    Ende
+                    end = i + 4
+                    Wenn end > len - 1
+                        end = len - 1
+                    Ende
+                    extract_len = end - start + 1
+                    k = 0
+                    Solange k < extract_len
+                        raw_setbyte(result, 8 + pos, str_at(text, start + k))
+                        pos = pos + 1
+                        k = k + 1
+                    Ende
+                    raw_setbyte(result, 8 + pos, 10)
+                    pos = pos + 1
+                    found_any = 1
+                    i = i + 4
+                Sonst
+                    i = i + 1
+                Ende
+            Sonst
+                i = i + 1
+            Ende
+        Ende
+    Ende
+
+    Wenn found_any == 0
+        pos = 0
+    Ende
+
+    raw_setbyte(result, 0, pos % 256)
+    raw_setbyte(result, 1, (pos / 256) % 256)
+    raw_setbyte(result, 2, (pos / 65536) % 256)
+    raw_setbyte(result, 3, (pos / 16777216) % 256)
+    raw_setbyte(result, 8 + pos, 0)
+   gebe_zurueck result
+Ende
+
+// ============ 文章内容提取 ============
+
+// 提取文章内容（从搜索结果的 <body> 中提取主要文本）
+// 返回最多 max_len 字符的内容
+Funktion extract_article_content(html, max_len)
+    // 先移除 script/style
+    body = remove_script_style(html)
+
+    // 查找 <body> 开始位置
+    body_pos = str_find(body, "<body")
+    Wenn body_pos < 0
+        body_pos = str_find(body, "<BODY")
+    Ende
+
+    // 找到 body 标签的 > 开始内容
+    i = body_pos
+    body_start = 0
+    Solange i < str_len(body)
+        Wenn str_at(body, i) == 62
+            body_start = i + 1
+            i = 999999
+        Ende
+        i = i + 1
+    Ende
+
+    // 如果没找到 body，使用整个内容
+    Wenn body_start == 0
+        body_start = 0
+    Ende
+
+    // 提取 body 内容
+    body_len = str_len(body)
+    content_len = body_len - body_start
+    Wenn content_len < 0
+        content_len = 0
+    Ende
+
+    // 去除 HTML 标签
+    clean_text = strip_html_tags(str_substr(body, body_start, content_len))
+    clean_text = remove_extra_spaces(clean_text)
+
+    // 截断到最大长度
+    result = truncate_str(clean_text, max_len)
+   gebe_zurueck result
+Ende
+
+// ============ 图片提取 ============
+
+// 提取图片链接（最多 max_count 张）
+Funktion extract_images(html, max_count)
+    len = str_len(html)
+    result = alloc(8 + len + 1)
+    pos = 0
+    i = 0
+    count = 0
+
+    Solange i < len und count < max_count
+        // 查找 "src=" (4 chars)
+        Wenn i + 3 < len und str_ieq_at(html, i, "src=")
+            j = i + 4
+            // 跳过空格
+            Solange j < len und str_at(html, j) == 32
+                j = j + 1
+            Ende
+            // 检查双引号
+            Wenn j < len und str_at(html, j) == 34
+                j = j + 1
+                url_start = j
+                // 找到闭合引号
+                Solange j < len und str_at(html, j) != 34
+                    j = j + 1
+                Ende
+                url_len = j - url_start
+
+                // 过滤：只保留图片扩展名的链接
+                // 检查是否以 .jpg, .jpeg, .png, .gif, .webp, .bmp 结尾
+                is_img = 0
+                Wenn url_len > 4 und str_ieq_at(html, j - 4, ".jpg")
+                    is_img = 1
+                Ende
+                Wenn url_len > 5 und str_ieq_at(html, j - 5, ".jpeg")
+                    is_img = 1
+                Ende
+                Wenn url_len > 4 und str_ieq_at(html, j - 4, ".png")
+                    is_img = 1
+                Ende
+                Wenn url_len > 4 und str_ieq_at(html, j - 4, ".gif")
+                    is_img = 1
+                Ende
+                Wenn url_len > 5 und str_ieq_at(html, j - 5, ".webp")
+                    is_img = 1
+                Ende
+
+                // 也保留常见图片服务器链接
+                Wenn is_img == 0 und url_len > 8 und str_ieq_at(html, url_start, "data:image")
+                    is_img = 1
+                Ende
+
+                Wenn is_img == 1
+                    // 复制 URL
+                    k = 0
+                    Solange k < url_len
+                        raw_setbyte(result, 8 + pos, str_at(html, url_start + k))
+                        pos = pos + 1
+                        k = k + 1
+                    Ende
+                    raw_setbyte(result, 8 + pos, 10)  // 换行
+                    pos = pos + 1
+                    count = count + 1
+                    i = j + 1
+                Sonst
+                    i = j + 1
+                Ende
+            Sonst
+                i = j + 1
+            Ende
+        Sonst
+            i = i + 1
+        Ende
+    Ende
+
+    raw_setbyte(result, 0, pos % 256)
+    raw_setbyte(result, 1, (pos / 256) % 256)
+    raw_setbyte(result, 2, (pos / 65536) % 256)
+    raw_setbyte(result, 3, (pos / 16777216) % 256)
+    raw_setbyte(result, 8 + pos, 0)
+   gebe_zurueck result
+Ende

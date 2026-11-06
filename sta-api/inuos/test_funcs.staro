@@ -1,0 +1,30 @@
+// test_funcs.staro - 测试函数实现
+// 简单的函数实现，测试 inuos 目录功能
+
+// 加法函数
+Funktion add(a, b)
+    gebe_zurueck a + b
+Ende
+
+// 乘法函数
+Funktion multiply(a, b)
+    gebe_zurueck a * b
+Ende
+
+// 字符串连接函数
+Funktion concat_str(s1, s2)
+    gebe_zurueck s1 + s2
+Ende
+
+// 比较函数
+Funktion compare(a, b)
+    Wenn a > b dann
+        gebe_zurueck 1
+    Sonst
+        Wenn a < b dann
+            gebe_zurueck -1
+        Sonst
+            gebe_zurueck 0
+        Ende
+    Ende
+Ende

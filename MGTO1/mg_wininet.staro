@@ -1,0 +1,78 @@
+// ============================================================================
+//  MGTO1 :: mg_wininet.staro —— HTTPS/HTTP 下载客户端（WinInet，系统内置 TLS，零第三方）
+//  WinHTTP 在本机实测无法读取响应体（连 example.com 都 TOTAL=0），故改用 WinInet。
+//  WinInet 是 ANSI API（A 版），无需 UTF-16 转换；InternetReadFile 阻塞等待数据。
+//  .starc 正文禁止 linx；全部能力在此层。
+// ============================================================================
+
+linx "wininet.dll!InternetOpenA"
+linx "wininet.dll!InternetConnectA"
+linx "wininet.dll!HttpOpenRequestA"
+linx "wininet.dll!HttpSendRequestA"
+linx "wininet.dll!InternetReadFile"
+linx "wininet.dll!InternetCloseHandle"
+linx "wininet.dll!HttpQueryInfoA"
+linx "kernel32.dll!GetLastError"
+
+// ---- 常量 ----
+// INTERNET_OPEN_TYPE_DIRECT = 1
+// INTERNET_SERVICE_HTTP = 3
+// INTERNET_FLAG_SECURE = 0x00800000 = 8388608
+
+// HTTPS/HTTP GET host:port/path -> outbuf（cap 容量），字节数写回 olen(8字节)。
+// host/path 为 C 串裸指针。返回 0 成功 / 负错误码。
+Funktion dl_get_wi(host, port, path, outbuf, cap, olen)
+    raw_set64(olen, 0, 0)
+    sess = InternetOpenA(mg_cstr("MGTO1/0.1"), 1, 0, 0, 0)
+    Wenn sess == 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    conn = InternetConnectA(sess, host, port, 0, 0, 3, 0, 0)
+    Wenn conn == 0 dann
+        InternetCloseHandle(sess)
+        gebe_zurueck 0 - 2
+    Ende
+    req = HttpOpenRequestA(conn, mg_cstr("GET"), path, 0, 0, 0, 8388608, 0)
+    Wenn req == 0 dann
+        InternetCloseHandle(conn)
+        InternetCloseHandle(sess)
+        gebe_zurueck 0 - 3
+    Ende
+    ok = HttpSendRequestA(req, 0, 0, 0, 0)
+    Wenn ok == 0 dann
+        InternetCloseHandle(req)
+        InternetCloseHandle(conn)
+        InternetCloseHandle(sess)
+        gebe_zurueck 0 - 4
+    Ende
+    total = 0
+    lauf = 1
+    nb = alloc(8)
+    Solange lauf == 1
+        mem_zero(nb, 8)
+        chunk = 65536
+        Wenn total + chunk > cap dann
+            chunk = cap - total
+        Ende
+        Wenn chunk <= 0 dann
+            lauf = 0
+        Sonst
+            r = InternetReadFile(req, outbuf + total, chunk, nb)
+            got = raw_get64(nb, 0)
+            Wenn r == 0 dann
+                lauf = 0
+            Sonst
+                Wenn got == 0 dann
+                    lauf = 0
+                Sonst
+                    total = total + got
+                Ende
+            Ende
+        Ende
+    Ende
+    raw_set64(olen, 0, total)
+    InternetCloseHandle(req)
+    InternetCloseHandle(conn)
+    InternetCloseHandle(sess)
+    gebe_zurueck 0
+Ende

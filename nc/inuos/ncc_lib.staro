@@ -1,0 +1,385 @@
+// ============================================================================
+//  nc :: inuos/ncc_lib.staro
+//  starc-Compiler 自身能力库（能力实现层）
+//  编译器源码（ncc_*.starc）零内建，只用本库函数。
+//  本库是"能力实现层"，允许使用底层 CPU 运算（+ - * / 等）。
+//  铁律 E：只用 alloc/raw_setbyte/raw_byteat + linx-o。
+// ============================================================================
+
+linx-o kernel32 GetStdHandle WriteFile GetCommandLineA
+linx-o kernel32 CreateFileA ReadFile GetFileSize CloseHandle
+linx-o kernel32 GetCurrentDirectoryA SetCurrentDirectoryA FindFirstFileA FindNextFileA
+linx-o kernel32 VirtualAlloc VirtualFree
+linx-o msvcrt malloc free
+
+// ---------- 数学（能力实现层，允许 + - * /）----------
+
+Funktion mathe_add(a, b)
+    gebe_zurueck a + b
+Ende
+
+Funktion mathe_sub(a, b)
+    gebe_zurueck a - b
+Ende
+
+Funktion mathe_mul(a, b)
+    gebe_zurueck a * b
+Ende
+
+Funktion mathe_div(a, b)
+    gebe_zurueck a / b
+Ende
+
+Funktion mathe_neg(a)
+    gebe_zurueck 0 - a
+Ende
+
+Funktion mathe_eq(a, b)
+    Wenn a == b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_ne(a, b)
+    Wenn a != b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_lt(a, b)
+    Wenn a < b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_gt(a, b)
+    Wenn a > b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_le(a, b)
+    Wenn a <= b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion mathe_ge(a, b)
+    Wenn a >= b dann
+        gebe_zurueck 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---------- 字符串 ----------
+
+Funktion str_len(s)
+    i = 0
+    Solange raw_byteat(s, 8 + i) != 0
+        i = i + 1
+    Ende
+    gebe_zurueck i
+Ende
+
+Funktion str_copy(s)
+    n = str_len(s)
+    buf = alloc(8 + n + 1)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, 8 + i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 0, n % 256)
+    raw_setbyte(buf, 1, (n / 256) % 256)
+    raw_setbyte(buf, 2, (n / 65536) % 256)
+    raw_setbyte(buf, 3, (n / 16777216) % 256)
+    raw_setbyte(buf, 8 + n, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion str_eq(s1, s2)
+    n1 = str_len(s1)
+    n2 = str_len(s2)
+    Wenn n1 != n2 dann
+        gebe_zurueck 0
+    Ende
+    i = 0
+    Solange i < n1
+        Wenn raw_byteat(s1, 8 + i) != raw_byteat(s2, 8 + i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+Funktion str_concat(s1, s2)
+    n1 = str_len(s1)
+    n2 = str_len(s2)
+    buf = alloc(8 + n1 + n2 + 1)
+    i = 0
+    Solange i < n1
+        raw_setbyte(buf, 8 + i, raw_byteat(s1, 8 + i))
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < n2
+        raw_setbyte(buf, 8 + n1 + i, raw_byteat(s2, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 0, (n1 + n2) % 256)
+    raw_setbyte(buf, 1, ((n1 + n2) / 256) % 256)
+    raw_setbyte(buf, 2, ((n1 + n2) / 65536) % 256)
+    raw_setbyte(buf, 3, ((n1 + n2) / 16777216) % 256)
+    raw_setbyte(buf, 8 + n1 + n2, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion str_slice(s, start, len)
+    buf = alloc(8 + len + 1)
+    raw_setbyte(buf, 0, len % 256)
+    raw_setbyte(buf, 1, (len / 256) % 256)
+    raw_setbyte(buf, 2, (len / 65536) % 256)
+    raw_setbyte(buf, 3, (len / 16777216) % 256)
+    i = 0
+    Solange i < len
+        raw_setbyte(buf, 8 + i, raw_byteat(s, 8 + start + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 8 + len, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion str_at(s, pos)
+    gebe_zurueck raw_byteat(s, 8 + pos)
+Ende
+
+// C 字符串 -> StarC 字符串
+Funktion cstr_to_starc(c)
+    n = 0
+    Solange raw_byteat(c, n) != 0
+        n = n + 1
+    Ende
+    buf = alloc(8 + n + 1)
+    raw_setbyte(buf, 0, n % 256)
+    raw_setbyte(buf, 1, (n / 256) % 256)
+    raw_setbyte(buf, 2, (n / 65536) % 256)
+    raw_setbyte(buf, 3, (n / 16777216) % 256)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, 8 + i, raw_byteat(c, i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 8 + n, 0)
+    gebe_zurueck buf
+Ende
+
+// StarC 字符串 -> C 字符串（裸指针）
+Funktion starc_to_cstr(s)
+    n = str_len(s)
+    buf = alloc(n + 1)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, n, 0)
+    gebe_zurueck buf
+Ende
+
+// ---------- 控制台 ----------
+
+Funktion get_stdout()
+    gebe_zurueck GetStdHandle(-11)
+Ende
+
+Funktion write_str(s)
+    WriteFile(get_stdout(), s + 8, str_len(s), 0, 0)
+    gebe_zurueck 0
+Ende
+
+Funktion write_newline()
+    nl = alloc(1)
+    raw_setbyte(nl, 0, 10)
+    WriteFile(get_stdout(), nl, 1, 0, 0)
+    gebe_zurueck 0
+Ende
+
+Funktion int_to_str(num)
+    Wenn num == 0 dann
+        buf = alloc(10)
+        raw_setbyte(buf, 0, 1)
+        raw_setbyte(buf, 1, 0)
+        raw_setbyte(buf, 2, 0)
+        raw_setbyte(buf, 3, 0)
+        raw_setbyte(buf, 12, 48)
+        raw_setbyte(buf, 13, 0)
+        gebe_zurueck buf
+    Ende
+    neg = 0
+    Wenn num < 0 dann
+        neg = 1
+        num = 0 - num
+    Ende
+    digits = alloc(24)
+    di = 0
+    Solange num > 0
+        raw_setbyte(digits, di, num % 10)
+        di = di + 1
+        num = num / 10
+    Ende
+    buf = alloc(24)
+    pos = 0
+    Wenn neg == 1 dann
+        raw_setbyte(buf, 8 + pos, 45)
+        pos = pos + 1
+    Ende
+    i = di - 1
+    Solange i >= 0
+        raw_setbyte(buf, 8 + pos, raw_byteat(digits, i) + 48)
+        pos = pos + 1
+        i = i - 1
+    Ende
+    raw_setbyte(buf, 0, pos % 256)
+    raw_setbyte(buf, 1, (pos / 256) % 256)
+    raw_setbyte(buf, 2, (pos / 65536) % 256)
+    raw_setbyte(buf, 3, (pos / 16777216) % 256)
+    raw_setbyte(buf, 8 + pos, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion write_int(num)
+    write_str(int_to_str(num))
+    gebe_zurueck 0
+Ende
+
+// ---------- 文件读取（能力实现层）----------
+
+// 读整个文件到内存（StarC 字符串），失败返回 0
+Funktion file_read(path)
+    h = CreateFileA(starc_to_cstr(path), 0x80000000, 1, 0, 3, 0x80, 0)
+    Wenn mathe_eq(h, -1) == 1 dann
+        gebe_zurueck 0
+    Ende
+    size = GetFileSize(h, 0)
+    buf = alloc(8 + size + 1)
+    read = alloc(4)
+    ok = ReadFile(h, buf + 8, size, read, 0)
+    CloseHandle(h)
+    raw_setbyte(buf, 0, size % 256)
+    raw_setbyte(buf, 1, (size / 256) % 256)
+    raw_setbyte(buf, 2, (size / 65536) % 256)
+    raw_setbyte(buf, 3, (size / 16777216) % 256)
+    raw_setbyte(buf, 8 + size, 0)
+    gebe_zurueck buf
+Ende
+
+// 把 StarC 字符串数据写入文件（覆盖），返回 1 成功 0 失败
+Funktion file_write(path, data)
+    h = CreateFileA(starc_to_cstr(path), 0x40000000, 0, 0, 2, 0x80, 0)
+    Wenn mathe_eq(h, -1) == 1 dann
+        gebe_zurueck 0
+    Ende
+    n = str_len(data)
+    written = alloc(4)
+    WriteFile(h, data + 8, n, written, 0)
+    CloseHandle(h)
+    gebe_zurueck 1
+Ende
+
+// ---------- 命令行 ----------
+
+Funktion get_cmdline_cstr()
+    gebe_zurueck GetCommandLineA()
+Ende
+
+// 从 C 字符串 start 取下一个参数（StarC 字符串）
+Funktion extract_arg(c, start)
+    Solange raw_byteat(c, start) == 32
+        start = start + 1
+    Ende
+    e = start
+    f = 0
+    ch = raw_byteat(c, e)
+    Solange f == 0
+        Wenn ch == 32 dann
+            f = 1
+        Sonst
+            Wenn ch == 0 dann
+                f = 1
+            Sonst
+                e = e + 1
+                ch = raw_byteat(c, e)
+            Ende
+        Ende
+    Ende
+    n = e - start
+    buf = alloc(8 + n + 1)
+    raw_setbyte(buf, 0, n % 256)
+    raw_setbyte(buf, 1, (n / 256) % 256)
+    raw_setbyte(buf, 2, (n / 65536) % 256)
+    raw_setbyte(buf, 3, (n / 16777216) % 256)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, 8 + i, raw_byteat(c, start + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 8 + n, 0)
+    gebe_zurueck buf
+Ende
+
+// C 字符串追加：把 StarC 字符串 s 的数据写到 buf 的 off 处，返回新 off
+Funktion cstr_append(buf, off, s)
+    n = str_len(s)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, off, raw_byteat(s, 8 + i))
+        off = off + 1
+        i = i + 1
+    Ende
+    gebe_zurueck off
+Ende
+
+// ---------- 64 位指针读写（避免超大字面量，逐字节移位）----------
+
+// 写 8 字节小端到 buf+off，v 为 64 位值
+Funktion ptr_set64(buf, off, v)
+    i = 0
+    Solange i < 8
+        raw_setbyte(buf, off + i, v % 256)
+        v = v / 256
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 读 8 字节小端从 buf+off
+Funktion ptr_get64(buf, off)
+    v = 0
+    i = 7
+    Solange i >= 0
+        v = v * 256
+        v = v + raw_byteat(buf, off + i)
+        i = i - 1
+    Ende
+    gebe_zurueck v
+Ende
+
+// 写 4 字节小端到 buf+off
+Funktion ptr_set32(buf, off, v)
+    raw_setbyte(buf, off, v % 256)
+    raw_setbyte(buf, off + 1, (v / 256) % 256)
+    raw_setbyte(buf, off + 2, (v / 65536) % 256)
+    raw_setbyte(buf, off + 3, (v / 16777216) % 256)
+    gebe_zurueck 0
+Ende
+
+// 读 4 字节小端从 buf+off
+Funktion ptr_get32(buf, off)
+    gebe_zurueck raw_byteat(buf, off) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+Ende

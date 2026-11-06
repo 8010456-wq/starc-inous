@@ -1,0 +1,44 @@
+// inuos/codegen.staro - RPN -> x64 汇编 (栈式)
+// 数字 -> push <imm>; 运算符 -> pop rcx(右) pop rax(左) op eax,ecx push rax; 结束 pop rax
+// 依赖: emit.staro(emit_str/emit_int/emit_nl/emit_line), sys.staro(raw_get32)
+
+// RPN -> x64 汇编, 返回新 off
+Funktion codegen_rpn(rpn, rn, out, off)
+    i = 0
+    Solange i < rn
+        base = i * 8
+        t = raw_get32(rpn, base)
+        v = raw_get32(rpn, base + 4)
+        Wenn t == 1 dann  // 数字 -> push v
+            off = emit_str(out, off, "push ")
+            off = emit_int(out, off, v)
+            off = emit_nl(out, off)
+        Sonst
+            Wenn t == 4 dann  // 运算符
+                off = emit_line(out, off, "pop rcx")
+                off = emit_line(out, off, "pop rax")
+                Wenn v == 43 dann
+                    off = emit_line(out, off, "add eax, ecx")
+                Sonst
+                    Wenn v == 45 dann
+                        off = emit_line(out, off, "sub eax, ecx")
+                    Sonst
+                        Wenn v == 42 dann
+                            off = emit_line(out, off, "imul eax, ecx")
+                        Sonst
+                            Wenn v == 47 dann
+                                off = emit_line(out, off, "xor edx, edx")
+                                off = emit_line(out, off, "div ecx")
+                            Ende
+                        Ende
+                    Ende
+                Ende
+                off = emit_line(out, off, "push rax")
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    // 结果在栈顶 -> pop rax
+    off = emit_line(out, off, "pop rax")
+    gebe_zurueck off
+Ende

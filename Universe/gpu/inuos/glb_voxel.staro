@@ -1,0 +1,1224 @@
+// inuos/glb_voxel.staro - GLB (glTF 2.0 二进制) 解析 + 体素化 (Universe)
+// 依赖: sys.staro (raw_*), softfloat.staro (f32_*), str.staro (str_len), tensor.staro (t_*), off_voxel.staro (off_normalize, voxelize_face)
+// 关键: float 以 IEEE 位模式 (u32) 表示, raw_get32 读出即 float 位模式; t_set/t_get 存位模式.
+//   json 扫描用绝对文件偏移 (fb 为 mmap 基址, p/end 为相对 fb 的偏移).
+//
+// GLB 布局 (glTF 2.0):
+//   [0..3] magic "glTF" = 0x46546C67 (小端)
+//   [4..7] version = 2
+//   [8..11] total length
+//   [12..15] chunk0 len, [16..19] chunk0 type "JSON" = 0x4E4F534A
+//   [20..20+json_len) JSON
+//   [20+json_len..] chunk1 len/type "BIN\0" = 0x004E4942, 数据从 +8 起
+//
+// 需要的 JSON 字段 (Sketchfab/Objaverse 导出): accessors[].{bufferView,componentType,count,byteOffset,type}
+//   bufferViews[].{byteOffset,byteLength,byteStride}  meshes[].primitives[].{attributes.POSITION, indices, mode}
+
+// ============ JSON 递归下降扫描器 ============
+
+// 跳过空白 (space=32 tab=9 nl=10 cr=13)
+Funktion js_skip_ws(fb, p, end)
+    Solange p < end und (raw_byteat(fb, p) == 32 oder raw_byteat(fb, p) == 9 oder raw_byteat(fb, p) == 10 oder raw_byteat(fb, p) == 13)
+        p = p + 1
+    Ende
+    gebe_zurueck p
+Ende
+
+// 检查 JSON 字符串 (p 指向开引号 34) 是否等于 StarC 字符串 key (无转义处理)
+// 返回 1 相等, 0 不等
+Funktion js_str_eq_at(fb, p, end, key)
+    kl = str_len(key)
+    Wenn raw_byteat(fb, p) != 34 dann
+        gebe_zurueck 0
+    Ende
+    j = 0
+    Solange j < kl
+        Wenn raw_byteat(fb, p + 1 + j) != raw_byteat(key, 8 + j) dann
+            gebe_zurueck 0
+        Ende
+        j = j + 1
+    Ende
+    Wenn raw_byteat(fb, p + 1 + kl) != 34 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 跳过 JSON 字符串 (p 指向开引号), 返回闭引号之后的位置
+Funktion js_skip_string(fb, p, end)
+    p = p + 1
+    Solange p < end und raw_byteat(fb, p) != 34
+        Wenn raw_byteat(fb, p) == 92 dann
+            p = p + 2
+        Sonst
+            p = p + 1
+        Ende
+    Ende
+    gebe_zurueck p + 1
+Ende
+
+// 跳过 JSON 数字 (整数/小数/指数)
+Funktion js_skip_number(fb, p, end)
+    Solange p < end und ((raw_byteat(fb, p) >= 48 und raw_byteat(fb, p) <= 57) oder raw_byteat(fb, p) == 45 oder raw_byteat(fb, p) == 43 oder raw_byteat(fb, p) == 46 oder raw_byteat(fb, p) == 101 oder raw_byteat(fb, p) == 69)
+        p = p + 1
+    Ende
+    gebe_zurueck p
+Ende
+
+// 跳过任意 JSON 值 (递归下降)
+Funktion js_skip_value(fb, p, end)
+    c = raw_byteat(fb, p)
+    Wenn c == 34 dann
+        p = js_skip_string(fb, p, end)
+    Sonst
+        Wenn c == 123 dann
+            // 对象
+            p = p + 1
+            p = js_skip_ws(fb, p, end)
+            Solange p < end und raw_byteat(fb, p) != 125
+                p = js_skip_string(fb, p, end)
+                p = js_skip_ws(fb, p, end)
+                Wenn raw_byteat(fb, p) == 58 dann
+                    p = p + 1
+                Ende
+                p = js_skip_ws(fb, p, end)
+                p = js_skip_value(fb, p, end)
+                p = js_skip_ws(fb, p, end)
+                Wenn raw_byteat(fb, p) == 44 dann
+                    p = p + 1
+                Ende
+                p = js_skip_ws(fb, p, end)
+            Ende
+            p = p + 1
+        Sonst
+            Wenn c == 91 dann
+                // 数组
+                p = p + 1
+                p = js_skip_ws(fb, p, end)
+                Solange p < end und raw_byteat(fb, p) != 93
+                    p = js_skip_value(fb, p, end)
+                    p = js_skip_ws(fb, p, end)
+                    Wenn raw_byteat(fb, p) == 44 dann
+                        p = p + 1
+                    Ende
+                    p = js_skip_ws(fb, p, end)
+                Ende
+                p = p + 1
+            Sonst
+                p = js_skip_number(fb, p, end)
+            Ende
+        Ende
+    Ende
+    gebe_zurueck p
+Ende
+
+// 解析整数 (p 指向数字起始), 写新位置到 posbuf, 返回数值
+Funktion js_parse_int(fb, p, end, posbuf)
+    p = js_skip_ws(fb, p, end)
+    neg = 0
+    Wenn raw_byteat(fb, p) == 45 dann
+        neg = 1
+        p = p + 1
+    Ende
+    v = 0
+    Solange p < end und raw_byteat(fb, p) >= 48 und raw_byteat(fb, p) <= 57
+        v = v * 10 + (raw_byteat(fb, p) - 48)
+        p = p + 1
+    Ende
+    Wenn neg == 1 dann
+        v = 0 - v
+    Ende
+    raw_set64(posbuf, 0, p)
+    gebe_zurueck v
+Ende
+
+// 在对象 [objp,end) 中查找 key, 返回值起始位置或 -1
+Funktion js_obj_find(fb, objp, end, key)
+    p = js_skip_ws(fb, objp, end)
+    Wenn raw_byteat(fb, p) != 123 dann
+        gebe_zurueck -1
+    Ende
+    p = p + 1
+    p = js_skip_ws(fb, p, end)
+    Wenn raw_byteat(fb, p) == 125 dann
+        gebe_zurueck -1
+    Ende
+    Solange p < end
+        Wenn js_str_eq_at(fb, p, end, key) == 1 dann
+            p = js_skip_string(fb, p, end)
+            p = js_skip_ws(fb, p, end)
+            Wenn raw_byteat(fb, p) == 58 dann
+                p = p + 1
+            Ende
+            p = js_skip_ws(fb, p, end)
+            gebe_zurueck p
+        Ende
+        p = js_skip_string(fb, p, end)
+        p = js_skip_ws(fb, p, end)
+        Wenn raw_byteat(fb, p) == 58 dann
+            p = p + 1
+        Ende
+        p = js_skip_ws(fb, p, end)
+        p = js_skip_value(fb, p, end)
+        p = js_skip_ws(fb, p, end)
+        Wenn raw_byteat(fb, p) == 44 dann
+            p = p + 1
+            p = js_skip_ws(fb, p, end)
+        Sonst
+            gebe_zurueck -1
+        Ende
+    Ende
+    gebe_zurueck -1
+Ende
+
+// 解析 JSON 浮点 (十进制/指数) -> f32 位模式, 写新位置到 posbuf
+Funktion js_parse_float(fb, p, end, posbuf)
+    p = js_skip_ws(fb, p, end)
+    neg = 0
+    Wenn raw_byteat(fb, p) == 45 dann
+        neg = 1
+        p = p + 1
+    Ende
+    intpart = 0
+    Solange p < end und raw_byteat(fb, p) >= 48 und raw_byteat(fb, p) <= 57
+        intpart = intpart * 10 + (raw_byteat(fb, p) - 48)
+        p = p + 1
+    Ende
+    frac = 0
+    fracden = 1
+    Wenn raw_byteat(fb, p) == 46 dann
+        p = p + 1
+        Solange p < end und raw_byteat(fb, p) >= 48 und raw_byteat(fb, p) <= 57
+            frac = frac * 10 + (raw_byteat(fb, p) - 48)
+            fracden = fracden * 10
+            p = p + 1
+        Ende
+    Ende
+    expn = 0
+    expneg = 0
+    Wenn raw_byteat(fb, p) == 101 oder raw_byteat(fb, p) == 69 dann
+        p = p + 1
+        Wenn raw_byteat(fb, p) == 45 dann
+            expneg = 1
+            p = p + 1
+        Sonst
+            Wenn raw_byteat(fb, p) == 43 dann
+                p = p + 1
+            Ende
+        Ende
+        Solange p < end und raw_byteat(fb, p) >= 48 und raw_byteat(fb, p) <= 57
+            expn = expn * 10 + (raw_byteat(fb, p) - 48)
+            p = p + 1
+        Ende
+    Ende
+    val = s32_to_f32(intpart)
+    ffrac = f32_div(s32_to_f32(frac), s32_to_f32(fracden))
+    val = f32_add(val, ffrac)
+    k = 0
+    Solange k < expn
+        Wenn expneg == 1 dann
+            val = f32_div(val, s32_to_f32(10))
+        Sonst
+            val = f32_mul(val, s32_to_f32(10))
+        Ende
+        k = k + 1
+    Ende
+    Wenn neg == 1 dann
+        val = fs_neg(val)
+    Ende
+    raw_set64(posbuf, 0, p)
+    gebe_zurueck val
+Ende
+
+// 在对象中查找 key 并解析整数 (缺省返回 0)
+Funktion js_get_num(fb, objp, end, key, posbuf)
+    vp = js_obj_find(fb, objp, end, key)
+    Wenn vp == -1 dann
+        raw_set64(posbuf, 0, -1)
+        gebe_zurueck 0
+    Ende
+    v = js_parse_int(fb, vp, end, posbuf)
+    gebe_zurueck v
+Ende
+
+// 数组 ap 指向 [, 取第 idx 个元素起始位置 (写 elempos 8 字节), 返回 1 成功 0 失败
+Funktion js_arr_elem(fb, ap, end, idx, elempos)
+    p = js_skip_ws(fb, ap, end)
+    Wenn raw_byteat(fb, p) != 91 dann
+        gebe_zurueck 0
+    Ende
+    p = p + 1
+    p = js_skip_ws(fb, p, end)
+    i = 0
+    Solange p < end
+        Wenn i == idx dann
+            raw_set64(elempos, 0, p)
+            gebe_zurueck 1
+        Ende
+        p = js_skip_value(fb, p, end)
+        p = js_skip_ws(fb, p, end)
+        Wenn raw_byteat(fb, p) == 44 dann
+            p = p + 1
+            p = js_skip_ws(fb, p, end)
+        Sonst
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 数组元素个数 (ap 指向 [), 失败返回 -1
+Funktion js_arr_count(fb, ap, end)
+    p = js_skip_ws(fb, ap, end)
+    Wenn raw_byteat(fb, p) != 91 dann
+        gebe_zurueck -1
+    Ende
+    p = p + 1
+    p = js_skip_ws(fb, p, end)
+    cnt = 0
+    Solange p < end und raw_byteat(fb, p) != 93
+        cnt = cnt + 1
+        p = js_skip_value(fb, p, end)
+        p = js_skip_ws(fb, p, end)
+        Wenn raw_byteat(fb, p) == 44 dann
+            p = p + 1
+            p = js_skip_ws(fb, p, end)
+        Ende
+    Ende
+    gebe_zurueck cnt
+Ende
+
+// ============ GLB 容器解析 ============
+
+// 解析 GLB 头, 写 out: [0]=json0 [8]=json_len [16]=bin_data [24]=bin_len [32]=version [40]=total
+// 返回 1 成功 0 失败 (magic 不对)
+Funktion glb_parse_header(fb, out)
+    magic = raw_get32(fb, 0)
+    Wenn magic != 1179937895 dann
+        gebe_zurueck 0
+    Ende
+    version = raw_get32(fb, 4)
+    total = raw_get32(fb, 8)
+    c0len = raw_get32(fb, 12)
+    json0 = 20
+    json_end = json0 + c0len
+    pad = json_end % 4
+    Wenn pad != 0 dann
+        json_end = json_end + (4 - pad)
+    Ende
+    c1len = raw_get32(fb, json_end)
+    bin_data = json_end + 8
+    raw_set64(out, 0, json0)
+    raw_set64(out, 8, c0len)
+    raw_set64(out, 16, bin_data)
+    raw_set64(out, 24, c1len)
+    raw_set64(out, 32, version)
+    raw_set64(out, 40, total)
+    gebe_zurueck 1
+Ende
+
+// ============ accessors / bufferViews 字段提取 ============
+
+// 提取 accessor[acc_idx]: out [0]=bufferView [8]=componentType [16]=count [24]=byteOffset [32]=type_v(0=SCALAR,1=VEC2,2=VEC3,3=VEC4)
+// 返回 1 成功 0 失败
+Funktion glb_get_accessor(fb, js, js_end, acc_idx, out)
+    ap = js_obj_find(fb, js, js_end, "accessors")
+    Wenn ap == -1 dann
+        gebe_zurueck 0
+    Ende
+    elempos = alloc(8)
+    r = js_arr_elem(fb, ap, js_end, acc_idx, elempos)
+    Wenn r != 1 dann
+        gebe_zurueck 0
+    Ende
+    posbuf = alloc(8)
+    el = raw_get64(elempos, 0)
+    bv = js_get_num(fb, el, js_end, "bufferView", posbuf)
+    ct = js_get_num(fb, el, js_end, "componentType", posbuf)
+    cnt = js_get_num(fb, el, js_end, "count", posbuf)
+    bo = js_get_num(fb, el, js_end, "byteOffset", posbuf)
+    tv = 0
+    tp = js_obj_find(fb, el, js_end, "type")
+    Wenn tp != -1 dann
+        Wenn js_str_eq_at(fb, tp, js_end, "VEC2") == 1 dann
+            tv = 1
+        Sonst
+            Wenn js_str_eq_at(fb, tp, js_end, "VEC3") == 1 dann
+                tv = 2
+            Sonst
+                Wenn js_str_eq_at(fb, tp, js_end, "VEC4") == 1 dann
+                    tv = 3
+                Ende
+            Ende
+        Ende
+    Ende
+    raw_set64(out, 0, bv)
+    raw_set64(out, 8, ct)
+    raw_set64(out, 16, cnt)
+    raw_set64(out, 24, bo)
+    raw_set64(out, 32, tv)
+    gebe_zurueck 1
+Ende
+
+// 提取 bufferView[bv_idx]: out [0]=byteOffset [8]=byteLength [16]=byteStride
+// 返回 1 成功 0 失败
+Funktion glb_get_bv(fb, js, js_end, bv_idx, out)
+    ap = js_obj_find(fb, js, js_end, "bufferViews")
+    Wenn ap == -1 dann
+        gebe_zurueck 0
+    Ende
+    elempos = alloc(8)
+    r = js_arr_elem(fb, ap, js_end, bv_idx, elempos)
+    Wenn r != 1 dann
+        gebe_zurueck 0
+    Ende
+    posbuf = alloc(8)
+    el = raw_get64(elempos, 0)
+    bo = js_get_num(fb, el, js_end, "byteOffset", posbuf)
+    bl = js_get_num(fb, el, js_end, "byteLength", posbuf)
+    bs = js_get_num(fb, el, js_end, "byteStride", posbuf)
+    raw_set64(out, 0, bo)
+    raw_set64(out, 8, bl)
+    raw_set64(out, 16, bs)
+    gebe_zurueck 1
+Ende
+
+// 从 primitive 对象提取: out [0]=POSITION accessor [8]=indices accessor (无则 -1)
+Funktion glb_prim_pos(fb, el, js_end, out)
+    posbuf = alloc(8)
+    pos = -1
+    idx = -1
+    ap = js_obj_find(fb, el, js_end, "attributes")
+    Wenn ap != -1 dann
+        vp = js_obj_find(fb, ap, js_end, "POSITION")
+        Wenn vp != -1 dann
+            pos = js_parse_int(fb, vp, js_end, posbuf)
+        Ende
+    Ende
+    ip = js_obj_find(fb, el, js_end, "indices")
+    Wenn ip != -1 dann
+        idx = js_parse_int(fb, ip, js_end, posbuf)
+    Ende
+    raw_set64(out, 0, pos)
+    raw_set64(out, 8, idx)
+    gebe_zurueck 1
+Ende
+
+// 从 meshes[mesh_idx] 取 primitives 数组起始位置 (写 primarr_pos), 返回 primitive 数量 (或 -1)
+Funktion glb_mesh_prims(fb, js, js_end, mesh_idx, primarr_pos)
+    map = js_obj_find(fb, js, js_end, "meshes")
+    Wenn map == -1 dann
+        gebe_zurueck -1
+    Ende
+    meshpos = alloc(8)
+    r = js_arr_elem(fb, map, js_end, mesh_idx, meshpos)
+    Wenn r != 1 dann
+        gebe_zurueck -1
+    Ende
+    me = raw_get64(meshpos, 0)
+    pp = js_obj_find(fb, me, js_end, "primitives")
+    Wenn pp == -1 dann
+        gebe_zurueck -1
+    Ende
+    raw_set64(primarr_pos, 0, pp)
+    gebe_zurueck js_arr_count(fb, pp, js_end)
+Ende
+
+// meshes 数量 (或 -1)
+Funktion glb_num_meshes(fb, js, js_end)
+    map = js_obj_find(fb, js, js_end, "meshes")
+    Wenn map == -1 dann
+        gebe_zurueck -1
+    Ende
+    gebe_zurueck js_arr_count(fb, map, js_end)
+Ende
+
+// ============ 体素化 ============
+
+// 体素化单个 primitive. stats: [0]+=nV [8]+=nTri [16]+=prim数 [24]=失败prim数
+// 返回 1 成功 0 失败
+Funktion glb_voxelize_prim(fb, js, js_end, bin_data, prim_el, vox, V, samples, stats)
+    pp = alloc(16)
+    glb_prim_pos(fb, prim_el, js_end, pp)
+    pos_acc = raw_get64(pp, 0)
+    idx_acc = raw_get64(pp, 8)
+    Wenn pos_acc == -1 dann
+        raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+        gebe_zurueck 0
+    Ende
+    ao = alloc(40)
+    r = glb_get_accessor(fb, js, js_end, pos_acc, ao)
+    Wenn r != 1 dann
+        raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+        gebe_zurueck 0
+    Ende
+    p_bv = raw_get64(ao, 0)
+    p_ct = raw_get64(ao, 8)
+    nV = raw_get64(ao, 16)
+    p_bo = raw_get64(ao, 24)
+    p_tv = raw_get64(ao, 32)
+    // POSITION 必须 float32 VEC3
+    Wenn p_ct != 5126 oder p_tv != 2 oder nV == 0 dann
+        raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+        gebe_zurueck 0
+    Ende
+    bo = alloc(32)
+    r = glb_get_bv(fb, js, js_end, p_bv, bo)
+    Wenn r != 1 dann
+        raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+        gebe_zurueck 0
+    Ende
+    bv_bo = raw_get64(bo, 0)
+    bs = raw_get64(bo, 16)
+    stride = bs
+    Wenn stride == 0 dann
+        stride = 12
+    Ende
+    // 顶点基址 (绝对偏移)
+    vbase = bin_data + bv_bo + p_bo
+    // 读顶点
+    verts = t_alloc(nV * 3)
+    i = 0
+    Solange i < nV
+        x = raw_get32(fb, vbase + i * stride)
+        y = raw_get32(fb, vbase + i * stride + 4)
+        z = raw_get32(fb, vbase + i * stride + 8)
+        t_set(verts, i * 3 + 0, x)
+        t_set(verts, i * 3 + 1, y)
+        t_set(verts, i * 3 + 2, z)
+        i = i + 1
+    Ende
+    // 归一化
+    stbuf = alloc(32)
+    off_normalize(verts, nV, stbuf)
+    // 索引起始
+    nTri = 0
+    Wenn idx_acc != -1 dann
+        io = alloc(40)
+        r = glb_get_accessor(fb, js, js_end, idx_acc, io)
+        Wenn r == 1 dann
+            i_bv = raw_get64(io, 0)
+            i_ct = raw_get64(io, 8)
+            i_cnt = raw_get64(io, 16)
+            i_bo = raw_get64(io, 24)
+            ibo = alloc(32)
+            r = glb_get_bv(fb, js, js_end, i_bv, ibo)
+            Wenn r == 1 dann
+                ibv_bo = raw_get64(ibo, 0)
+                ibase = bin_data + ibv_bo + i_bo
+                // 索引宽度
+                isz = 4
+                Wenn i_ct == 5123 dann
+                    isz = 2
+                Ende
+                nTri = i_cnt / 3
+                ti = 0
+                Solange ti < nTri
+                    i0 = glb_read_idx(fb, ibase, ti * 3 + 0, isz)
+                    i1 = glb_read_idx(fb, ibase, ti * 3 + 1, isz)
+                    i2 = glb_read_idx(fb, ibase, ti * 3 + 2, isz)
+                    Wenn i0 < nV und i1 < nV und i2 < nV dann
+                        voxelize_face_adaptive(verts, i0, i1, i2, vox, V)
+                    Ende
+                    ti = ti + 1
+                Ende
+            Ende
+        Ende
+    Sonst
+        // 非索引: 顺序三角形
+        nTri = nV / 3
+        ti = 0
+        Solange ti < nTri
+            voxelize_face_adaptive(verts, ti * 3 + 0, ti * 3 + 1, ti * 3 + 2, vox, V)
+            ti = ti + 1
+        Ende
+    Ende
+    raw_set64(stats, 0, raw_get64(stats, 0) + nV)
+    raw_set64(stats, 8, raw_get64(stats, 8) + nTri)
+    raw_set64(stats, 16, raw_get64(stats, 16) + 1)
+    gebe_zurueck 1
+Ende
+
+// 跳空白 + 可选逗号 + 空白 (数组元素间)
+Funktion js_skip_comma(fb, p, end)
+    p = js_skip_ws(fb, p, end)
+    Wenn p < end und raw_byteat(fb, p) == 44 dann
+        p = p + 1
+        p = js_skip_ws(fb, p, end)
+    Ende
+    gebe_zurueck p
+Ende
+
+// 取单个 accessor 的 min/max 包围盒 (POSITION 用), out[0..5]=minx,miny,minz,maxx,maxy,maxz ----
+// 返回 1 成功 0 无 min/max
+Funktion glb_acc_bbox(fb, js, js_end, acc_idx, out)
+    ap = js_obj_find(fb, js, js_end, "accessors")
+    Wenn ap == -1 dann
+        gebe_zurueck 0
+    Ende
+    elempos = alloc(8)
+    r = js_arr_elem(fb, ap, js_end, acc_idx, elempos)
+    Wenn r != 1 dann
+        gebe_zurueck 0
+    Ende
+    posbuf = alloc(8)
+    el = raw_get64(elempos, 0)
+    mp = js_obj_find(fb, el, js_end, "min")
+    xp = js_obj_find(fb, el, js_end, "max")
+    Wenn mp == -1 oder xp == -1 dann
+        gebe_zurueck 0
+    Ende
+    q = js_skip_ws(fb, mp, js_end)
+    Wenn raw_byteat(fb, q) != 91 dann
+        gebe_zurueck 0
+    Ende
+    q = js_skip_ws(fb, q + 1, js_end)
+    mx = js_parse_float(fb, q, js_end, posbuf)
+    q = js_skip_comma(fb, raw_get64(posbuf, 0), js_end)
+    my = js_parse_float(fb, q, js_end, posbuf)
+    q = js_skip_comma(fb, raw_get64(posbuf, 0), js_end)
+    mz = js_parse_float(fb, q, js_end, posbuf)
+    q = js_skip_ws(fb, xp, js_end)
+    Wenn raw_byteat(fb, q) != 91 dann
+        gebe_zurueck 0
+    Ende
+    q = js_skip_ws(fb, q + 1, js_end)
+    ax = js_parse_float(fb, q, js_end, posbuf)
+    q = js_skip_comma(fb, raw_get64(posbuf, 0), js_end)
+    ay = js_parse_float(fb, q, js_end, posbuf)
+    q = js_skip_comma(fb, raw_get64(posbuf, 0), js_end)
+    az = js_parse_float(fb, q, js_end, posbuf)
+    raw_set64(out, 0, mx)
+    raw_set64(out, 8, my)
+    raw_set64(out, 16, mz)
+    raw_set64(out, 24, ax)
+    raw_set64(out, 32, ay)
+    raw_set64(out, 40, az)
+    gebe_zurueck 1
+Ende
+
+// ---- 全局包围盒: 只累积 POSITION accessor 的 min/max (经 meshes->prims->attributes.POSITION) ----
+Funktion glb_global_bbox(fb, js, js_end, out)
+    nmesh = glb_num_meshes(fb, js, js_end)
+    Wenn nmesh == -1 dann
+        gebe_zurueck 0
+    Ende
+    posbuf = alloc(8)
+    found = 0
+    mi = 0
+    Solange mi < nmesh
+        primarr = alloc(8)
+        nprim = glb_mesh_prims(fb, js, js_end, mi, primarr)
+        Wenn nprim != -1 dann
+            pp = raw_get64(primarr, 0)
+            pi = 0
+            Solange pi < nprim
+                elempos = alloc(8)
+                r = js_arr_elem(fb, pp, js_end, pi, elempos)
+                Wenn r == 1 dann
+                    po = alloc(16)
+                    glb_prim_pos(fb, raw_get64(elempos, 0), js_end, po)
+                    pa = raw_get64(po, 0)
+                    Wenn pa != -1 dann
+                        ab = alloc(48)
+                        rr = glb_acc_bbox(fb, js, js_end, pa, ab)
+                        Wenn rr == 1 dann
+                            mx = raw_get64(ab, 0)
+                            my = raw_get64(ab, 8)
+                            mz = raw_get64(ab, 16)
+                            ax = raw_get64(ab, 24)
+                            ay = raw_get64(ab, 32)
+                            az = raw_get64(ab, 40)
+                            Wenn found == 0 dann
+                                raw_set64(out, 0, mx)
+                                raw_set64(out, 8, my)
+                                raw_set64(out, 16, mz)
+                                raw_set64(out, 24, ax)
+                                raw_set64(out, 32, ay)
+                                raw_set64(out, 40, az)
+                                found = 1
+                            Sonst
+                                Wenn f32_lt(mx, raw_get64(out, 0)) dann
+                                    raw_set64(out, 0, mx)
+                                Ende
+                                Wenn f32_lt(my, raw_get64(out, 8)) dann
+                                    raw_set64(out, 8, my)
+                                Ende
+                                Wenn f32_lt(mz, raw_get64(out, 16)) dann
+                                    raw_set64(out, 16, mz)
+                                Ende
+                                Wenn f32_gt(ax, raw_get64(out, 24)) dann
+                                    raw_set64(out, 24, ax)
+                                Ende
+                                Wenn f32_gt(ay, raw_get64(out, 32)) dann
+                                    raw_set64(out, 32, ay)
+                                Ende
+                                Wenn f32_gt(az, raw_get64(out, 40)) dann
+                                    raw_set64(out, 40, az)
+                                Ende
+                            Ende
+                        Ende
+                    Ende
+                Ende
+                pi = pi + 1
+            Ende
+        Ende
+        mi = mi + 1
+    Ende
+    gebe_zurueck found
+Ende
+
+// ---- 全局归一化: 用 gb 包围盒缩放顶点到 [-0.45,0.45]^3 ----
+// gb: [0]=minx [8]=miny [16]=minz [24]=maxx [32]=maxy [40]=maxz
+Funktion glb_normalize_global(verts, nV, gb)
+    minx = raw_get64(gb, 0)
+    miny = raw_get64(gb, 8)
+    minz = raw_get64(gb, 16)
+    maxx = raw_get64(gb, 24)
+    maxy = raw_get64(gb, 32)
+    maxz = raw_get64(gb, 40)
+    dx = f32_sub(maxx, minx)
+    dy = f32_sub(maxy, miny)
+    dz = f32_sub(maxz, minz)
+    maxd = dx
+    Wenn f32_gt(dy, maxd) dann
+        maxd = dy
+    Ende
+    Wenn f32_gt(dz, maxd) dann
+        maxd = dz
+    Ende
+    scale = f32_div(s32_to_f32(9), f32_mul(maxd, s32_to_f32(10)))
+    cx = f32_mul(f32_add(minx, maxx), 1056964608)
+    cy = f32_mul(f32_add(miny, maxy), 1056964608)
+    cz = f32_mul(f32_add(minz, maxz), 1056964608)
+    i = 0
+    Solange i < nV
+        x = f32_sub(t_get(verts, i * 3 + 0), cx)
+        y = f32_sub(t_get(verts, i * 3 + 1), cy)
+        z = f32_sub(t_get(verts, i * 3 + 2), cz)
+        t_set(verts, i * 3 + 0, f32_mul(x, scale))
+        t_set(verts, i * 3 + 1, f32_mul(y, scale))
+        t_set(verts, i * 3 + 2, f32_mul(z, scale))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- ws 版: 用预分配 verts 缓冲 (maxV 上限), 避免逐 prim alloc ----
+Funktion glb_voxelize_prim_ws(fb, js, js_end, bin_data, prim_el, vox, V, stats, verts, maxV, gb)
+    pp = alloc(16)
+    glb_prim_pos(fb, prim_el, js_end, pp)
+    pos_acc = raw_get64(pp, 0)
+    idx_acc = raw_get64(pp, 8)
+    Wenn pos_acc == -1 dann
+        raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+        gebe_zurueck 0
+    Ende
+    ao = alloc(40)
+    r = glb_get_accessor(fb, js, js_end, pos_acc, ao)
+    Wenn r != 1 dann
+        raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+        gebe_zurueck 0
+    Ende
+    p_bv = raw_get64(ao, 0)
+    p_ct = raw_get64(ao, 8)
+    nV = raw_get64(ao, 16)
+    p_bo = raw_get64(ao, 24)
+    p_tv = raw_get64(ao, 32)
+    Wenn p_ct != 5126 oder p_tv != 2 oder nV == 0 dann
+        raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+        gebe_zurueck 0
+    Ende
+    Wenn nV > maxV dann
+        raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+        gebe_zurueck 0
+    Ende
+    bo = alloc(32)
+    r = glb_get_bv(fb, js, js_end, p_bv, bo)
+    Wenn r != 1 dann
+        raw_set64(stats, 24, raw_get64(stats, 24) + 1)
+        gebe_zurueck 0
+    Ende
+    bv_bo = raw_get64(bo, 0)
+    bs = raw_get64(bo, 16)
+    stride = bs
+    Wenn stride == 0 dann
+        stride = 12
+    Ende
+    vbase = bin_data + bv_bo + p_bo
+    i = 0
+    Solange i < nV
+        x = raw_get32(fb, vbase + i * stride)
+        y = raw_get32(fb, vbase + i * stride + 4)
+        z = raw_get32(fb, vbase + i * stride + 8)
+        t_set(verts, i * 3 + 0, x)
+        t_set(verts, i * 3 + 1, y)
+        t_set(verts, i * 3 + 2, z)
+        i = i + 1
+    Ende
+    stbuf = alloc(32)
+    glb_normalize_global(verts, nV, gb)
+    nTri = 0
+    Wenn idx_acc != -1 dann
+        io = alloc(40)
+        r = glb_get_accessor(fb, js, js_end, idx_acc, io)
+        Wenn r == 1 dann
+            i_bv = raw_get64(io, 0)
+            i_ct = raw_get64(io, 8)
+            i_cnt = raw_get64(io, 16)
+            i_bo = raw_get64(io, 24)
+            ibo = alloc(32)
+            r = glb_get_bv(fb, js, js_end, i_bv, ibo)
+            Wenn r == 1 dann
+                ibv_bo = raw_get64(ibo, 0)
+                ibase = bin_data + ibv_bo + i_bo
+                isz = 4
+                Wenn i_ct == 5123 dann
+                    isz = 2
+                Ende
+                nTri = i_cnt / 3
+                ti = 0
+                Solange ti < nTri
+                    i0 = glb_read_idx(fb, ibase, ti * 3 + 0, isz)
+                    i1 = glb_read_idx(fb, ibase, ti * 3 + 1, isz)
+                    i2 = glb_read_idx(fb, ibase, ti * 3 + 2, isz)
+                    Wenn i0 < nV und i1 < nV und i2 < nV dann
+                        voxelize_face_adaptive(verts, i0, i1, i2, vox, V)
+                    Ende
+                    ti = ti + 1
+                Ende
+            Ende
+        Ende
+    Sonst
+        nTri = nV / 3
+        ti = 0
+        Solange ti < nTri
+            voxelize_face_adaptive(verts, ti * 3 + 0, ti * 3 + 1, ti * 3 + 2, vox, V)
+            ti = ti + 1
+        Ende
+    Ende
+    raw_set64(stats, 0, raw_get64(stats, 0) + nV)
+    raw_set64(stats, 8, raw_get64(stats, 8) + nTri)
+    raw_set64(stats, 16, raw_get64(stats, 16) + 1)
+    gebe_zurueck 1
+Ende
+
+// 读索引 (isz 字节 1/2/4)
+Funktion glb_read_idx(fb, base, i, isz)
+    Wenn isz == 2 dann
+        v = raw_byteat(fb, base + i * 2)
+        v = v + raw_byteat(fb, base + i * 2 + 1) * 256
+        gebe_zurueck v
+    Ende
+    Wenn isz == 1 dann
+        gebe_zurueck raw_byteat(fb, base + i)
+    Ende
+    gebe_zurueck raw_get32(fb, base + i * 4)
+Ende
+
+// ---- 边长度 (世界单位, f32) ----
+Funktion edge_len(x1, y1, z1, x2, y2, z2)
+    dx = f32_sub(x1, x2)
+    dy = f32_sub(y1, y2)
+    dz = f32_sub(z1, z2)
+    d2 = f32_add(f32_add(f32_mul(dx, dx), f32_mul(dy, dy)), f32_mul(dz, dz))
+    gebe_zurueck f32_sqrt(d2)
+Ende
+
+// ---- 自适应采样体素化: 按三角形体素边长选 samples (间距 <= 0.5 体素) ----
+// 保证任意网格封闭壳 (flood 可填). 采样数 clamp [1, 48].
+Funktion voxelize_face_adaptive(verts, v0, v1, v2, vox, V)
+    ax = t_get(verts, v0 * 3 + 0)
+    ay = t_get(verts, v0 * 3 + 1)
+    az = t_get(verts, v0 * 3 + 2)
+    bx = t_get(verts, v1 * 3 + 0)
+    by = t_get(verts, v1 * 3 + 1)
+    bz = t_get(verts, v1 * 3 + 2)
+    cx = t_get(verts, v2 * 3 + 0)
+    cy = t_get(verts, v2 * 3 + 1)
+    cz = t_get(verts, v2 * 3 + 2)
+    // 用平方边长取最大边 (避免 3 次 sqrt), 只 sqrt 一次; 结果与 edge_len 一致
+    d1x = f32_sub(ax, bx)
+    d1y = f32_sub(ay, by)
+    d1z = f32_sub(az, bz)
+    e1sq = f32_add(f32_add(f32_mul(d1x, d1x), f32_mul(d1y, d1y)), f32_mul(d1z, d1z))
+    d2x = f32_sub(bx, cx)
+    d2y = f32_sub(by, cy)
+    d2z = f32_sub(bz, cz)
+    e2sq = f32_add(f32_add(f32_mul(d2x, d2x), f32_mul(d2y, d2y)), f32_mul(d2z, d2z))
+    d3x = f32_sub(cx, ax)
+    d3y = f32_sub(cy, ay)
+    d3z = f32_sub(cz, az)
+    e3sq = f32_add(f32_add(f32_mul(d3x, d3x), f32_mul(d3y, d3y)), f32_mul(d3z, d3z))
+    maxsq = e1sq
+    Wenn f32_gt(e2sq, maxsq) dann
+        maxsq = e2sq
+    Ende
+    Wenn f32_gt(e3sq, maxsq) dann
+        maxsq = e3sq
+    Ende
+    maxe = f32_sqrt(maxsq)
+    // voxlen = maxe * V; samples = voxlen * 2 (间距 0.5 体素)
+    voxlen = f32_mul(maxe, s32_to_f32(V))
+    s = f32_to_s32(f32_mul(voxlen, 1073741824))
+    Wenn s < 1 dann
+        s = 1
+    Ende
+    Wenn s > 48 dann
+        s = 48
+    Ende
+    voxelize_face(verts, v0, v1, v2, vox, V, s)
+    gebe_zurueck 0
+Ende
+
+// ---- 泛洪填充内部 (预分配工作区版): visited/queue 由调用方提供 ----
+Funktion voxel_fill_flood_ws(vox, V, visited, queue)
+    n = V * V * V
+    i = 0
+    Solange i < n
+        Wenn t_get(vox, i) != 0 dann
+            raw_setbyte(visited, i, 2)
+        Sonst
+            raw_setbyte(visited, i, 0)
+        Ende
+        i = i + 1
+    Ende
+    qh = 0
+    qt = 0
+    i = 0
+    Solange i < n
+        Wenn raw_byteat(visited, i) == 0 dann
+            z = i / (V * V)
+            rem = i % (V * V)
+            y = rem / V
+            x = rem % V
+            Wenn x == 0 oder x == V - 1 oder y == 0 oder y == V - 1 oder z == 0 oder z == V - 1 dann
+                raw_setbyte(visited, i, 1)
+                raw_set32(queue, qt * 4, i)
+                qt = qt + 1
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    Solange qh < qt
+        cur = raw_get32(queue, qh * 4)
+        qh = qh + 1
+        z = cur / (V * V)
+        rem = cur % (V * V)
+        y = rem / V
+        x = rem % V
+        Wenn x > 0 dann
+            nb = cur - 1
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn x < V - 1 dann
+            nb = cur + 1
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn y > 0 dann
+            nb = cur - V
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn y < V - 1 dann
+            nb = cur + V
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn z > 0 dann
+            nb = cur - V * V
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn z < V - 1 dann
+            nb = cur + V * V
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+    Ende
+    i = 0
+    Solange i < n
+        Wenn raw_byteat(visited, i) == 0 dann
+            t_set(vox, i, 1065353216)
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 泛洪填充内部: 从网格边界 BFS 标记"外部"空体素, 未被标记的空体素=内部 -> 填充 ----
+// 正确处理: 封闭壳(球/立方), 薄片(开面不填), 凹形(开凹不误填). 6-连通.
+Funktion voxel_fill_flood(vox, V)
+    n = V * V * V
+    visited = alloc(n)
+    queue = alloc(n * 4)
+    i = 0
+    Solange i < n
+        Wenn t_get(vox, i) != 0 dann
+            raw_setbyte(visited, i, 2)
+        Sonst
+            raw_setbyte(visited, i, 0)
+        Ende
+        i = i + 1
+    Ende
+    qh = 0
+    qt = 0
+    i = 0
+    Solange i < n
+        Wenn raw_byteat(visited, i) == 0 dann
+            z = i / (V * V)
+            rem = i % (V * V)
+            y = rem / V
+            x = rem % V
+            Wenn x == 0 oder x == V - 1 oder y == 0 oder y == V - 1 oder z == 0 oder z == V - 1 dann
+                raw_setbyte(visited, i, 1)
+                raw_set32(queue, qt * 4, i)
+                qt = qt + 1
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    Solange qh < qt
+        cur = raw_get32(queue, qh * 4)
+        qh = qh + 1
+        z = cur / (V * V)
+        rem = cur % (V * V)
+        y = rem / V
+        x = rem % V
+        Wenn x > 0 dann
+            nb = cur - 1
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn x < V - 1 dann
+            nb = cur + 1
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn y > 0 dann
+            nb = cur - V
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn y < V - 1 dann
+            nb = cur + V
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn z > 0 dann
+            nb = cur - V * V
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+        Wenn z < V - 1 dann
+            nb = cur + V * V
+            Wenn raw_byteat(visited, nb) == 0 dann
+                raw_setbyte(visited, nb, 1)
+                raw_set32(queue, qt * 4, nb)
+                qt = qt + 1
+            Ende
+        Ende
+    Ende
+    i = 0
+    Solange i < n
+        Wenn raw_byteat(visited, i) == 0 dann
+            t_set(vox, i, 1065353216)
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 完整流程: GLB -> 体素化 ----
+// path: StarC 字符串, vox: V^3 fp32 输出, V: 分辨率, samples: 每边采样数, fill: 1=内部填充
+// stats: [0]=nV [8]=nTri [16]=prim数 [24]=失败prim数 [32]=ms [40]=nnz
+// 返回 1 成功 0 失败
+Funktion glb_to_voxel(path, vox, V, samples, fill, stats)
+    m = alloc(32)
+    r = file_mmap(path, m)
+    Wenn r != 1 dann
+        gebe_zurueck 0
+    Ende
+    fb = raw_get64(m, 0)
+    hdr = alloc(48)
+    r = glb_parse_header(fb, hdr)
+    Wenn r != 1 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    js = raw_get64(hdr, 0)
+    js_len = raw_get64(hdr, 8)
+    bin_data = raw_get64(hdr, 16)
+    js_end = js + js_len
+    t_zero(vox, V * V * V)
+    t0 = tick_ms()
+    // 统计初始化
+    raw_set64(stats, 0, 0)
+    raw_set64(stats, 8, 0)
+    raw_set64(stats, 16, 0)
+    raw_set64(stats, 24, 0)
+    nmesh = glb_num_meshes(fb, js, js_end)
+    Wenn nmesh == -1 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    mi = 0
+    Solange mi < nmesh
+        primarr = alloc(8)
+        nprim = glb_mesh_prims(fb, js, js_end, mi, primarr)
+        Wenn nprim != -1 dann
+            pp = raw_get64(primarr, 0)
+            pi = 0
+            Solange pi < nprim
+                elempos = alloc(8)
+                r = js_arr_elem(fb, pp, js_end, pi, elempos)
+                Wenn r == 1 dann
+                    glb_voxelize_prim(fb, js, js_end, bin_data, raw_get64(elempos, 0), vox, V, samples, stats)
+                Ende
+                pi = pi + 1
+            Ende
+        Ende
+        mi = mi + 1
+    Ende
+    t1 = tick_ms()
+    raw_set64(stats, 32, t1 - t0)
+    file_munmap(m)
+    Wenn fill == 1 dann
+        voxel_fill_flood(vox, V)
+    Ende
+    // nnz (fill 之后统计)
+    nz = 0
+    i = 0
+    Solange i < V * V * V
+        Wenn t_get(vox, i) != 0 dann
+            nz = nz + 1
+        Ende
+        i = i + 1
+    Ende
+    raw_set64(stats, 40, nz)
+    gebe_zurueck 1
+Ende
+
+// ---- 批处理版: 复用预分配 verts/visited/queue, 逐 GLB 调用不累积内存 ----
+// verts: maxV*3*4 字节, visited: V^3 字节, queue: V^3*4 字节
+Funktion glb_to_voxel_ws(path, vox, V, fill, stats, verts, maxV, visited, queue)
+    m = alloc(32)
+    r = file_mmap(path, m)
+    Wenn r != 1 dann
+        gebe_zurueck 0
+    Ende
+    fb = raw_get64(m, 0)
+    hdr = alloc(48)
+    r = glb_parse_header(fb, hdr)
+    Wenn r != 1 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    js = raw_get64(hdr, 0)
+    js_len = raw_get64(hdr, 8)
+    bin_data = raw_get64(hdr, 16)
+    js_end = js + js_len
+    gb = alloc(48)
+    hasgb = glb_global_bbox(fb, js, js_end, gb)
+    Wenn hasgb != 1 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    t_zero(vox, V * V * V)
+    t0 = tick_ms()
+    raw_set64(stats, 0, 0)
+    raw_set64(stats, 8, 0)
+    raw_set64(stats, 16, 0)
+    raw_set64(stats, 24, 0)
+    nmesh = glb_num_meshes(fb, js, js_end)
+    Wenn nmesh == -1 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    mi = 0
+    Solange mi < nmesh
+        primarr = alloc(8)
+        nprim = glb_mesh_prims(fb, js, js_end, mi, primarr)
+        Wenn nprim != -1 dann
+            pp = raw_get64(primarr, 0)
+            pi = 0
+            Solange pi < nprim
+                elempos = alloc(8)
+                r = js_arr_elem(fb, pp, js_end, pi, elempos)
+                Wenn r == 1 dann
+                    glb_voxelize_prim_ws(fb, js, js_end, bin_data, raw_get64(elempos, 0), vox, V, stats, verts, maxV, gb)
+                Ende
+                pi = pi + 1
+            Ende
+        Ende
+        mi = mi + 1
+    Ende
+    t1 = tick_ms()
+    raw_set64(stats, 32, t1 - t0)
+    file_munmap(m)
+    Wenn fill == 1 dann
+        voxel_fill_flood_ws(vox, V, visited, queue)
+    Ende
+    nz = 0
+    i = 0
+    Solange i < V * V * V
+        Wenn t_get(vox, i) != 0 dann
+            nz = nz + 1
+        Ende
+        i = i + 1
+    Ende
+    raw_set64(stats, 40, nz)
+    gebe_zurueck 1
+Ende
+
+// ---- 工作区分配: 一次性分配 verts/visited/queue, 写指针到 ws ----
+// ws: [0]=verts [8]=visited [16]=queue [24]=maxV [32]=V
+// 返回 ws (调用方保留复用)
+Funktion glb_ws_alloc(V, maxV)
+    ws = alloc(40)
+    verts = alloc(maxV * 3 * 4)
+    visited = alloc(V * V * V)
+    queue = alloc(V * V * V * 4)
+    raw_set64(ws, 0, verts)
+    raw_set64(ws, 8, visited)
+    raw_set64(ws, 16, queue)
+    raw_set64(ws, 24, maxV)
+    raw_set64(ws, 32, V)
+    gebe_zurueck ws
+Ende

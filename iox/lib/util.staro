@@ -1,0 +1,409 @@
+// util.staro - 通用工具函数模块
+// 零 linx，纯 StarC 实现
+
+Funktion str_len(str)
+    b0 = raw_byteat(str, 0)
+    b1 = raw_byteat(str, 1)
+    b2 = raw_byteat(str, 2)
+    b3 = raw_byteat(str, 3)
+    len = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+    gebe_zurueck len
+Ende
+
+Funktion str_at(str, pos)
+    gebe_zurueck byteat(str, pos)
+Ende
+
+Funktion str_eq(s1, s2)
+    l1 = str_len(s1)
+    l2 = str_len(s2)
+    Wenn l1 != l2 dann
+        gebe_zurueck 0
+    Ende
+    Wenn l1 == 0 dann
+        gebe_zurueck 1
+    Ende
+    i = 0
+    Solange i < l1
+        Wenn str_at(s1, i) != str_at(s2, i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+Funktion str_starts_with(str, prefix)
+    sl = str_len(str)
+    pl = str_len(prefix)
+    Wenn pl > sl dann
+        gebe_zurueck 0
+    Ende
+    i = 0
+    found = 0
+    Solange i < pl
+        Wenn str_at(str, i) != str_at(prefix, i) dann
+            found = 1
+            i = 999999
+        Ende
+        i = i + 1
+    Ende
+    Wenn found == 1 dann
+        gebe_zurueck 0
+    Ende
+    gebe_zurueck 1
+Ende
+
+Funktion str_substr(str, start, len)
+    result = alloc(8 + len + 1)
+    raw_setbyte(result, 0, len % 256)
+    raw_setbyte(result, 1, (len / 256) % 256)
+    raw_setbyte(result, 2, (len / 65536) % 256)
+    raw_setbyte(result, 3, (len / 16777216) % 256)
+    raw_setbyte(result, 4, 0)
+    raw_setbyte(result, 5, 0)
+    raw_setbyte(result, 6, 0)
+    raw_setbyte(result, 7, 0)
+    i = 0
+    Solange i < len
+        raw_setbyte(result, 8 + i, str_at(str, start + i))
+        i = i + 1
+    Ende
+    raw_setbyte(result, 8 + len, 0)
+    gebe_zurueck result
+Ende
+
+Funktion str_concat(s1, s2)
+    l1 = str_len(s1)
+    l2 = str_len(s2)
+    total = l1 + l2
+    result = alloc(8 + total + 1)
+    raw_setbyte(result, 0, total % 256)
+    raw_setbyte(result, 1, (total / 256) % 256)
+    raw_setbyte(result, 2, (total / 65536) % 256)
+    raw_setbyte(result, 3, (total / 16777216) % 256)
+    raw_setbyte(result, 4, 0)
+    raw_setbyte(result, 5, 0)
+    raw_setbyte(result, 6, 0)
+    raw_setbyte(result, 7, 0)
+    i = 0
+    Solange i < l1
+        raw_setbyte(result, 8 + i, str_at(s1, i))
+        i = i + 1
+    Ende
+    j = 0
+    Solange j < l2
+        raw_setbyte(result, 8 + l1 + j, str_at(s2, j))
+        j = j + 1
+    Ende
+    raw_setbyte(result, 8 + total, 0)
+    gebe_zurueck result
+Ende
+
+Funktion str_lower(str)
+    len = str_len(str)
+    result = alloc(8 + len + 1)
+    raw_setbyte(result, 0, len % 256)
+    raw_setbyte(result, 1, (len / 256) % 256)
+    raw_setbyte(result, 2, (len / 65536) % 256)
+    raw_setbyte(result, 3, (len / 16777216) % 256)
+    raw_setbyte(result, 4, 0)
+    raw_setbyte(result, 5, 0)
+    raw_setbyte(result, 6, 0)
+    raw_setbyte(result, 7, 0)
+    i = 0
+    Solange i < len
+        ch = str_at(str, i)
+        Wenn ch >= 65 und ch <= 90 dann
+            ch = ch + 32
+        Ende
+        raw_setbyte(result, 8 + i, ch)
+        i = i + 1
+    Ende
+    raw_setbyte(result, 8 + len, 0)
+    gebe_zurueck result
+Ende
+
+Funktion url_encode(str)
+    len = str_len(str)
+    result = alloc(8 + len * 3 + 1)
+    pos = 0
+    i = 0
+    Solange i < len
+        ch = str_at(str, i)
+        Wenn ch == 32 dann
+            raw_setbyte(result, 8 + pos, 37)
+            pos = pos + 1
+            raw_setbyte(result, 8 + pos, 50)
+            pos = pos + 1
+            raw_setbyte(result, 8 + pos, 48)
+            pos = pos + 1
+        Sonst
+            Wenn (ch >= 97 und ch <= 122) oder (ch >= 65 und ch <= 90) oder (ch >= 48 und ch <= 57) oder ch == 45 oder ch == 95 oder ch == 46 oder ch == 126 dann
+                raw_setbyte(result, 8 + pos, ch)
+                pos = pos + 1
+            Sonst
+                raw_setbyte(result, 8 + pos, 37)
+                pos = pos + 1
+                high = ch / 16
+                low = ch % 16
+                Wenn high < 10 dann
+                    raw_setbyte(result, 8 + pos, high + 48)
+                Sonst
+                    raw_setbyte(result, 8 + pos, high + 55)
+                Ende
+                pos = pos + 1
+                Wenn low < 10 dann
+                    raw_setbyte(result, 8 + pos, low + 48)
+                Sonst
+                    raw_setbyte(result, 8 + pos, low + 55)
+                Ende
+                pos = pos + 1
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    raw_setbyte(result, 0, pos % 256)
+    raw_setbyte(result, 1, (pos / 256) % 256)
+    raw_setbyte(result, 2, (pos / 65536) % 256)
+    raw_setbyte(result, 3, (pos / 16777216) % 256)
+    raw_setbyte(result, 8 + pos, 0)
+    gebe_zurueck result
+Ende
+
+Funktion str_trim(str)
+    len = str_len(str)
+    start = 0
+    end = len - 1
+
+    // 跳过前导空格
+    skip_start = 0
+    Solange start < len und skip_start == 0
+        ch = str_at(str, start)
+        Wenn ch == 32 oder ch == 9 oder ch == 10 oder ch == 13 dann
+            start = start + 1
+        Sonst
+            skip_start = 1
+            start = len
+        Ende
+    Ende
+
+    // 跳过尾随空格
+    skip_end = 0
+    Solange end >= start und skip_end == 0
+        ch = str_at(str, end)
+        Wenn ch == 32 oder ch == 9 oder ch == 10 oder ch == 13 dann
+            end = end - 1
+        Sonst
+            skip_end = 1
+            end = -1
+        Ende
+    Ende
+
+    result_len = end - start + 1
+    Wenn result_len < 0 dann
+        result_len = 0
+    Ende
+
+    result = alloc(8 + result_len + 1)
+    raw_setbyte(result, 0, result_len % 256)
+    raw_setbyte(result, 1, (result_len / 256) % 256)
+    raw_setbyte(result, 2, (result_len / 65536) % 256)
+    raw_setbyte(result, 3, (result_len / 16777216) % 256)
+    raw_setbyte(result, 4, 0)
+    raw_setbyte(result, 5, 0)
+    raw_setbyte(result, 6, 0)
+    raw_setbyte(result, 7, 0)
+    i = 0
+    Solange i < result_len
+        raw_setbyte(result, 8 + i, str_at(str, start + i))
+        i = i + 1
+    Ende
+    raw_setbyte(result, 8 + result_len, 0)
+    gebe_zurueck result
+Ende
+
+Funktion to_cstr(str)
+    len = str_len(str)
+    buf = alloc(len + 1)
+    i = 0
+    Solange i < len
+        raw_setbyte(buf, i, str_at(str, i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, len, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion from_cstr(cstr_ptr)
+    len = 0
+    Solange raw_byteat(cstr_ptr, len) != 0
+        len = len + 1
+    Ende
+    buf = alloc(8 + len + 1)
+    raw_setbyte(buf, 0, len % 256)
+    raw_setbyte(buf, 1, (len / 256) % 256)
+    raw_setbyte(buf, 2, (len / 65536) % 256)
+    raw_setbyte(buf, 3, (len / 16777216) % 256)
+    raw_setbyte(buf, 4, 0)
+    raw_setbyte(buf, 5, 0)
+    raw_setbyte(buf, 6, 0)
+    raw_setbyte(buf, 7, 0)
+    i = 0
+    Solange i < len
+        raw_setbyte(buf, 8 + i, raw_byteat(cstr_ptr, i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 8 + len, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion hex_digit_val(ch)
+    Wenn ch >= 48 und ch <= 57 dann
+        gebe_zurueck ch - 48
+    Ende
+    Wenn ch >= 65 und ch <= 70 dann
+        gebe_zurueck ch - 55
+    Ende
+    Wenn ch >= 97 und ch <= 102 dann
+        gebe_zurueck ch - 87
+    Ende
+    gebe_zurueck -1
+Ende
+
+Funktion url_decode(str)
+    len = str_len(str)
+    result = alloc(8 + len + 1)
+    pos = 0
+    i = 0
+    Solange i < len
+        ch = str_at(str, i)
+        Wenn ch == 37 und i + 2 < len dann
+            h1 = str_at(str, i + 1)
+            h2 = str_at(str, i + 2)
+            high = hex_digit_val(h1)
+            low = hex_digit_val(h2)
+            Wenn high != -1 und low != -1 dann
+                raw_setbyte(result, 8 + pos, high * 16 + low)
+                pos = pos + 1
+                i = i + 3
+            Sonst
+                raw_setbyte(result, 8 + pos, ch)
+                pos = pos + 1
+                i = i + 1
+            Ende
+        Sonst
+            Wenn ch == 43 dann
+                raw_setbyte(result, 8 + pos, 32)
+            Sonst
+                raw_setbyte(result, 8 + pos, ch)
+            Ende
+            pos = pos + 1
+            i = i + 1
+        Ende
+    Ende
+    raw_setbyte(result, 0, pos % 256)
+    raw_setbyte(result, 1, (pos / 256) % 256)
+    raw_setbyte(result, 2, (pos / 65536) % 256)
+    raw_setbyte(result, 3, (pos / 16777216) % 256)
+    raw_setbyte(result, 8 + pos, 0)
+    gebe_zurueck result
+Ende
+
+// ========== 新增：字符串查找 ==========
+
+Funktion str_find(str, substr)
+    sl = str_len(str)
+    subl = str_len(substr)
+    Wenn subl == 0 dann
+        gebe_zurueck 0
+    Ende
+    Wenn subl > sl dann
+        gebe_zurueck -1
+    Ende
+    i = 0
+    found_pos = -1
+    found = 0
+    Solange i <= sl - subl und found == 0
+        j = 0
+        match = 1
+        Solange j < subl und match == 1
+            Wenn str_at(str, i + j) != str_at(substr, j) dann
+                match = 0
+            Ende
+            j = j + 1
+        Ende
+        Wenn match == 1 dann
+            found_pos = i
+            found = 1
+            i = 999999
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck found_pos
+Ende
+
+// 大小写不敏感匹配：检查 str 在 pos 位置是否以 pattern 开头
+Funktion str_ieq_at(str, pos, pattern)
+    sl = str_len(str)
+    pl = str_len(pattern)
+    Wenn pos + pl > sl dann
+        gebe_zurueck 0
+    Ende
+    i = 0
+    match = 1
+    Solange i < pl und match == 1
+        c1 = str_at(str, pos + i)
+        c2 = str_at(pattern, i)
+        Wenn c1 >= 65 und c1 <= 90 dann
+            c1 = c1 + 32
+        Ende
+        Wenn c2 >= 65 und c2 <= 90 dann
+            c2 = c2 + 32
+        Ende
+        Wenn c1 != c2 dann
+            match = 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck match
+Ende
+
+// 截断字符串到最大长度（用于128K限制）
+Funktion truncate_str(str, max_len)
+    len = str_len(str)
+    Wenn len <= max_len dann
+        gebe_zurueck str
+    Ende
+
+    result = alloc(8 + max_len + 1)
+    raw_setbyte(result, 0, max_len % 256)
+    raw_setbyte(result, 1, (max_len / 256) % 256)
+    raw_setbyte(result, 2, (max_len / 65536) % 256)
+    raw_setbyte(result, 3, (max_len / 16777216) % 256)
+    raw_setbyte(result, 4, 0)
+    raw_setbyte(result, 5, 0)
+    raw_setbyte(result, 6, 0)
+    raw_setbyte(result, 7, 0)
+    i = 0
+    Solange i < max_len
+        raw_setbyte(result, 8 + i, str_at(str, i))
+        i = i + 1
+    Ende
+    raw_setbyte(result, 8 + max_len, 0)
+    gebe_zurueck result
+Ende
+
+// 统计字符串中换行符数量
+Funktion count_lines(str)
+    len = str_len(str)
+    count = 0
+    i = 0
+    Solange i < len
+        Wenn str_at(str, i) == 10 dann
+            count = count + 1
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck count
+Ende

@@ -1,0 +1,167 @@
+// ============================================================
+// uv.staro — .Uv 自研权重(网云)数据集格式: 写入器 + 加载器
+// Universe 3D V1 阶段0.1(格式规范) / 0.2(写出) / 0.4(加载)
+// 纯 StarC, 零第三方依赖 (file + sys + tensor)
+//
+// ================= .Uv 二进制布局 (小端) =================
+//  Header 128B:
+//    [0:4]   magic u32   = 825251413 ("UV01" 小端)
+//    [4:8]   version u32 = 1
+//    [8:12]  header_size u32 = 128
+//    [12:16] flags u32   (bit0=has_material, bit1=has_marks)
+//    [16:24] nV u64      (点云顶点数)
+//    [24:32] nF u64      (面云三角数)
+//    [32:36] nPrim u32   (prim 数)
+//    [36:40] V u32       (体网络分辨率)
+//    [40:48] occ u64     (体网络占用单元数)
+//    [48:56] point_off u64
+//    [56:64] point_len u64  (= nV*12)
+//    [64:72] face_off u64
+//    [72:80] face_len u64   (= nF*12)
+//    [80:88] voxnet_off u64
+//    [88:96] voxnet_len u64 (= 8 + occ*8)
+//    [96:104]  material_off u64
+//    [104:112] material_len u64
+//    [112:120] marks_off u64
+//    [120:128] marks_len u64
+//  点云段 (point_off..):   f32 位模式 [nV*3],  nV*12 字节
+//  面云段 (face_off..):    u32 [nF*3],          nF*12 字节
+//  体网络段 (voxnet_off..):
+//    [0:8]   occ u64
+//    [8:8+occ*4]     cell_idx u32[occ]  (非零单元一维索引, 升序)
+//    [8+occ*4:8+occ*8] cell_cnt u32[occ] (每单元点数)
+//  材质段 (可选, flags.bit0) / 标记段 (可选, flags.bit1)
+// ============================================================
+// uv_load 返回 out 结构 (调用方 alloc(112)):
+//   [0] base   [8] fsize [16] nV [24] nF [32] nPrim [36] V [40] occ
+//   [48] point_ptr [56] face_ptr [64] voxnet_ptr
+//   [80..112] mmap 结构副本 (供 uv_unload)
+// ============================================================
+
+// ---- .Uv 写入器: 把网云(点云+面云+体网络)写为 .Uv 文件 ----
+// path: StarC 字符串; points/faces: 数据缓冲; cell_idx/cell_cnt: occ 长度数组
+// 返回 1 成功 0 失败
+Funktion uv_write(path, points, faces, cell_idx, cell_cnt, nV, nF, V, occ, nPrim, flags)
+    h = file_open_sh(path, 1073741824, 2)  // GENERIC_WRITE + CREATE_ALWAYS
+    Wenn h == -1 dann
+        gebe_zurueck 0
+    Ende
+    point_len = nV * 12
+    face_len = nF * 12
+    voxnet_len = 8 + occ * 8
+    point_off = 128
+    face_off = point_off + point_len
+    voxnet_off = face_off + face_len
+    hdr = alloc(128)
+    raw_set32(hdr, 0, 825251413)   // magic "UV01"
+    raw_set32(hdr, 4, 1)           // version
+    raw_set32(hdr, 8, 128)         // header_size
+    raw_set32(hdr, 12, flags)      // flags
+    raw_set64(hdr, 16, nV)
+    raw_set64(hdr, 24, nF)
+    raw_set32(hdr, 32, nPrim)
+    raw_set32(hdr, 36, V)
+    raw_set64(hdr, 40, occ)
+    raw_set64(hdr, 48, point_off)
+    raw_set64(hdr, 56, point_len)
+    raw_set64(hdr, 64, face_off)
+    raw_set64(hdr, 72, face_len)
+    raw_set64(hdr, 80, voxnet_off)
+    raw_set64(hdr, 88, voxnet_len)
+    raw_set64(hdr, 96, 0)          // material_off
+    raw_set64(hdr, 104, 0)         // material_len
+    raw_set64(hdr, 112, 0)         // marks_off
+    raw_set64(hdr, 120, 0)         // marks_len
+    r1 = file_write_at(h, hdr, 0, 128)
+    Wenn r1 != 1 dann
+        file_close(h)
+        gebe_zurueck 0
+    Ende
+    r2 = file_write_at(h, points, point_off, point_len)
+    Wenn r2 != 1 dann
+        file_close(h)
+        gebe_zurueck 0
+    Ende
+    r3 = file_write_at(h, faces, face_off, face_len)
+    Wenn r3 != 1 dann
+        file_close(h)
+        gebe_zurueck 0
+    Ende
+    // 体网络段: 组装 [occ][cell_idx...][cell_cnt...]
+    vn = alloc(8 + occ * 8)
+    raw_set64(vn, 0, occ)
+    i = 0
+    Solange i < occ
+        raw_set32(vn, 8 + i * 4, raw_get32(cell_idx, i * 4))
+        raw_set32(vn, 8 + occ * 4 + i * 4, raw_get32(cell_cnt, i * 4))
+        i = i + 1
+    Ende
+    r4 = file_write_at(h, vn, voxnet_off, voxnet_len)
+    Wenn r4 != 1 dann
+        file_close(h)
+        gebe_zurueck 0
+    Ende
+    file_close(h)
+    gebe_zurueck 1
+Ende
+
+// ---- .Uv 加载器: mmap 并解析 header, 填 out ----
+// 返回 1 成功 0 失败; 调用方需 alloc(112) 的 out, 用完调 uv_unload(out)
+Funktion uv_load(path, out)
+    m = alloc(32)
+    r = file_mmap(path, m)
+    Wenn r != 1 dann
+        gebe_zurueck 0
+    Ende
+    base = raw_get64(m, 0)
+    fsize = raw_get64(m, 24)
+    magic = raw_get32(base, 0)
+    Wenn magic != 825251413 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    version = raw_get32(base, 4)
+    Wenn version != 1 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    hsize = raw_get32(base, 8)
+    Wenn hsize != 128 dann
+        file_munmap(m)
+        gebe_zurueck 0
+    Ende
+    nV = raw_get64(base, 16)
+    nF = raw_get64(base, 24)
+    nPrim = raw_get32(base, 32)
+    V = raw_get32(base, 36)
+    occ = raw_get64(base, 40)
+    point_off = raw_get64(base, 48)
+    face_off = raw_get64(base, 64)
+    voxnet_off = raw_get64(base, 80)
+    raw_set64(out, 0, base)
+    raw_set64(out, 8, fsize)
+    raw_set64(out, 16, nV)
+    raw_set64(out, 24, nF)
+    raw_set32(out, 32, nPrim)
+    raw_set32(out, 36, V)
+    raw_set64(out, 40, occ)
+    raw_set64(out, 48, base + point_off)
+    raw_set64(out, 56, base + face_off)
+    raw_set64(out, 64, base + voxnet_off)
+    raw_set64(out, 80, raw_get64(m, 0))
+    raw_set64(out, 88, raw_get64(m, 8))
+    raw_set64(out, 96, raw_get64(m, 16))
+    raw_set64(out, 104, raw_get64(m, 24))
+    gebe_zurueck 1
+Ende
+
+// ---- .Uv 卸载: 释放 uv_load 的 mmap ----
+Funktion uv_unload(out)
+    mp = alloc(32)
+    raw_set64(mp, 0, raw_get64(out, 80))
+    raw_set64(mp, 8, raw_get64(out, 88))
+    raw_set64(mp, 16, raw_get64(out, 96))
+    raw_set64(mp, 24, raw_get64(out, 104))
+    file_munmap(mp)
+    gebe_zurueck 0
+Ende

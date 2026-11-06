@@ -1,0 +1,53 @@
+// ============================================================================
+//  matmul.staro —— language-bench 考题「Matmul」能力层
+//  铁律 E：能力全在 .staro。256×256 double 矩阵乘，精确复现 lbgen ref_matmul。
+//  ★ 浮点全用 fp.staro（编译器库函数 fadd/fmul/f2i，非内建）；矩阵值均为小整数，
+//    和 ≤12800 在 double 内精确，故 f2i(C)=floor(C+0.5)。
+//  matmul_run(buf) -> 返回 alloc(n*8)：65536 个 int64 word（floor(C+0.5)）。
+//  buf = 实例净荷（u32 m + A row-major f64 + B row-major f64）。
+// ============================================================================
+
+Funktion matmul_run(buf)
+    m = fio_read_i32(buf, 0)
+    aoff = 4
+    boff = 4 + m * m * 8
+    n = m * m
+
+    // C 清零（作为浮点位模式，0 位模式 = +0.0）
+    c = alloc(n * 8)
+    i = 0
+    Solange i < n
+        write_u64(c, i * 8, 0)
+        i = i + 1
+    Ende
+
+    // i-k-j 矩阵乘：C[i][j] += A[i][k] * B[k][j]
+    i = 0
+    Solange i < m
+        k = 0
+        Solange k < m
+            aik = fio_read_f64(buf, aoff + (i * m + k) * 8)
+            j = 0
+            Solange j < m
+                idx = i * m + j
+                cj = read_i64(c, idx * 8)                     // C[i][j] 位模式（有符号）
+                bk = fio_read_f64(buf, boff + (k * m + j) * 8)
+                s = fp_add(cj, fp_mul(aik, bk))               // 新 C[i][j] 位模式
+                write_u64(c, idx * 8, s)
+                j = j + 1
+            Ende
+            k = k + 1
+        Ende
+        i = i + 1
+    Ende
+
+    // 输出 word：floor(C+0.5)。C 为精确整数（和 ≤12800），f2i 即得。
+    out = alloc(n * 8)
+    j = 0
+    Solange j < n
+        cv = read_i64(c, j * 8)
+        write_i64(out, j * 8, f2i(cv))
+        j = j + 1
+    Ende
+    gebe_zurueck out
+Ende

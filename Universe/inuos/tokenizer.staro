@@ -1,0 +1,254 @@
+// inuos/tokenizer.staro - DeepSeek-V4 BPE tokenizer (ByteLevel + BPE)
+// 依赖: sys str file
+//
+// 符号语义 (2026-10-30 修正, 与 tokenizers 权威对齐):
+//   tokenizers 的 ByteLevel+BPE 操作"符号序列"(char code point).
+//   符号 = byte_to_char(UTF-8字节) (GPT-2 表), 空格 0x20 -> 0x120 (Ġ) 自动统一.
+//   所以 tokenizer.bin/merges_rank.bin 按符号序列(u16) 存储, 不是 UTF-8 字节.
+//   引擎内符号用 u32 值 (0x000-0x1FF 范围).
+//
+// 内存读取: 编译器内置 raw_getbyte/raw_get16 只支持 alloc, 在 mmap 恒返回 0 (bug).
+//   一律用 raw_byteat (能读 alloc+mmap). raw_get32/raw_get64 是 sys.staro 库函数, 可靠.
+//   tz_get16 是本地 u16 读 (基于 raw_byteat).
+
+// ---- 小端 16 位读 (基于 raw_byteat, 支持 mmap) ----
+Funktion tz_get16(ptr, off)
+    v = raw_byteat(ptr, off)
+    v = v + raw_byteat(ptr, off + 1) * 256
+    gebe_zurueck v
+Ende
+
+// ---- 哈希 (乘加取模, StarC 无位运算) ----
+// 输入: u16 符号序列 (p 每符号 2 字节)
+Funktion tz_hash16(p, n)
+    h = 2166136261
+    i = 0
+    Solange i < n
+        h = h * 16777619
+        h = (h + tz_get16(p, i * 2)) % 4294967296
+        i = i + 1
+    Ende
+    gebe_zurueck h
+Ende
+
+// 输入: u32 符号序列 (p 每符号 4 字节)
+Funktion tz_hash32(p, n)
+    h = 2166136261
+    i = 0
+    Solange i < n
+        h = h * 16777619
+        h = (h + raw_get32(p, i * 4)) % 4294967296
+        i = i + 1
+    Ende
+    gebe_zurueck h
+Ende
+
+// 初始化 vocab 哈希表 + merges_rank 哈希表
+// 返回 byte_to_char 表地址 (存全局, tz_encode 用)
+// tokenizer.bin 布局: hdr(16) + vocab(u16符号) + merges(u16符号) + btc(256 u16)
+Funktion tz_init(tbuf, rbuf, hashbuf, rrankbuf)
+    cap = 1048576
+    base = raw_get64(tbuf, 0)
+    vocab_size = raw_get32(base, 0)
+    vb = raw_get32(base, 8)
+    mb = raw_get32(base, 12)
+    vstart = base + 16
+    mstart = vstart + vb
+    btc = mstart + mb
+    // vocab 哈希表: key = u16 符号序列
+    i = 0
+    Solange i < cap
+        raw_set32(hashbuf, i * 12 + 8, 1)
+        i = i + 1
+    Ende
+    voff = vstart
+    i = 0
+    Solange i < vocab_size
+        nsym = tz_get16(voff, 0)
+        key = voff + 2
+        h = tz_hash16(key, nsym)
+        slot = h % cap
+        Solange raw_get32(hashbuf, slot * 12 + 8) == 0
+            slot = (slot + 1) % cap
+        Ende
+        raw_set32(hashbuf, slot * 12 + 0, h)
+        raw_set32(hashbuf, slot * 12 + 4, i)
+        raw_set32(hashbuf, slot * 12 + 8, 0)
+        voff = voff + 2 + nsym * 2
+        i = i + 1
+    Ende
+    // merges_rank 哈希表: key = a符号序列+b符号序列 (连续 u16), value = rank
+    rbase = raw_get64(rbuf, 0)
+    rcount = 127741
+    i = 0
+    Solange i < cap
+        raw_set32(rrankbuf, i * 12 + 8, 1)
+        i = i + 1
+    Ende
+    roff = rbase
+    i = 0
+    Solange i < rcount
+        na = tz_get16(roff, 0)
+        ap = roff + 2
+        nb = tz_get16(ap + na * 2, 0)
+        bp = ap + na * 2 + 2
+        rank = raw_get32(bp + nb * 2, 0)
+        // key = a 符号 + b 符号 (FNV 流式: 先喂 a, 再喂 b, 跳过中间 nb 字段)
+        h = 2166136261
+        j = 0
+        Solange j < na
+            h = h * 16777619
+            h = (h + tz_get16(ap, j * 2)) % 4294967296
+            j = j + 1
+        Ende
+        j = 0
+        Solange j < nb
+            h = h * 16777619
+            h = (h + tz_get16(bp, j * 2)) % 4294967296
+            j = j + 1
+        Ende
+        slot = h % cap
+        Solange raw_get32(rrankbuf, slot * 12 + 8) == 0
+            slot = (slot + 1) % cap
+        Ende
+        raw_set32(rrankbuf, slot * 12 + 0, h)
+        raw_set32(rrankbuf, slot * 12 + 4, rank)
+        raw_set32(rrankbuf, slot * 12 + 8, 0)
+        roff = roff + 2 + na * 2 + 2 + nb * 2 + 4
+        i = i + 1
+    Ende
+    gebe_zurueck btc
+Ende
+
+// 查 vocab: p 是 u32 符号序列
+Funktion tz_lookup(hashbuf, p, n)
+    cap = 1048576
+    h = tz_hash32(p, n)
+    slot = h % cap
+    i = 0
+    Solange i < cap
+        Wenn raw_get32(hashbuf, slot * 12 + 8) == 1 dann
+            gebe_zurueck -1
+        Ende
+        Wenn raw_get32(hashbuf, slot * 12 + 0) == h dann
+            gebe_zurueck raw_get32(hashbuf, slot * 12 + 4)
+        Ende
+        slot = (slot + 1) % cap
+        i = i + 1
+    Ende
+    gebe_zurueck -1
+Ende
+
+// 查 merges_rank: a,b 是 u32 符号序列 -> rank, 未命中 -1
+Funktion tz_rank(rrankbuf, ap, la, bp, lb)
+    cap = 1048576
+    // 拼接 key = a 符号 + b 符号 (u32)
+    kl = la + lb
+    kbuf = alloc(kl * 4)
+    j = 0
+    Solange j < la
+        raw_set32(kbuf, j * 4, raw_get32(ap, j * 4))
+        j = j + 1
+    Ende
+    j = 0
+    Solange j < lb
+        raw_set32(kbuf, (la + j) * 4, raw_get32(bp, j * 4))
+        j = j + 1
+    Ende
+    h = tz_hash32(kbuf, kl)
+    slot = h % cap
+    i = 0
+    Solange i < cap
+        Wenn raw_get32(rrankbuf, slot * 12 + 8) == 1 dann
+            gebe_zurueck -1
+        Ende
+        Wenn raw_get32(rrankbuf, slot * 12 + 0) == h dann
+            gebe_zurueck raw_get32(rrankbuf, slot * 12 + 4)
+        Ende
+        slot = (slot + 1) % cap
+        i = i + 1
+    Ende
+    gebe_zurueck -1
+Ende
+
+// 把 StarC 字符串 (8字节长度头+数据) 复制成 alloc 原始缓冲 (数据从 offset 0)
+Funktion tz_strdata(s, slen)
+    buf = alloc(slen)
+    i = 0
+    Solange i < slen
+        raw_setbyte(buf, i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    gebe_zurueck buf
+Ende
+
+// 输入 UTF-8 字节串 -> 符号流 (u32 数组 syms), 用 byte_to_char 表 (btc, 256 u16)
+// s 是原始字节缓冲 (offset 0 起), slen 字节数
+Funktion tz_encode(s, slen, syms, btc)
+    n = 0
+    i = 0
+    Solange i < slen
+        b = raw_byteat(s, i)
+        raw_set32(syms, n * 4, tz_get16(btc, b * 2))
+        n = n + 1
+        i = i + 1
+    Ende
+    gebe_zurueck n
+Ende
+
+// BPE: 符号流 -> token id (标准算法, 每轮找最小 rank 对)
+// token 用区间 [st,en) 表示, 符号存 syms (u32 数组)
+Funktion tz_tokenize(hashbuf, rrankbuf, syms, nsym, ids)
+    st = alloc(nsym * 4)
+    en = alloc(nsym * 4)
+    i = 0
+    Solange i < nsym
+        raw_set32(st, i * 4, i)
+        raw_set32(en, i * 4, i + 1)
+        i = i + 1
+    Ende
+    ntok = nsym
+    again = 1
+    Solange again == 1
+        again = 0
+        // 找最小 rank 的相邻对
+        best_rank = 2147483647
+        best_i = -1
+        ti = 0
+        Solange ti < ntok - 1
+            la = raw_get32(en, ti * 4) - raw_get32(st, ti * 4)
+            lb = raw_get32(en, (ti + 1) * 4) - raw_get32(st, (ti + 1) * 4)
+            // a 和 b 的 u32 符号序列 (直接在 syms 里)
+            ap = syms + raw_get32(st, ti * 4) * 4
+            bp = syms + raw_get32(st, (ti + 1) * 4) * 4
+            rk = tz_rank(rrankbuf, ap, la, bp, lb)
+            Wenn rk >= 0 dann
+                Wenn rk < best_rank dann
+                    best_rank = rk
+                    best_i = ti
+                Ende
+            Ende
+            ti = ti + 1
+        Ende
+        Wenn best_i >= 0 dann
+            // 合并 best_i 和 best_i+1
+            raw_set32(en, best_i * 4, raw_get32(en, (best_i + 1) * 4))
+            k = best_i + 1
+            Solange k < ntok - 1
+                raw_set32(st, k * 4, raw_get32(st, (k + 1) * 4))
+                raw_set32(en, k * 4, raw_get32(en, (k + 1) * 4))
+                k = k + 1
+            Ende
+            ntok = ntok - 1
+            again = 1
+        Ende
+    Ende
+    i = 0
+    Solange i < ntok
+        tlen = raw_get32(en, i * 4) - raw_get32(st, i * 4)
+        tmp = syms + raw_get32(st, i * 4) * 4
+        raw_set32(ids, i * 4, tz_lookup(hashbuf, tmp, tlen))
+        i = i + 1
+    Ende
+    gebe_zurueck ntok
+Ende

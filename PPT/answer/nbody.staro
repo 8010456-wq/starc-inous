@@ -1,0 +1,134 @@
+// ============================================================================
+//  nbody.staro —— language-bench 考题「N-Body」能力层
+//  铁律 E：能力全在 .staro。5 体 × 1e6 步，精确复现 lbgen ref_nbody。
+//  ★ 浮点全用 fp.staro（fadd/fsub/fmul/fdiv/fsqrt/fneg/f2i/i2f，编译器库函数）。
+//    操作顺序严格按 C 参考（左结合、逐 pair 就地更新速度、先算 dx/dy/dz 再 mag）。
+//    常量用位模式字面量（StarC 无浮点字面量；位模式精确可表示，见 nbconst.c）。
+//  nbody_run(buf) -> 返回 alloc(16)：[rnd9(e0), rnd9(e1)] 各 8 字节。
+//  buf = 实例净荷（5×7 双精度初值，seed=0）。
+// ============================================================================
+
+// ---- 常量位模式（0x.. = 十进制字面量，StarC 词法仅十进制）----
+// pi = 4614256656552045848；SOLAR = (4*pi)*pi = 4630752910647379422
+// dt = 0.01 = 4576918229304087675；0.5 = 4602678819172646912；1e9 = 4741671816366391296
+
+Funktion nb_get(b, i, k)
+    gebe_zurueck read_u64(b, (i * 7 + k) * 8)
+Ende
+
+Funktion nb_set(b, i, k, v)
+    write_u64(b, (i * 7 + k) * 8, v)
+    gebe_zurueck 0
+Ende
+
+// 能量（严格左结合，复现 C nb_energy）
+Funktion nb_energy(b)
+    e = 0                                  // +0.0 位模式
+    i = 0
+    Solange i < 5
+        b6 = nb_get(b, i, 6)
+        b3 = nb_get(b, i, 3)
+        b4 = nb_get(b, i, 4)
+        b5 = nb_get(b, i, 5)
+        sum = fp_add(fp_add(fp_mul(b3, b3), fp_mul(b4, b4)), fp_mul(b5, b5))
+        e = fp_add(e, fp_mul(fp_mul(4602678819172646912, b6), sum))   // 0.5*b6*sum
+        j = i + 1
+        Solange j < 5
+            dx = fp_sub(nb_get(b, i, 0), nb_get(b, j, 0))
+            dy = fp_sub(nb_get(b, i, 1), nb_get(b, j, 1))
+            dz = fp_sub(nb_get(b, i, 2), nb_get(b, j, 2))
+            d = fp_add(fp_add(fp_mul(dx, dx), fp_mul(dy, dy)), fp_mul(dz, dz))
+            term = fp_div(fp_mul(b6, nb_get(b, j, 6)), fp_sqrt(d))
+            e = fp_sub(e, term)
+            j = j + 1
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck e
+Ende
+
+// floor(x*1e9+0.5)，复现 C rnd9（x 为负时需 floor 而非 trunc）
+Funktion rnd9(x)
+    t = fp_add(fp_mul(x, 4741671816366391296), 4602678819172646912)   // x*1e9 + 0.5
+    v = f2i(t)
+    ti = i2f(v)
+    Wenn fp_cmp(t, 0) < 0 dann
+        Wenn fp_cmp(ti, t) != 0 dann
+            v = v - 1
+        Ende
+    Ende
+    gebe_zurueck v
+Ende
+
+Funktion nbody_run(buf)
+    // 读入 5×7 初值
+    b = alloc(280)
+    i = 0
+    Solange i < 5
+        k = 0
+        Solange k < 7
+            nb_set(b, i, k, fio_read_f64(buf, (i * 7 + k) * 8))
+            k = k + 1
+        Ende
+        i = i + 1
+    Ende
+
+    // 动量修正：px = Σ b[i][3]*b[i][6]；b[0][3] = -px/SOLAR
+    px = 0
+    py = 0
+    pz = 0
+    i = 0
+    Solange i < 5
+        px = fp_add(px, fp_mul(nb_get(b, i, 3), nb_get(b, i, 6)))
+        py = fp_add(py, fp_mul(nb_get(b, i, 4), nb_get(b, i, 6)))
+        pz = fp_add(pz, fp_mul(nb_get(b, i, 5), nb_get(b, i, 6)))
+        i = i + 1
+    Ende
+    nb_set(b, 0, 3, fp_div(fp_neg(px), 4630752910647379422))
+    nb_set(b, 0, 4, fp_div(fp_neg(py), 4630752910647379422))
+    nb_set(b, 0, 5, fp_div(fp_neg(pz), 4630752910647379422))
+
+    // 能量 e0
+    e0 = nb_energy(b)
+
+    // 1e6 步：逐 pair 就地更新速度，再更新位置
+    step = 0
+    Solange step < 1000000
+        i = 0
+        Solange i < 5
+            j = i + 1
+            Solange j < 5
+                dx = fp_sub(nb_get(b, i, 0), nb_get(b, j, 0))
+                dy = fp_sub(nb_get(b, i, 1), nb_get(b, j, 1))
+                dz = fp_sub(nb_get(b, i, 2), nb_get(b, j, 2))
+                d2 = fp_add(fp_add(fp_mul(dx, dx), fp_mul(dy, dy)), fp_mul(dz, dz))
+                mag = fp_div(4576918229304087675, fp_mul(d2, fp_sqrt(d2)))   // dt/(d2*sqrt(d2))
+                bm = fp_mul(nb_get(b, i, 6), mag)
+                cm = fp_mul(nb_get(b, j, 6), mag)
+                nb_set(b, i, 3, fp_sub(nb_get(b, i, 3), fp_mul(dx, cm)))
+                nb_set(b, i, 4, fp_sub(nb_get(b, i, 4), fp_mul(dy, cm)))
+                nb_set(b, i, 5, fp_sub(nb_get(b, i, 5), fp_mul(dz, cm)))
+                nb_set(b, j, 3, fp_add(nb_get(b, j, 3), fp_mul(dx, bm)))
+                nb_set(b, j, 4, fp_add(nb_get(b, j, 4), fp_mul(dy, bm)))
+                nb_set(b, j, 5, fp_add(nb_get(b, j, 5), fp_mul(dz, bm)))
+                j = j + 1
+            Ende
+            i = i + 1
+        Ende
+        i = 0
+        Solange i < 5
+            nb_set(b, i, 0, fp_add(nb_get(b, i, 0), fp_mul(4576918229304087675, nb_get(b, i, 3))))
+            nb_set(b, i, 1, fp_add(nb_get(b, i, 1), fp_mul(4576918229304087675, nb_get(b, i, 4))))
+            nb_set(b, i, 2, fp_add(nb_get(b, i, 2), fp_mul(4576918229304087675, nb_get(b, i, 5))))
+            i = i + 1
+        Ende
+        step = step + 1
+    Ende
+
+    e1 = nb_energy(b)
+
+    out = alloc(16)
+    write_u64(out, 0, rnd9(e0))
+    write_u64(out, 8, rnd9(e1))
+    gebe_zurueck out
+Ende

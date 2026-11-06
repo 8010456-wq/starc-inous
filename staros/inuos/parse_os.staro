@@ -1,0 +1,723 @@
+// inuos/parse_os.staro - StarOS 内核 DSL 解析器 (tokens -> AST + 函数表 + RPN + 字符串池)
+// 依赖: sys.staro(raw_set32/get32/setbyte/byteat), str.staro(str_len), lexer.staro(lex_tokenize)
+//
+// ===== 内核 DSL 语法 (OS 版, 多函数) =====
+//   Funktion name(int a, int b, ptr p)
+//     int k                 // 局部整数变量
+//     int k = expr          // 声明+初始化
+//     k = expr              // 整数赋值
+//     arr[i] = expr         // 数组/内存存储
+//     v = arr[i]            // 数组/内存加载
+//     v = name(args)        // 函数调用(赋值)
+//     name(args)            // 函数调用(语句)
+//     vga_str("...")        // 能力内置调用(字符串参数)
+//     Ausgeben "..."        // 字符串字面量语句 -> VGA 打印
+//     Solange cond          // 循环
+//       ...
+//     Ende
+//     Wenn cond dann        // if
+//       ...
+//     Sonst
+//       ...
+//     Ende
+//     gebe_zurueck expr     // 返回
+//   Ende
+//
+// ===== AST 节点 (32 字节): [0]type [4]a [8]b [12]c [16]d [20]e [24]f =====
+//   4=func:      a=param_count b=body_start c=body_count d=func_id e=frame_slots
+//   5=int assign:a=rreg b=irpn_start c=irpn_len
+//   7=loop:      a=cond_start b=cond_len c=body_start d=body_count
+//   8=if:        a=cond_start b=cond_len c=then_start d=then_count e=else_start f=else_count
+//   2=ret:       b=irpn_start c=irpn_len
+//   9=call:      a=func_id b=arg_irpn_start c=arg_irpn_len d=ret_reg(0=无,>0=rreg)
+//   10=strprint: b=str_off c=str_len      (VGA 打印字符串字面量)
+//
+// ===== 函数表 (每项 28B): [0]name_off [4]name_len [8]param_count [12]body_start [16]body_count [20]frame_slots [24]id =====
+// ===== 符号表 (每项 16B): [0]name_off [4]name_len [8]kind [12]aux =====
+//   kind: 1=int var 2=array(ptr) 3=int param; aux>=16
+// ===== 整数 RPN 项 (8B): [0]type [4]a =====
+//   1=int const 2=int var 4=int op 6=builtin
+// ===== 字符串池: strpool 缓冲, 每串 [4]=off [8]=len 连续存, 数据在 spdata =====
+
+// 字符串比较: tokbuf[s..s+l) 与 kw (StarC 字符串) 相等
+Funktion os_str_eq(tokbuf, s, l, kw)
+    kl = str_len(kw)
+    Wenn kl != l dann gebe_zurueck 0 Ende
+    i = 0
+    Solange i < l
+        Wenn raw_byteat(tokbuf, s + i) != raw_byteat(kw, 8 + i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 能力内置识别: 返回内置 id, 非内置 -1
+//   0=x86_cli 1=x86_sti 2=x86_hlt 3=port_outb 4=port_inb 5=x86_read_cr2
+//   6=vga_putc 7=vga_str 8=vga_clear 9=kernel_halt_loop
+Funktion os_builtin_id(tokbuf, s, l)
+    Wenn os_str_eq(tokbuf, s, l, "x86_cli") dann gebe_zurueck 0 Ende
+    Wenn os_str_eq(tokbuf, s, l, "x86_sti") dann gebe_zurueck 1 Ende
+    Wenn os_str_eq(tokbuf, s, l, "x86_hlt") dann gebe_zurueck 2 Ende
+    Wenn os_str_eq(tokbuf, s, l, "port_outb") dann gebe_zurueck 3 Ende
+    Wenn os_str_eq(tokbuf, s, l, "port_inb") dann gebe_zurueck 4 Ende
+    Wenn os_str_eq(tokbuf, s, l, "x86_read_cr2") dann gebe_zurueck 5 Ende
+    Wenn os_str_eq(tokbuf, s, l, "vga_putc") dann gebe_zurueck 6 Ende
+    Wenn os_str_eq(tokbuf, s, l, "vga_str") dann gebe_zurueck 7 Ende
+    Wenn os_str_eq(tokbuf, s, l, "vga_clear") dann gebe_zurueck 8 Ende
+    Wenn os_str_eq(tokbuf, s, l, "kernel_halt_loop") dann gebe_zurueck 9 Ende
+    gebe_zurueck 0 - 1
+Ende
+
+// 整数运算符优先级: * / = 3; + - = 2; < > <= >= = 1; und = 0
+Funktion os_int_op_prio(c)
+    Wenn c == 42 dann gebe_zurueck 3 Ende
+    Wenn c == 47 dann gebe_zurueck 3 Ende
+    Wenn c == 43 dann gebe_zurueck 2 Ende
+    Wenn c == 45 dann gebe_zurueck 2 Ende
+    Wenn c == 60 dann gebe_zurueck 1 Ende
+    Wenn c == 61 dann gebe_zurueck 1 Ende
+    Wenn c == 62 dann gebe_zurueck 1 Ende
+    Wenn c == 64 dann gebe_zurueck 1 Ende
+    Wenn c == 65 dann gebe_zurueck 1 Ende
+    gebe_zurueck 0
+Ende
+
+// 符号表查找
+Funktion os_var_find(symtab, symcount, tokbuf, name_s, name_l)
+    i = 0
+    Solange i < symcount
+        ns = raw_get32(symtab, i * 16)
+        nl = raw_get32(symtab, i * 16 + 4)
+        Wenn nl == name_l dann
+            match = 1
+            k = 0
+            Solange k < name_l
+                Wenn raw_byteat(tokbuf, ns + k) != raw_byteat(tokbuf, name_s + k) dann
+                    match = 0
+                Ende
+                k = k + 1
+            Ende
+            Wenn match == 1 dann gebe_zurueck i Ende
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 0 - 1
+Ende
+
+// 添加变量 (kind 由调用方定), 返回 sym 索引; aux 计数在 st[20](int) / st[28](array)
+Funktion os_add_var(symtab, st, tokbuf, name_s, name_l, kind)
+    vid = raw_get32(st, 0)
+    raw_set32(symtab, vid * 16, name_s)
+    raw_set32(symtab, vid * 16 + 4, name_l)
+    raw_set32(symtab, vid * 16 + 8, kind)
+    Wenn kind == 2 dann  // array
+        raw_set32(symtab, vid * 16 + 12, 16 + raw_get32(st, 28))
+        raw_set32(st, 28, raw_get32(st, 28) + 1)
+    Sonst  // int (var 或 param)
+        raw_set32(symtab, vid * 16 + 12, 16 + raw_get32(st, 20))
+        raw_set32(st, 20, raw_get32(st, 20) + 1)
+    Ende
+    raw_set32(st, 0, vid + 1)
+    gebe_zurueck vid
+Ende
+
+// 函数表查找: 返回函数 id 或 -1
+Funktion os_func_find(funcs, fcount, tokbuf, name_s, name_l)
+    i = 0
+    Solange i < fcount
+        ns = raw_get32(funcs, i * 28)
+        nl = raw_get32(funcs, i * 28 + 4)
+        Wenn nl == name_l dann
+            match = 1
+            k = 0
+            Solange k < name_l
+                Wenn raw_byteat(tokbuf, ns + k) != raw_byteat(tokbuf, name_s + k) dann
+                    match = 0
+                Ende
+                k = k + 1
+            Ende
+            Wenn match == 1 dann gebe_zurueck i Ende
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 0 - 1
+Ende
+
+// 整数表达式 (Shunting-Yard), 写 irpn[st[4]..], 返回新 i; funcs/fcount 用于函数调用识别
+Funktion os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+    ostack = alloc(256)
+    osp = 0
+    in = raw_get32(st, 4)
+    stop = 0
+    Solange i < tn und stop == 0
+        base = i * 32
+        t = raw_get32(tokens, base)
+        Wenn t == 6 oder t == 7 dann
+            stop = 1
+        Sonst
+            Wenn t == 3 dann
+                Wenn raw_get32(tokens, base + 4) == 9 dann  // und
+                    stop2 = 0
+                    Solange osp > 0 und stop2 == 0
+                        oc = raw_byteat(ostack, osp - 1)
+                        Wenn oc == 40 dann
+                            stop2 = 1
+                        Sonst
+                            Wenn os_int_op_prio(oc) > 0 dann
+                                raw_set32(irpn, in * 8, 4)
+                                raw_set32(irpn, in * 8 + 4, oc)
+                                in = in + 1
+                                osp = osp - 1
+                            Sonst
+                                stop2 = 1
+                            Ende
+                        Ende
+                    Ende
+                    raw_setbyte(ostack, osp, 0)
+                    osp = osp + 1
+                    i = i + 1
+                Sonst
+                    stop = 1
+                Ende
+            Sonst
+                Wenn t == 1 dann  // 数字
+                    raw_set32(irpn, in * 8, 1)
+                    raw_set32(irpn, in * 8 + 4, raw_get32(tokens, base + 4))
+                    in = in + 1
+                    i = i + 1
+                Sonst
+                    Wenn t == 5 dann  // 字符串字面量 (作为内建参数) -> RPN type8 [0]=8 [4]=sp_off [8]=slen
+                        slen = raw_get32(tokens, base + 4)
+                        sp_off = raw_get32(st, 36)
+                        sp_base = raw_get32(st, 32)
+                        // 写字符串池头部: 不存头部, 直接连续存数据, sp_off 即数据偏移
+                        j = 0
+                        Solange j < slen
+                            raw_setbyte(sp_base, sp_off + j, raw_byteat(tokens, base + 8 + j))
+                            j = j + 1
+                        Ende
+                        raw_set32(irpn, in * 8, 8)
+                        raw_set32(irpn, in * 8 + 4, sp_off)
+                        raw_set32(irpn, in * 8 + 8, slen)
+                        in = in + 2  // type8 占 2 槽
+                        raw_set32(st, 36, sp_off + slen + 1)  // 预留 \0
+                        i = i + 1
+                    Sonst
+                    Wenn t == 2 dann  // 标识符
+                        ilen = raw_get32(tokens, base + 4)
+                        // 函数调用? 已知函数名 + (
+                        Wenn i + 1 < tn und raw_get32(tokens, (i + 1) * 32) == 4 und raw_byteat(tokens, (i + 1) * 32 + 8) == 40 dann
+                            cfid = os_func_find(funcs, fcount, tokens, base + 8, ilen)
+                            Wenn cfid != 0 - 1 dann
+                                // 函数调用 RPN 项 type7: [0]=7 [4]=fid [8]=arg_start [12]=arg_len (占2槽)
+                                i = i + 1  // 跳过函数名
+                                Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 40 dann i = i + 1 Ende
+                                arg_start = raw_get32(st, 4)
+                                alen = 0
+                                stop2 = 0
+                                Solange i < tn und stop2 == 0
+                                    Wenn raw_byteat(tokens, i * 32 + 8) == 41 dann
+                                        i = i + 1
+                                        stop2 = 1
+                                    Sonst
+                                        i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                                        alen = alen + 1
+                                        Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 44 dann i = i + 1 Ende
+                                    Ende
+                                Ende
+                                arg_len = raw_get32(st, 4) - arg_start
+                                raw_set32(irpn, in * 8, 7)
+                                raw_set32(irpn, in * 8 + 4, cfid)
+                                raw_set32(irpn, in * 8 + 8, arg_start)
+                                raw_set32(irpn, in * 8 + 12, arg_len)
+                                in = in + 2
+                            Sonst
+                                vid = os_var_find(symtab, raw_get32(st, 0), tokens, base + 8, ilen)
+                                Wenn vid == 0 - 1 dann
+                                    vid = os_add_var(symtab, st, tokens, base + 8, ilen, 1)
+                                Ende
+                                raw_set32(irpn, in * 8, 2)
+                                raw_set32(irpn, in * 8 + 4, raw_get32(symtab, vid * 16 + 12))
+                                in = in + 1
+                                i = i + 1
+                            Ende
+                        Sonst
+                            vid = os_var_find(symtab, raw_get32(st, 0), tokens, base + 8, ilen)
+                            Wenn vid == 0 - 1 dann
+                                vid = os_add_var(symtab, st, tokens, base + 8, ilen, 1)
+                            Ende
+                            raw_set32(irpn, in * 8, 2)
+                            raw_set32(irpn, in * 8 + 4, raw_get32(symtab, vid * 16 + 12))
+                            in = in + 1
+                            i = i + 1
+                        Ende
+                    Sonst
+                        Wenn t == 4 dann  // 运算符
+                            c = raw_byteat(tokens, base + 8)
+                            Wenn c == 93 dann
+                                stop = 1
+                            Sonst
+                                Wenn c == 44 dann
+                                    stop = 1
+                                Sonst
+                                    Wenn c == 40 dann
+                                        raw_setbyte(ostack, osp, 40)
+                                        osp = osp + 1
+                                        i = i + 1
+                                    Sonst
+                                        Wenn c == 41 dann
+                                            stop2 = 0
+                                            Solange osp > 0 und stop2 == 0
+                                                oc = raw_byteat(ostack, osp - 1)
+                                                Wenn oc == 40 dann
+                                                    osp = osp - 1
+                                                    stop2 = 1
+                                                Sonst
+                                                    raw_set32(irpn, in * 8, 4)
+                                                    raw_set32(irpn, in * 8 + 4, oc)
+                                                    in = in + 1
+                                                    osp = osp - 1
+                                                Ende
+                                            Ende
+                                            i = i + 1
+                                        Sonst
+                                            Wenn c == 60 oder c == 62 oder c == 61 dann
+                                                Wenn i + 1 < tn und raw_get32(tokens, (i + 1) * 32) == 4 und raw_byteat(tokens, (i + 1) * 32 + 8) == 61 dann
+                                                    Wenn c == 60 dann c = 65 Sonst
+                                                        Wenn c == 62 dann c = 64 Ende
+                                                    Ende
+                                                    i = i + 1
+                                                Ende
+                                            Ende
+                                            stop2 = 0
+                                            Solange osp > 0 und stop2 == 0
+                                                oc = raw_byteat(ostack, osp - 1)
+                                                Wenn oc == 40 dann
+                                                    stop2 = 1
+                                                Sonst
+                                                    Wenn os_int_op_prio(oc) >= os_int_op_prio(c) dann
+                                                        raw_set32(irpn, in * 8, 4)
+                                                        raw_set32(irpn, in * 8 + 4, oc)
+                                                        in = in + 1
+                                                        osp = osp - 1
+                                                    Sonst
+                                                        stop2 = 1
+                                                    Ende
+                                                Ende
+                                            Ende
+                                            raw_setbyte(ostack, osp, c)
+                                            osp = osp + 1
+                                            i = i + 1
+                                        Ende
+                                    Ende
+                                Ende
+                            Ende
+                        Sonst
+                            stop = 1
+                        Ende
+                    Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+    Ende
+    Solange osp > 0
+        oc = raw_byteat(ostack, osp - 1)
+        Wenn oc != 40 dann
+            raw_set32(irpn, in * 8, 4)
+            raw_set32(irpn, in * 8 + 4, oc)
+            in = in + 1
+        Ende
+        osp = osp - 1
+    Ende
+    raw_set32(st, 4, in)
+    raw_set32(st, 12, 0)
+    gebe_zurueck i
+Ende
+
+// 前瞻: 从 i 起跳过前导 '(' 判断首个原子是否 int 表达式
+Funktion os_peek_int(tokens, i, tn, symtab, st)
+    j = i
+    Solange j < tn und raw_byteat(tokens, j * 32 + 8) == 40
+        j = j + 1
+    Ende
+    Wenn j >= tn dann gebe_zurueck 0 Ende
+    t = raw_get32(tokens, j * 32)
+    Wenn t == 1 dann gebe_zurueck 1 Ende  // 数字 -> int
+    Wenn t == 2 dann
+        ilen = raw_get32(tokens, j * 32 + 4)
+        vid = os_var_find(symtab, raw_get32(st, 0), tokens, j * 32 + 8, ilen)
+        Wenn vid != 0 - 1 und raw_get32(symtab, vid * 16 + 8) == 1 dann
+            gebe_zurueck 1
+        Ende
+        Wenn vid != 0 - 1 und raw_get32(symtab, vid * 16 + 8) == 3 dann
+            gebe_zurueck 1
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 语句块解析 (递归), 遇 Ende(kw2)/EOF 结束; stopsonst=1 时也停 Sonst(kw5)
+Funktion os_parse_block(tokens, i, tn, ast, irpn, funcs, fcount, symtab, st, stopsonst)
+    stop = 0
+    Solange i < tn und stop == 0
+        base = i * 32
+        t = raw_get32(tokens, base)
+        Wenn t == 6 dann
+            stop = 1
+        Sonst
+            Wenn t == 3 und raw_get32(tokens, base + 4) == 2 dann  // Ende
+                i = i + 1
+                stop = 1
+            Sonst
+                Wenn stopsonst == 1 und t == 3 und raw_get32(tokens, base + 4) == 5 dann
+                    stop = 1
+                Sonst
+                Wenn t == 3 und raw_get32(tokens, base + 4) == 6 dann  // Solange
+                    i = i + 1
+                    cond_start = raw_get32(st, 4)
+                    i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                    cond_len = raw_get32(st, 4) - cond_start
+                    Wenn i < tn und raw_get32(tokens, i * 32) == 7 dann i = i + 1 Ende
+                    node = raw_get32(st, 16)
+                    raw_set32(ast, node * 32, 7)
+                    raw_set32(ast, node * 32 + 4, cond_start)
+                    raw_set32(ast, node * 32 + 8, cond_len)
+                    raw_set32(ast, node * 32 + 12, node + 1)
+                    raw_set32(st, 16, node + 1)
+                    i = os_parse_block(tokens, i, tn, ast, irpn, funcs, fcount, symtab, st, 0)
+                    raw_set32(ast, node * 32 + 16, raw_get32(st, 16) - (node + 1))
+                Sonst
+                    Wenn t == 3 und raw_get32(tokens, base + 4) == 3 dann  // Wenn
+                        i = i + 1
+                        cond_start = raw_get32(st, 4)
+                        i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                        cond_len = raw_get32(st, 4) - cond_start
+                        Wenn i < tn und raw_get32(tokens, i * 32) == 3 und raw_get32(tokens, i * 32 + 4) == 4 dann i = i + 1 Ende
+                        Wenn i < tn und raw_get32(tokens, i * 32) == 7 dann i = i + 1 Ende
+                        node = raw_get32(st, 16)
+                        raw_set32(ast, node * 32, 8)
+                        raw_set32(ast, node * 32 + 4, cond_start)
+                        raw_set32(ast, node * 32 + 8, cond_len)
+                        raw_set32(ast, node * 32 + 12, node + 1)
+                        raw_set32(st, 16, node + 1)
+                        i = os_parse_block(tokens, i, tn, ast, irpn, funcs, fcount, symtab, st, 1)
+                        raw_set32(ast, node * 32 + 16, raw_get32(st, 16) - (node + 1))
+                        Wenn i < tn und raw_get32(tokens, i * 32) == 3 und raw_get32(tokens, i * 32 + 4) == 5 dann
+                            i = i + 1
+                            Wenn i < tn und raw_get32(tokens, i * 32) == 7 dann i = i + 1 Ende
+                            raw_set32(ast, node * 32 + 20, raw_get32(st, 16))
+                            i = os_parse_block(tokens, i, tn, ast, irpn, funcs, fcount, symtab, st, 0)
+                            raw_set32(ast, node * 32 + 24, raw_get32(st, 16) - raw_get32(ast, node * 32 + 20))
+                        Sonst
+                            raw_set32(ast, node * 32 + 20, 0)
+                            raw_set32(ast, node * 32 + 24, 0)
+                        Ende
+                    Sonst
+                        Wenn t == 3 und raw_get32(tokens, base + 4) == 7 dann  // gebe_zurueck
+                            i = i + 1
+                            rpnoff = raw_get32(st, 4)
+                            i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                            rn = raw_get32(st, 4) - rpnoff
+                            node = raw_get32(st, 16)
+                            raw_set32(ast, node * 32, 2)
+                            raw_set32(ast, node * 32 + 8, rpnoff)
+                            raw_set32(ast, node * 32 + 12, rn)
+                            raw_set32(st, 16, node + 1)
+                        Sonst
+                            Wenn t == 3 und raw_get32(tokens, base + 4) == 8 dann  // Ausgeben "str"
+                                i = i + 1
+                                Wenn i < tn und raw_get32(tokens, i * 32) == 5 dann
+                                    slen = raw_get32(tokens, i * 32 + 4)
+                                    // 拷贝字符串进字符串池: 先存 off/len 在 st[32] 附近? 用字符串池区
+                                    sp_off = raw_get32(st, 36)
+                                    sp_base = raw_get32(st, 32)
+                                    raw_set32(sp_base, sp_off, raw_get32(st, 36))   // 占位 off(实际=sp_off)
+                                    raw_set32(sp_base, sp_off + 4, slen)
+                                    // 数据写入: 从 sp_base + 8 + sp_off? 设计: 每串头部 8B + 数据
+                                    // 简单: 数据紧接头部
+                                    j = 0
+                                    Solange j < slen
+                                        raw_setbyte(sp_base, sp_off + 8 + j, raw_byteat(tokens, i * 32 + 8 + j))
+                                        j = j + 1
+                                    Ende
+                                    node = raw_get32(st, 16)
+                                    raw_set32(ast, node * 32, 10)
+                                    raw_set32(ast, node * 32 + 4, sp_off)
+                                    raw_set32(ast, node * 32 + 8, slen)
+                                    raw_set32(st, 16, node + 1)
+                                    raw_set32(st, 36, sp_off + 8 + slen)
+                                    i = i + 1
+                                Sonst
+                                    stop = 1
+                                Ende
+                            Sonst
+                                Wenn t == 3 und raw_get32(tokens, base + 4) == 11 dann  // int 声明
+                                    i = i + 1
+                                    Wenn i < tn und raw_get32(tokens, i * 32) == 2 dann
+                                        ilen = raw_get32(tokens, i * 32 + 4)
+                                        vid = os_var_find(symtab, raw_get32(st, 0), tokens, i * 32 + 8, ilen)
+                                        Wenn vid == 0 - 1 dann
+                                            vid = os_add_var(symtab, st, tokens, i * 32 + 8, ilen, 1)
+                                        Ende
+                                        i = i + 1
+                                        Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 61 dann
+                                            i = i + 1
+                                            rpnoff = raw_get32(st, 4)
+                                            i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                                            rn = raw_get32(st, 4) - rpnoff
+                                            node = raw_get32(st, 16)
+                                            raw_set32(ast, node * 32, 5)
+                                            raw_set32(ast, node * 32 + 4, raw_get32(symtab, vid * 16 + 12))
+                                            raw_set32(ast, node * 32 + 8, rpnoff)
+                                            raw_set32(ast, node * 32 + 12, rn)
+                                            raw_set32(st, 16, node + 1)
+                                        Ende
+                                    Ende
+                                Sonst
+                                    Wenn t == 3 und raw_get32(tokens, base + 4) == 12 dann  // ptr 声明
+                                        i = i + 1
+                                        Wenn i < tn und raw_get32(tokens, i * 32) == 2 dann
+                                            ilen = raw_get32(tokens, i * 32 + 4)
+                                            vid = os_var_find(symtab, raw_get32(st, 0), tokens, i * 32 + 8, ilen)
+                                            Wenn vid == 0 - 1 dann
+                                                vid = os_add_var(symtab, st, tokens, i * 32 + 8, ilen, 2)
+                                            Ende
+                                            i = i + 1
+                                        Ende
+                                    Sonst
+                                        Wenn t == 2 dann  // 标识符
+                                            ilen = raw_get32(tokens, base + 4)
+                                            // 函数调用? 名称 + (
+                                            Wenn i + 1 < tn und raw_get32(tokens, (i + 1) * 32) == 4 und raw_byteat(tokens, (i + 1) * 32 + 8) == 40 dann
+                                                fid = os_func_find(funcs, fcount, tokens, base + 8, ilen)
+                                                Wenn fid == 0 - 1 dann
+                                                    // 可能内建或未定义 -> 若为内建, 用特殊 call (b 标记 65535+builtin)
+                                                    bid = os_builtin_id(tokens, base + 8, ilen)
+                                                    Wenn bid != 0 - 1 dann
+                                                        // 内建调用: node 9, a=65536+bid (标记内建), 参数作为 irpn
+                                                        i = i + 1  // 跳过函数名
+                                                        Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 40 dann i = i + 1 Ende
+                                                        arg_start = raw_get32(st, 4)
+                                                        // 解析逗号分隔 int 参数
+                                                        alen = 0
+                                                        stop2 = 0
+                                                        Solange i < tn und stop2 == 0
+                                                            Wenn raw_byteat(tokens, i * 32 + 8) == 41 dann
+                                                                i = i + 1
+                                                                stop2 = 1
+                                                            Sonst
+                                                                i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                                                                alen = alen + 1
+                                                                Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 44 dann i = i + 1 Ende
+                                                            Ende
+                                                        Ende
+                                                        node = raw_get32(st, 16)
+                                                        raw_set32(ast, node * 32, 9)
+                                                        raw_set32(ast, node * 32 + 4, 65536 + bid)
+                                                        raw_set32(ast, node * 32 + 8, arg_start)
+                                                        raw_set32(ast, node * 32 + 12, alen)
+                                                        raw_set32(ast, node * 32 + 16, 0)
+                                                        raw_set32(st, 16, node + 1)
+                                                    Sonst
+                                                        stop = 1
+                                                    Ende
+                                                Sonst
+                                                    // 普通函数调用(语句): node 9, a=fid
+                                                    i = i + 1
+                                                    Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 40 dann i = i + 1 Ende
+                                                    arg_start = raw_get32(st, 4)
+                                                    alen = 0
+                                                    stop2 = 0
+                                                    Solange i < tn und stop2 == 0
+                                                        Wenn raw_byteat(tokens, i * 32 + 8) == 41 dann
+                                                            i = i + 1
+                                                            stop2 = 1
+                                                        Sonst
+                                                            i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                                                            alen = alen + 1
+                                                            Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 44 dann i = i + 1 Ende
+                                                        Ende
+                                                    Ende
+                                                    node = raw_get32(st, 16)
+                                                    raw_set32(ast, node * 32, 9)
+                                                    raw_set32(ast, node * 32 + 4, fid)
+                                                    raw_set32(ast, node * 32 + 8, arg_start)
+                                                    raw_set32(ast, node * 32 + 12, alen)
+                                                    raw_set32(ast, node * 32 + 16, 0)
+                                                    raw_set32(st, 16, node + 1)
+                                                Ende
+                                            Sonst
+                                                // 变量赋值 / 数组存储
+                                                vid = os_var_find(symtab, raw_get32(st, 0), tokens, base + 8, ilen)
+                                                Wenn vid != 0 - 1 und raw_get32(symtab, vid * 16 + 8) == 2 dann
+                                                    // 数组存储 arr[i] = expr
+                                                    arrreg = raw_get32(symtab, vid * 16 + 12)
+                                                    i = i + 1
+                                                    Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 91 dann i = i + 1 Ende
+                                                    idx_start = raw_get32(st, 4)
+                                                    i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                                                    idx_len = raw_get32(st, 4) - idx_start
+                                                    Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 93 dann i = i + 1 Ende
+                                                    Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 61 dann i = i + 1 Ende
+                                                    valoff = raw_get32(st, 4)
+                                                    i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                                                    vlen = raw_get32(st, 4) - valoff
+                                                    node = raw_get32(st, 16)
+                                                    raw_set32(ast, node * 32, 11)
+                                                    raw_set32(ast, node * 32 + 4, arrreg)
+                                                    raw_set32(ast, node * 32 + 8, idx_start)
+                                                    raw_set32(ast, node * 32 + 12, idx_len)
+                                                    raw_set32(ast, node * 32 + 16, valoff)
+                                                    raw_set32(ast, node * 32 + 20, vlen)
+                                                    raw_set32(st, 16, node + 1)
+                                                Sonst
+                                                    // 变量赋值 (或新变量)
+                                                    Wenn vid == 0 - 1 dann
+                                                        i = i + 1
+                                                        Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 61 dann i = i + 1 Ende
+                                                        vid = os_add_var(symtab, st, tokens, base + 8, ilen, 1)
+                                                    Sonst
+                                                        i = i + 1
+                                                        Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 61 dann i = i + 1 Ende
+                                                    Ende
+                                                    rpnoff = raw_get32(st, 4)
+                                                    i = os_parse_int_expr(tokens, i, tn, irpn, symtab, st, funcs, fcount)
+                                                    rn = raw_get32(st, 4) - rpnoff
+                                                    node = raw_get32(st, 16)
+                                                    raw_set32(ast, node * 32, 5)
+                                                    raw_set32(ast, node * 32 + 4, raw_get32(symtab, vid * 16 + 12))
+                                                    raw_set32(ast, node * 32 + 8, rpnoff)
+                                                    raw_set32(ast, node * 32 + 12, rn)
+                                                    raw_set32(st, 16, node + 1)
+                                                Ende
+                                            Ende
+                                        Sonst
+                                            Wenn t == 7 dann
+                                                i = i + 1
+                                            Sonst
+                                                stop = 1
+                                            Ende
+                                        Ende
+                                    Ende
+                                Ende
+                            Ende
+                        Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+    Ende
+    Ende
+    gebe_zurueck i
+Ende
+
+// 主程序解析: srcbuf -> AST + irpn + 函数表 + 字符串池
+// funcs: 函数表缓冲(每项28B)  spdata: 字符串池缓冲  out_info[0]=func_count [4]=ast_count [8]=sym_count [12]=err
+Funktion parse_os_program(srcbuf, slen, ast, irpn, symtab, funcs, spdata, out_info)
+    tokens = alloc(8192 * 32)
+    tn = lex_tokenize(srcbuf, slen, tokens, 8192)
+    st = alloc(40)
+    raw_set32(st, 0, 0)   // sym_count
+    raw_set32(st, 4, 0)   // irpn_len
+    raw_set32(st, 12, 1)  // err
+    raw_set32(st, 16, 0)  // ast_count
+    raw_set32(st, 20, 0)  // int_var_count
+    raw_set32(st, 28, 0)  // array_count
+    raw_set32(st, 32, spdata) // 字符串池基址 (存入 st[32])
+    raw_set32(st, 36, 0)  // 字符串池 off
+    raw_set32(out_info, 0, 0)
+    raw_set32(out_info, 4, 0)
+    raw_set32(out_info, 8, 0)
+    raw_set32(out_info, 12, 1)
+    // 第一遍: 收集函数名 (Funktion kw1 name)
+    fcount = 0
+    i = 0
+    Solange i < tn
+        Wenn raw_get32(tokens, i * 32) == 3 und raw_get32(tokens, i * 32 + 4) == 1 dann  // Funktion
+            i = i + 1
+            Wenn i < tn und raw_get32(tokens, i * 32) == 2 dann
+                raw_set32(funcs, fcount * 28, i * 32 + 8)   // name_off (token 缓冲内)
+                raw_set32(funcs, fcount * 28 + 4, raw_get32(tokens, i * 32 + 4))
+                raw_set32(funcs, fcount * 28 + 24, fcount)
+                fcount = fcount + 1
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    // 第二遍: 解析每个函数体
+    fi = 0
+    i = 0
+    Solange i < tn
+        Wenn raw_get32(tokens, i * 32) == 3 und raw_get32(tokens, i * 32 + 4) == 1 dann
+            i = i + 1
+            // 函数名
+            Wenn i < tn und raw_get32(tokens, i * 32) == 2 dann i = i + 1 Ende
+            // 跳过 (
+            Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 40 dann i = i + 1 Ende
+            // 参数: int a / ptr p
+            param_count = 0
+            stop = 0
+            Solange i < tn und stop == 0
+                base = i * 32
+                t = raw_get32(tokens, base)
+                Wenn t == 4 und raw_byteat(tokens, base + 8) == 41 dann
+                    i = i + 1
+                    stop = 1
+                Sonst
+                    Wenn t == 3 und raw_get32(tokens, base + 4) == 11 dann  // int param
+                        i = i + 1
+                        Wenn i < tn und raw_get32(tokens, i * 32) == 2 dann
+                            ilen = raw_get32(tokens, i * 32 + 4)
+                            vid = os_add_var(symtab, st, tokens, i * 32 + 8, ilen, 3)  // int param
+                            i = i + 1
+                            param_count = param_count + 1
+                        Ende
+                        Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 44 dann i = i + 1 Ende
+                    Sonst
+                        Wenn t == 3 und raw_get32(tokens, base + 4) == 12 dann  // ptr param
+                            i = i + 1
+                            Wenn i < tn und raw_get32(tokens, i * 32) == 2 dann
+                                ilen = raw_get32(tokens, i * 32 + 4)
+                                vid = os_add_var(symtab, st, tokens, i * 32 + 8, ilen, 2)  // array
+                                i = i + 1
+                                param_count = param_count + 1
+                            Ende
+                            Wenn i < tn und raw_byteat(tokens, i * 32 + 8) == 44 dann i = i + 1 Ende
+                        Sonst
+                            stop = 1
+                        Ende
+                    Ende
+                Ende
+            Ende
+            // 函数体
+            body_start = raw_get32(st, 16)
+            i = os_parse_block(tokens, i, tn, ast, irpn, funcs, fcount, symtab, st, 0)
+            node = raw_get32(st, 16)
+            raw_set32(ast, node * 32, 4)  // func
+            raw_set32(ast, node * 32 + 4, param_count)
+            raw_set32(ast, node * 32 + 8, body_start)
+            raw_set32(ast, node * 32 + 12, node - body_start)
+            raw_set32(ast, node * 32 + 16, fi)
+            raw_set32(ast, node * 32 + 20, raw_get32(st, 20))  // frame_slots (int vars count)
+            raw_set32(st, 16, node + 1)
+            raw_set32(funcs, fi * 28 + 8, param_count)
+            raw_set32(funcs, fi * 28 + 12, body_start)
+            raw_set32(funcs, fi * 28 + 16, node - body_start)
+            raw_set32(funcs, fi * 28 + 20, raw_get32(st, 20))
+            // 重置符号表与计数 (每个函数独立符号表)
+            raw_set32(st, 0, 0)
+            raw_set32(st, 20, 0)
+            raw_set32(st, 28, 0)
+            fi = fi + 1
+        Ende
+        i = i + 1
+    Ende
+    raw_set32(out_info, 0, fcount)
+    raw_set32(out_info, 4, raw_get32(st, 16))
+    raw_set32(out_info, 8, 0)
+    raw_set32(out_info, 12, 0)
+    gebe_zurueck 0
+Ende

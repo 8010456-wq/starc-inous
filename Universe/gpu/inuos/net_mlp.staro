@@ -1,0 +1,140 @@
+// ============================================================
+// net_mlp.staro — 轻量 MLP 生成器 (阶段2 lite 训练核心网络)
+// Universe 3D V1: 条件特征 -> 体网络占位补全 (粗->细)
+// 2 隐层 relu MLP: X(in) -> H1(hid) -> H2(hid) -> Y(out)
+// 纯 StarC, 零第三方依赖 (softfloat)
+//
+// 连续缓冲布局 (便于 .u 权重直接保存):
+//   W = [W1(in*hid) | W2(hid*hid) | W3(out*hid)]
+//   B = [b1(hid) | b2(hid) | b3(out)]
+//   W1 行主序 [hid*in], W2 [hid*hid], W3 [out*hid]
+// 损失: 0.5*MSE, 梯度 dL/dY = Y_pred - Y_target
+// ============================================================
+
+// ---- 前向: Y = W3·relu(W2·relu(W1·X+b1)+b2)+b3 ----
+// W/B: 连续缓冲; 内部算偏移
+Funktion mlp_forward(X, W, B, H1, H2, Y, in, hid, out)
+    W1 = W
+    W2 = W + in * hid
+    W3 = W + in * hid + hid * hid
+    b1 = B
+    b2 = B + hid
+    b3 = B + hid + hid
+    zero = s32_to_f32(0)
+    j = 0
+    Solange j < hid
+        s = raw_get32(b1, j * 4)
+        k = 0
+        Solange k < in
+            s = f32_add(s, f32_mul(raw_get32(W1, (j * in + k) * 4), raw_get32(X, k * 4)))
+            k = k + 1
+        Ende
+        Wenn f32_lt(s, zero) dann s = zero Ende
+        raw_set32(H1, j * 4, s)
+        j = j + 1
+    Ende
+    j = 0
+    Solange j < hid
+        s = raw_get32(b2, j * 4)
+        k = 0
+        Solange k < hid
+            s = f32_add(s, f32_mul(raw_get32(W2, (j * hid + k) * 4), raw_get32(H1, k * 4)))
+            k = k + 1
+        Ende
+        Wenn f32_lt(s, zero) dann s = zero Ende
+        raw_set32(H2, j * 4, s)
+        j = j + 1
+    Ende
+    j = 0
+    Solange j < out
+        s = raw_get32(b3, j * 4)
+        k = 0
+        Solange k < hid
+            s = f32_add(s, f32_mul(raw_get32(W3, (j * hid + k) * 4), raw_get32(H2, k * 4)))
+            k = k + 1
+        Ende
+        raw_set32(Y, j * 4, s)
+        j = j + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// ---- 反向: 累加梯度到连续 G/GB 缓冲 (调用方需预置 0) ----
+// G = [G1(in*hid)|G2(hid*hid)|G3(out*hid)], GB = [gb1(hid)|gb2(hid)|gb3(out)]
+// dH2/dH1: 调用方分配的隐层梯度临时缓冲 (各 hid*4)
+Funktion mlp_backward(X, H1, H2, Y_pred, Y_target, W, B, G, GB, dH2, dH1, in, hid, out)
+    W1 = W
+    W2 = W + in * hid
+    W3 = W + in * hid + hid * hid
+    G1 = G
+    G2 = G + in * hid
+    G3 = G + in * hid + hid * hid
+    gb1 = GB
+    gb2 = GB + hid
+    gb3 = GB + hid + hid
+    zero = s32_to_f32(0)
+    // ---- 输出层: dW3/db3 ----
+    j = 0
+    Solange j < out
+        dy = f32_sub(raw_get32(Y_pred, j * 4), raw_get32(Y_target, j * 4))
+        raw_set32(gb3, j * 4, f32_add(raw_get32(gb3, j * 4), dy))
+        k = 0
+        Solange k < hid
+            raw_set32(G3, (j * hid + k) * 4, f32_add(raw_get32(G3, (j * hid + k) * 4), f32_mul(dy, raw_get32(H2, k * 4))))
+            k = k + 1
+        Ende
+        j = j + 1
+    Ende
+    // ---- dH2 = W3^T·dY, 经 relu 门 ----
+    j = 0
+    Solange j < hid
+        s = zero
+        k = 0
+        Solange k < out
+            dy = f32_sub(raw_get32(Y_pred, k * 4), raw_get32(Y_target, k * 4))
+            s = f32_add(s, f32_mul(raw_get32(W3, (k * hid + j) * 4), dy))
+            k = k + 1
+        Ende
+        Wenn f32_lt(raw_get32(H2, j * 4), zero) dann s = zero Ende
+        raw_set32(dH2, j * 4, s)
+        j = j + 1
+    Ende
+    // ---- 隐层2: dW2/db2 ----
+    j = 0
+    Solange j < hid
+        dh = raw_get32(dH2, j * 4)
+        raw_set32(gb2, j * 4, f32_add(raw_get32(gb2, j * 4), dh))
+        k = 0
+        Solange k < hid
+            raw_set32(G2, (j * hid + k) * 4, f32_add(raw_get32(G2, (j * hid + k) * 4), f32_mul(dh, raw_get32(H1, k * 4))))
+            k = k + 1
+        Ende
+        j = j + 1
+    Ende
+    // ---- dH1 = W2^T·dH2, 经 relu 门 ----
+    j = 0
+    Solange j < hid
+        s = zero
+        k = 0
+        Solange k < hid
+            s = f32_add(s, f32_mul(raw_get32(W2, (k * hid + j) * 4), raw_get32(dH2, k * 4)))
+            k = k + 1
+        Ende
+        Wenn f32_lt(raw_get32(H1, j * 4), zero) dann s = zero Ende
+        raw_set32(dH1, j * 4, s)
+        j = j + 1
+    Ende
+    // ---- 隐层1: dW1/db1 ----
+    j = 0
+    Solange j < hid
+        dh = raw_get32(dH1, j * 4)
+        raw_set32(gb1, j * 4, f32_add(raw_get32(gb1, j * 4), dh))
+        k = 0
+        Solange k < in
+            raw_set32(G1, (j * in + k) * 4, f32_add(raw_get32(G1, (j * in + k) * 4), f32_mul(dh, raw_get32(X, k * 4))))
+            k = k + 1
+        Ende
+        j = j + 1
+    Ende
+    gebe_zurueck 1
+Ende

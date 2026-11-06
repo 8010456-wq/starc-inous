@@ -1,0 +1,89 @@
+// inuos/fp8_kernel.staro - GPU 融合 FP8(E4M3)反量化+GEMV 内核 PTX 生成 (deepPuTT)
+// 依赖: sys.staro, str.staro (str_len)
+//
+// 内核 fp8gemv: 每线程算输出行 m 的 out[m] = sum_k act[k] * dequant(w[m,k])
+//   w: F8_E4M3 每元素 1 字节; lut: 256 项 fp32 LUT(byte->e4m3值);
+//   pow2: fp32 数组 2^(scale-127), 按块 (row/128)*ncb + col/128; act: fp32[K]
+//   反量化 fuse 进循环 (LUT查找 + 乘 block scale), 输出 fp32
+// 参数: w(u64) lut(u64) pow2(u64) act(u64) out(u64) M(u32) K(u32) ncb(u32)
+// 布局: grid.x*block.x >= M, 每线程 1 输出行
+
+Funktion kstr_emit2(out, off, s)
+    n = str_len(s)
+    i = 0
+    Solange i < n
+        raw_setbyte(out, off + i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    gebe_zurueck off + n
+Ende
+
+// 生成 fp8gemv 内核 PTX 到 out, 返回新 off (调用方末尾补 0)
+Funktion fp8gemv_ptx(out, off)
+    off = kstr_emit2(out, off, ".version 7.0\n")
+    off = kstr_emit2(out, off, ".target sm_75\n")
+    off = kstr_emit2(out, off, ".address_size 64\n")
+    off = kstr_emit2(out, off, ".visible .entry fp8gemv(.param .u64 w, .param .u64 lut, .param .u64 pow2, .param .u64 act, .param .u64 out, .param .u32 M, .param .u32 K, .param .u32 ncb) {\n")
+    off = kstr_emit2(out, off, ".reg .u32 %m, %M, %K, %ncb, %k, %bi, %blk, %e0, %t1, %t2;\n")
+    off = kstr_emit2(out, off, ".reg .u64 %rw, %rl, %rp, %ra, %ro, %addr, %addr2;\n")
+    off = kstr_emit2(out, off, ".reg .u8 %ub;\n")
+    off = kstr_emit2(out, off, ".reg .f32 %f, %fk, %a, %acc;\n")
+    off = kstr_emit2(out, off, ".reg .pred %p;\n")
+    // m = blockIdx*blockDim + threadIdx
+    off = kstr_emit2(out, off, "mov.u32 %t1, %ctaid.x;\n")
+    off = kstr_emit2(out, off, "mov.u32 %t2, %ntid.x;\n")
+    off = kstr_emit2(out, off, "mul.lo.u32 %m, %t1, %t2;\n")
+    off = kstr_emit2(out, off, "mov.u32 %t1, %tid.x;\n")
+    off = kstr_emit2(out, off, "add.u32 %m, %m, %t1;\n")
+    off = kstr_emit2(out, off, "ld.param.u32 %M, [M];\n")
+    off = kstr_emit2(out, off, "setp.ge.u32 %p, %m, %M;\n")
+    off = kstr_emit2(out, off, "@%p bra EXIT;\n")
+    off = kstr_emit2(out, off, "ld.param.u64 %rw, [w];\n")
+    off = kstr_emit2(out, off, "ld.param.u64 %rl, [lut];\n")
+    off = kstr_emit2(out, off, "ld.param.u64 %rp, [pow2];\n")
+    off = kstr_emit2(out, off, "ld.param.u64 %ra, [act];\n")
+    off = kstr_emit2(out, off, "ld.param.u64 %ro, [out];\n")
+    off = kstr_emit2(out, off, "ld.param.u32 %K, [K];\n")
+    off = kstr_emit2(out, off, "ld.param.u32 %ncb, [ncb];\n")
+    off = kstr_emit2(out, off, "mov.f32 %acc, 0f00000000;\n")
+    off = kstr_emit2(out, off, "mov.u32 %k, 0;\n")
+    off = kstr_emit2(out, off, "LOOP:\n")
+    off = kstr_emit2(out, off, "setp.ge.u32 %p, %k, %K;\n")
+    off = kstr_emit2(out, off, "@%p bra DONE;\n")
+    // byte_idx = m*K + k  (1 byte/elem)
+    off = kstr_emit2(out, off, "mul.lo.u32 %bi, %m, %K;\n")
+    off = kstr_emit2(out, off, "add.u32 %bi, %bi, %k;\n")
+    off = kstr_emit2(out, off, "cvt.u64.u32 %addr, %bi;\n")
+    off = kstr_emit2(out, off, "add.u64 %addr, %rw, %addr;\n")
+    off = kstr_emit2(out, off, "ld.global.u8 %ub, [%addr];\n")
+    off = kstr_emit2(out, off, "cvt.u32.u8 %e0, %ub;\n")
+    // f = lut[byte]
+    off = kstr_emit2(out, off, "mul.wide.u32 %addr2, %e0, 4;\n")
+    off = kstr_emit2(out, off, "add.u64 %addr2, %rl, %addr2;\n")
+    off = kstr_emit2(out, off, "ld.global.f32 %f, [%addr2];\n")
+    // blk = (m/128)*ncb + k/128 ; f *= pow2[blk]
+    off = kstr_emit2(out, off, "shr.u32 %t1, %m, 7;\n")
+    off = kstr_emit2(out, off, "mul.lo.u32 %t1, %t1, %ncb;\n")
+    off = kstr_emit2(out, off, "shr.u32 %t2, %k, 7;\n")
+    off = kstr_emit2(out, off, "add.u32 %blk, %t1, %t2;\n")
+    off = kstr_emit2(out, off, "mul.wide.u32 %addr2, %blk, 4;\n")
+    off = kstr_emit2(out, off, "add.u64 %addr2, %rp, %addr2;\n")
+    off = kstr_emit2(out, off, "ld.global.f32 %fk, [%addr2];\n")
+    off = kstr_emit2(out, off, "mul.f32 %f, %f, %fk;\n")
+    // a = act[k]; acc = fma(a, f, acc)
+    off = kstr_emit2(out, off, "mul.wide.u32 %addr2, %k, 4;\n")
+    off = kstr_emit2(out, off, "add.u64 %addr2, %ra, %addr2;\n")
+    off = kstr_emit2(out, off, "ld.global.f32 %a, [%addr2];\n")
+    off = kstr_emit2(out, off, "fma.rn.f32 %acc, %a, %f, %acc;\n")
+    off = kstr_emit2(out, off, "add.u32 %k, %k, 1;\n")
+    off = kstr_emit2(out, off, "bra LOOP;\n")
+    // out[m] = acc
+    off = kstr_emit2(out, off, "DONE:\n")
+    off = kstr_emit2(out, off, "mul.wide.u32 %addr2, %m, 4;\n")
+    off = kstr_emit2(out, off, "add.u64 %addr2, %ro, %addr2;\n")
+    off = kstr_emit2(out, off, "st.global.f32 [%addr2], %acc;\n")
+    off = kstr_emit2(out, off, "EXIT:\n")
+    off = kstr_emit2(out, off, "ret;\n")
+    off = kstr_emit2(out, off, "}\n")
+    gebe_zurueck off
+Ende

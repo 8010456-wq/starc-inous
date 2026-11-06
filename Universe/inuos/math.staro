@@ -1,0 +1,132 @@
+// inuos/math.staro - StarC 自研 cos/sin (deepPuTT, 纯整数实现 IEEE754 fp32)
+// 依赖: softfloat.staro (f32_* 基本运算), 本文件纯算术
+// 用途: RoPE 余弦/正弦表生成 (gen_cossin.starc)
+//
+// 策略: 范围缩减到 [-π/4, π/4] (象限), 泰勒级数 (cos 10 项, sin 11 项)
+//   角度 a >= 0 (pos>=0, freq>=0): n = round(a/(π/2)); r = a - n*(π/2) in [-π/4,π/4]
+//   象限 q = n mod 4: cos(a), sin(a) 按 q 符号翻转
+// 精度: |r|<=π/4, 泰勒余项 < 1e-7, 相对误差 ~1e-6 (足够 RoPE)
+
+Funktion f32_round_halfaway(t)
+    // round(t) 向最近整数, 半值远离零; t 是 fp32 位模式
+    half = 1056964608  // 0.5
+    Wenn fs_sign(t) == 1 dann
+        // 负数: -floor(|t|+0.5)
+        nt = fs_neg(t)
+        v = f32_to_s32(f32_add(nt, half))
+        gebe_zurueck 0 - v
+    Ende
+    v = f32_to_s32(f32_add(t, half))
+    gebe_zurueck v
+Ende
+
+// cos(a), a>=0 位模式 -> cos 位模式
+Funktion f32_cos(a)
+    half_pi = 1070141403  // π/2 = 1.5707963268
+    n = f32_round_halfaway(f32_div(a, half_pi))
+    r = f32_sub(a, f32_mul(s32_to_f32(n), half_pi))
+    // cos Taylor
+    r2 = f32_mul(r, r)
+    // cos(r) = 1 - r2/2 + r4/24 - r6/720 + r8/40320 - r10/3628800
+    t = f32_mul(r2, 1056964608)            // r2/2
+    c = f32_sub(1065353216, t)             // 1 - r2/2
+    p = f32_mul(r2, r2)                    // r4
+    t = f32_mul(p, 1026206379)             // r4/24
+    c = f32_add(c, t)
+    p = f32_mul(p, r2)                     // r6
+    t = f32_mul(p, 985008993)              // r6/720
+    c = f32_sub(c, t)
+    p = f32_mul(p, r2)                     // r8
+    t = f32_mul(p, 936381697)              // r8/40320
+    c = f32_add(c, t)
+    p = f32_mul(p, r2)                     // r10
+    t = f32_mul(p, 882111102)              // r10/3628800
+    c = f32_sub(c, t)
+    // sin Taylor
+    s = r
+    p = f32_mul(r, r2)                     // r3
+    t = f32_mul(p, 1042983595)             // r3/6
+    s = f32_sub(s, t)
+    p = f32_mul(p, r2)                     // r5
+    t = f32_mul(p, 1007192201)             // r5/120
+    s = f32_add(s, t)
+    p = f32_mul(p, r2)                     // r7
+    t = f32_mul(p, 961547521)              // r7/5040
+    s = f32_sub(s, t)
+    p = f32_mul(p, r2)                     // r9
+    t = f32_mul(p, 909700893)              // r9/362880
+    s = f32_add(s, t)
+    p = f32_mul(p, r2)                     // r11
+    t = f32_mul(p, 852963883)              // r11/39916800
+    s = f32_sub(s, t)
+    // quadrant q = n mod 4 (n>=0)
+    q = n % 4
+    Wenn q == 0 dann
+        gebe_zurueck c
+    Ende
+    Wenn q == 1 dann
+        gebe_zurueck fs_neg(s)
+    Ende
+    Wenn q == 2 dann
+        gebe_zurueck fs_neg(c)
+    Ende
+    gebe_zurueck s  // q == 3
+Ende
+
+// sin(a), a>=0 位模式 -> sin 位模式
+Funktion f32_sin(a)
+    half_pi = 1070141403  // π/2
+    n = f32_round_halfaway(f32_div(a, half_pi))
+    r = f32_sub(a, f32_mul(s32_to_f32(n), half_pi))
+    r2 = f32_mul(r, r)
+    // cos(r)
+    t = f32_mul(r2, 1056964608)
+    c = f32_sub(1065353216, t)
+    p = f32_mul(r2, r2)
+    t = f32_mul(p, 1026206379)
+    c = f32_add(c, t)
+    p = f32_mul(p, r2)
+    t = f32_mul(p, 985008993)
+    c = f32_sub(c, t)
+    p = f32_mul(p, r2)
+    t = f32_mul(p, 936381697)
+    c = f32_add(c, t)
+    p = f32_mul(p, r2)
+    t = f32_mul(p, 882111102)
+    c = f32_sub(c, t)
+    // sin(r)
+    s = r
+    p = f32_mul(r, r2)
+    t = f32_mul(p, 1042983595)
+    s = f32_sub(s, t)
+    p = f32_mul(p, r2)
+    t = f32_mul(p, 1007192201)
+    s = f32_add(s, t)
+    p = f32_mul(p, r2)
+    t = f32_mul(p, 961547521)
+    s = f32_sub(s, t)
+    p = f32_mul(p, r2)
+    t = f32_mul(p, 909700893)
+    s = f32_add(s, t)
+    p = f32_mul(p, r2)
+    t = f32_mul(p, 852963883)
+    s = f32_sub(s, t)
+    q = n % 4
+    Wenn q == 0 dann
+        gebe_zurueck s
+    Ende
+    Wenn q == 1 dann
+        gebe_zurueck c
+    Ende
+    Wenn q == 2 dann
+        gebe_zurueck fs_neg(s)
+    Ende
+    gebe_zurueck fs_neg(c)  // q == 3
+Ende
+
+// f32_pow: b^n (n 正整数/负整数, 用 exp/ln) -- 供 gen_cossin 用
+Funktion f32_pow(b, n)
+    // b^n = exp(n * ln(b))
+    lnb = f32_ln(b)
+    gebe_zurueck f32_exp(f32_mul(s32_to_f32(n), lnb))
+Ende

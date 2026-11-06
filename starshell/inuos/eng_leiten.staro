@@ -1,0 +1,528 @@
+// ============================================================================
+//  starshell :: inuos/eng_leiten.staro
+//  StarShell V5 分发器：把命令名路由到自研域引擎（零转发，无 cmd/PS）。
+//  args = C-String des Befehlsrests (nach dem Befehlsnamen).
+//  Rueckgabe: 1 = behandelt, 0 = unbekannter Befehl.
+//  铁律 E：alle Faehigkeiten liegen in den eng_*.staro / file / system 库。
+// ============================================================================
+
+Funktion befehl_ausfuehren(name, c, rest)
+    args = c + rest
+
+    // ---------- Echo ----------
+    Wenn str_eq_ci(name, "echo") dann
+        Solange raw_byteat(c, rest) == 32
+            rest = rest + 1
+        Ende
+        write_cstr(c + rest)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Datei / Verzeichnis ----------
+    Wenn str_eq_ci(name, "dir") dann
+        datei_liste(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ls") dann
+        datei_liste(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "liste") dann
+        datei_liste(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "dirlist") dann
+        datei_liste_gross(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ll") dann
+        datei_liste_gross(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "cd") dann
+        datei_wechsle(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "wechsle") dann
+        datei_wechsle(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "pwd") dann
+        datei_wo()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "wo") dann
+        datei_wo()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "type") dann
+        datei_lesen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "cat") dann
+        datei_lesen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "zeige") dann
+        datei_lesen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "more") dann
+        datei_lesen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "copy") dann
+        datei_kopieren(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "kopiere") dann
+        datei_kopieren(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "cp") dann
+        datei_kopieren(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "move") dann
+        datei_verschieben(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "verschiebe") dann
+        datei_verschieben(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ren") dann
+        datei_verschieben(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "umbenenne") dann
+        datei_verschieben(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "mv") dann
+        datei_verschieben(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "del") dann
+        datei_loeschen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "rm") dann
+        datei_loeschen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "loesche") dann
+        datei_loeschen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "erase") dann
+        datei_loeschen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "mkdir") dann
+        datei_anlegen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "md") dann
+        datei_anlegen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "rmdir") dann
+        datei_entfernen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "rd") dann
+        datei_entfernen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "existiert") dann
+        datei_existiert(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "exists") dann
+        datei_existiert(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "groesse") dann
+        datei_groesse(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "size") dann
+        datei_groesse(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "attrib") dann
+        datei_attrib(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "touch") dann
+        datei_touch(args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Prozesse ----------
+    Wenn str_eq_ci(name, "tasklist") dann
+        eng_prozess("liste", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ps") dann
+        eng_prozess("liste", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "prozesse") dann
+        eng_prozess("liste", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "prozesszahl") dann
+        eng_prozess("zahl", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "taskcount") dann
+        eng_prozess("zahl", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "taskkill") dann
+        eng_prozess("beende", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "kill") dann
+        eng_prozess("beende", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "prozessexistiert") dann
+        eng_prozess("existiert", args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- System ----------
+    Wenn str_eq_ci(name, "systeminfo") dann
+        eng_sys("info", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "sysinfo") dann
+        eng_sys("info", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "cpu") dann
+        eng_sys("cpu", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "cpuinfo") dann
+        eng_sys("cpu", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "mem") dann
+        eng_sys("ram", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ram") dann
+        eng_sys("ram", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "memory") dann
+        eng_sys("ram", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ramgesamt") dann
+        eng_sys("ramgesamt", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ramfrei") dann
+        eng_sys("ramfrei", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "uptime") dann
+        eng_sys("uptime", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "hostname") dann
+        write_str(rechner_name())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "rechner") dann
+        write_str(rechner_name())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "whoami") dann
+        write_str(benutzer_name())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "benutzer") dann
+        write_str(benutzer_name())
+        write_newline()
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Datentraeger ----------
+    Wenn str_eq_ci(name, "volumes") dann
+        eng_disk("liste", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "diskliste") dann
+        eng_disk("liste", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "df") dann
+        eng_disk("frei", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "diskfrei") dann
+        eng_disk("frei", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "diskgr") dann
+        eng_disk("gesamt", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "diskgesamt") dann
+        eng_disk("gesamt", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "disktyp") dann
+        eng_disk("typ", args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Zeit ----------
+    Wenn str_eq_ci(name, "zeit") dann
+        eng_zeit("jetzt", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "jetzt") dann
+        eng_zeit("jetzt", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "date") dann
+        eng_zeit("datum", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "datum") dann
+        eng_zeit("datum", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "uhr") dann
+        eng_zeit("uhr", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "jahr") dann
+        eng_zeit("jahr", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "monat") dann
+        eng_zeit("monat", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "tag") dann
+        eng_zeit("tag", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "stunde") dann
+        eng_zeit("stunde", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "minute") dann
+        eng_zeit("minute", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "sekunde") dann
+        eng_zeit("sekunde", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "wochentag") dann
+        eng_zeit("wochentag", args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Umgebung ----------
+    Wenn str_eq_ci(name, "env") dann
+        umgebung_zeigen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "umgebung") dann
+        umgebung_zeigen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "set") dann
+        umgebung_setzen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "envset") dann
+        umgebung_setzen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "path") dann
+        umgebung_zeigen(args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Netz ----------
+    Wenn str_eq_ci(name, "ipconfig") dann
+        eng_netz("ip", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ip") dann
+        eng_netz("ip", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ping") dann
+        eng_netz("ping", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "dns") dann
+        eng_netz("dns", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "nslookup") dann
+        eng_netz("dns", args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Registry ----------
+    Wenn str_eq_ci(name, "reg") dann
+        op = extract_arg(args, 0)
+        Wenn str_eq_ci(op, "lesen") dann
+            reg_lesen(c_rest(args, str_len(op) + 1))
+            gebe_zurueck 1
+        Ende
+        Wenn str_eq_ci(op, "liste") dann
+            reg_liste(c_rest(args, str_len(op) + 1))
+            gebe_zurueck 1
+        Ende
+        Wenn str_eq_ci(op, "setzen") dann
+            reg_setzen(c_rest(args, str_len(op) + 1))
+            gebe_zurueck 1
+        Ende
+        Wenn str_eq_ci(op, "loeschen") dann
+            reg_loeschen(c_rest(args, str_len(op) + 1))
+            gebe_zurueck 1
+        Ende
+        write_str("reg lesen|liste|setzen|loeschen <Pfad> [Wert]")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "reglesen") dann
+        reg_lesen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "regliste") dann
+        reg_liste(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "regsetzen") dann
+        reg_setzen(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "regloeschen") dann
+        reg_loeschen(args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Dienste ----------
+    Wenn str_eq_ci(name, "dienst") dann
+        op = extract_arg(args, 0)
+        Wenn str_eq_ci(op, "liste") dann
+            dienst_liste()
+            gebe_zurueck 1
+        Ende
+        Wenn str_eq_ci(op, "status") dann
+            dienst_status(c_rest(args, str_len(op) + 1))
+            gebe_zurueck 1
+        Ende
+        Wenn str_eq_ci(op, "start") dann
+            dienst_start(c_rest(args, str_len(op) + 1))
+            gebe_zurueck 1
+        Ende
+        Wenn str_eq_ci(op, "stop") dann
+            dienst_stop(c_rest(args, str_len(op) + 1))
+            gebe_zurueck 1
+        Ende
+        write_str("dienst liste|status|start|stop [Name]")
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "dienstliste") dann
+        dienst_liste()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "dienststatus") dann
+        dienst_status(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "dienststart") dann
+        dienst_start(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "dienststop") dann
+        dienst_stop(args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Pfad ----------
+    Wenn str_eq_ci(name, "basename") dann
+        s = pfad_basename(args)
+        write_str(s)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "dirname") dann
+        s = pfad_dirname(args)
+        write_str(s)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "ext") dann
+        s = pfad_ext(args)
+        write_str(s)
+        write_newline()
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "joinpath") dann
+        pfad_join(args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "normpath") dann
+        pfad_normal(args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Text (Domain-Praefix) ----------
+    Wenn str_starts_with(name, "text_") dann
+        op = str_slice(name, 5, str_len(name) - 5)
+        eng_text(op, args)
+        gebe_zurueck 1
+    Ende
+    // Kurzformen
+    Wenn str_eq_ci(name, "laenge") dann
+        eng_text("laenge", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "gross") dann
+        eng_text("gross", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "klein") dann
+        eng_text("klein", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "umgekehrt") dann
+        eng_text("umgekehrt", args)
+        gebe_zurueck 1
+    Ende
+    Wenn str_eq_ci(name, "teil") dann
+        eng_text("teil", args)
+        gebe_zurueck 1
+    Ende
+
+    // ---------- Mathe (Domain-Praefix) ----------
+    Wenn str_starts_with(name, "mathe_") dann
+        op = str_slice(name, 6, str_len(name) - 6)
+        eng_mathe(op, args)
+        gebe_zurueck 1
+    Ende
+
+    gebe_zurueck 0
+Ende

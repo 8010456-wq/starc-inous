@@ -1,0 +1,320 @@
+// ============================================================================
+//  MGTO1 :: mg_tls.staro —— SChannel TLS 客户端（系统内置 TLS，零第三方）
+//  配合 mg_net 的原始 socket，实现 HTTPS。WinHTTP/WinInet 在本机无法读取响应体，
+//  故用 SChannel(secur32.dll) 在原始 socket 上做 TLS。
+//  .starc 正文禁止 linx；全部能力在此层。
+// ============================================================================
+
+linx "secur32.dll!AcquireCredentialsHandleW"
+linx "secur32.dll!InitializeSecurityContextW"
+linx "secur32.dll!EncryptMessage"
+linx "secur32.dll!DecryptMessage"
+linx "secur32.dll!FreeCredentialsHandle"
+linx "secur32.dll!DeleteSecurityContext"
+linx "secur32.dll!QueryContextAttributesW"
+linx "secur32.dll!FreeContextBuffer"
+
+// ---- 常量 ----
+// SECPKG_CRED_OUTBOUND = 0x00000002
+// SEC_E_OK = 0
+// SEC_I_CONTINUE_NEEDED = 0x00090312
+// SEC_I_INCOMPLETE_CREDENTIALS = 0x00090314
+// SEC_I_INCOMPLETE_CREDENTIALS -> 0x90314
+// SECBUFFER_VERSION = 0
+// SECBUFFER_EMPTY = 0
+// SECBUFFER_DATA = 1
+// SECBUFFER_TOKEN = 2
+// SECBUFFER_EXTRA = 5
+// SECURITY_NATIVE_DREP = 0x10
+// ISC_REQ_CONFIDENTIALITY = 0x00000010
+// ISC_REQ_STREAM = 0x00008000
+
+// ANSI C 串 -> UTF-16（新分配，含双 NUL 结尾）
+Funktion tls_utf16(s)
+    n = cstr_len(s)
+    q = alloc((n + 1) * 2)
+    i = 0
+    Solange i < n
+        raw_setbyte(q, i * 2, raw_byteat(s, i))
+        raw_setbyte(q, i * 2 + 1, 0)
+        i = i + 1
+    Ende
+    raw_setbyte(q, n * 2, 0)
+    raw_setbyte(q, n * 2 + 1, 0)
+    gebe_zurueck q
+Ende
+
+// 写 4 字节小端到 p+off
+Funktion w32(p, off, v)
+    raw_setbyte(p, off + 0, v - (v / 256) * 256)
+    raw_setbyte(p, off + 1, (v / 256) - (v / 65536) * 256)
+    raw_setbyte(p, off + 2, (v / 65536) - (v / 16777216) * 256)
+    raw_setbyte(p, off + 3, v / 16777216)
+    gebe_zurueck 0
+Ende
+
+// 读 4 字节小端从 p+off
+Funktion r32(p, off)
+    v = raw_byteat(p, off) + raw_byteat(p, off + 1) * 256 + raw_byteat(p, off + 2) * 65536 + raw_byteat(p, off + 3) * 16777216
+    gebe_zurueck v
+Ende
+
+// 设置 SecBuffer 字段：buf[0]=cb, buf[4]=type, buf[8]=ptr
+Funktion sbuf(buf, cb, btype, ptr)
+    w32(buf, 0, cb)
+    w32(buf, 4, btype)
+    raw_set64(buf, 8, ptr)
+    gebe_zurueck 0
+Ende
+
+// 设置 SecBufferDesc：desc[0]=version, desc[4]=count, desc[8]=buffers ptr
+Funktion sdesc(desc, ver, count, bufs)
+    w32(desc, 0, ver)
+    w32(desc, 4, count)
+    raw_set64(desc, 8, bufs)
+    gebe_zurueck 0
+Ende
+
+// 填充 SCHANNEL_CRED（x64 布局，总长 80 字节）：
+//   dwVersion@0 = 4 (SCHANNEL_CRED_VERSION)
+//   cCreds@4 = 0, paCred@8 = 0, hRootStore@16 = 0, cMappers@24 = 0, aphMappers@32 = 0
+//   dwSessionLifespan@40 = 0
+//   dwFlags@44 = 0x8 (SCH_CRED_MANUAL_CRED_VALIDATION：跳过服务器证书链校验)
+//   cbMaxLength@48 = 0
+//   grbitEnabledProtocols@52 = 0x800 (SP_PROT_TLS1_2_CLIENT，只用 TLS1.2 最稳)
+Funktion tls_cred(sch)
+    i = 0
+    Solange i < 80
+        raw_setbyte(sch, i, 0)
+        i = i + 1
+    Ende
+    w32(sch, 0, 4)        // dwVersion
+    w32(sch, 44, 8)       // dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION
+    w32(sch, 52, 2048)    // grbitEnabledProtocols = 0x800 = TLS1.2
+    gebe_zurueck 0
+Ende
+
+// 字节拷贝（裸内存）：dst/src 为裸指针
+Funktion mem_copy(dst, src, n)
+    i = 0
+    Solange i < n
+        raw_setbyte(dst, i, raw_byteat(src, i))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// TLS 握手：在已连接的 sock 上对 host_c 完成 TLS。返回 0 成功 / 负错误码。
+// cred/ctx 由调用方分配（16 字节各），握手后用于后续 tls_send/tls_recv。
+// ★ 流式实现：累积输入 + SECBUFFER_EXTRA 回填 + 出错即停。
+Funktion tls_connect(sock, host_c, cred, ctx)
+    ts = alloc(8)
+    mem_zero(ts, 8)
+    sch = alloc(80)
+    tls_cred(sch)
+    st = AcquireCredentialsHandleW(0, tls_utf16(mg_cstr("SCHANNEL")), 2, 0, sch, 0, 0, cred, ts)
+    Wenn st != 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    hostw = tls_utf16(host_c)
+    // 持久输入缓冲（累积服务器数据）
+    inbuf = alloc(131072)
+    mem_zero(inbuf, 131072)
+    inoff = 0
+    attrs = alloc(8)
+    ts2 = alloc(8)
+    // 输出 desc：obs[0..15]=token, obs[16..31]=extra
+    // ★ ALLOCATE_MEMORY 模式：SChannel 分配缓冲，发送/复制用其返回指针。
+    obs = alloc(32)
+    phctx = 0              // 首次调用 phContext=NULL
+    lauf = 1
+    round = 0
+    st = -1
+    Solange lauf == 1
+        // 输入 desc
+        Wenn inoff > 0 dann
+            ib = alloc(16)
+            sbuf(ib, inoff, 2, inbuf)
+            id = alloc(16)
+            sdesc(id, 0, 1, ib)
+        Sonst
+            id = 0
+        Ende
+        // 输出 desc（EMPTY -> SChannel 用 ALLOCATE_MEMORY 分配）
+        mem_zero(obs, 32)
+        sbuf(obs, 0, 2, 0)               // SECBUFFER_TOKEN，cb=0,ptr=NULL
+        sbuf(obs + 16, 0, 0, 0)          // SECBUFFER_EMPTY，将变为 EXTRA
+        od = alloc(16)
+        sdesc(od, 0, 2, obs)
+        // ISC：fContextReq = 33052 (0x811C = STREAM|CONFIDENTIALITY|ALLOCATE_MEMORY|SEQ_DETECT|REPLAY_DETECT)
+        st = InitializeSecurityContextW(cred, phctx, hostw, 33052, 0, 16, id, 0, ctx, od, attrs, ts2)
+        phctx = ctx
+        // 发送输出 token（用 SChannel 返回的指针）
+        toklen = r32(obs, 0)
+        tok = raw_get64(obs, 8)
+        Wenn toklen > 0 dann
+            n = send(sock, tok, toklen, 0)
+            Wenn isneg(n) == 1 oder n != toklen dann
+                st = -901
+                lauf = 0
+            Ende
+        Ende
+        Wenn lauf == 1 dann
+            Wenn st == 0 dann             // SEC_E_OK：握手完成
+                lauf = 0
+            Sonst
+                // 检查 extra（SChannel 分配的未消费输入）
+                extlen = r32(obs + 16, 0)
+                ext = raw_get64(obs + 16, 8)
+                Wenn extlen > 0 und ext != 0 dann
+                    mem_copy(inbuf, ext, extlen)
+                    inoff = extlen
+                Sonst
+                    inoff = 0     // 无 extra：重置输入
+                Ende
+                // 释放 SChannel 分配的缓冲
+                Wenn tok != 0 dann
+                    FreeContextBuffer(tok)
+                Ende
+                Wenn ext != 0 dann
+                    FreeContextBuffer(ext)
+                Ende
+                // 继续条件判定：
+                //   SEC_I_CONTINUE_NEEDED=590610, SEC_I_INCOMPLETE_CREDENTIALS=590612,
+                //   SEC_I_INCOMPLETE_MESSAGE=590616（信息级，高位=0，可直接 == 比较）
+                //   SEC_E_INCOMPLETE_MESSAGE=0x80090326（错误级：高位bit31=1，低16位=0x0326=806）
+                // ★ 不能写 st==2148074278：字面量>=2^31 被编译器 int32 截断，恒假（实测）。
+                //   故用 st>2147483647 判高位、st-(st/65536)*65536 取低16位来识别错误级码。
+                go = 0
+                Wenn st == 590610 oder st == 590612 oder st == 590616 dann
+                    go = 1
+                Sonst
+                    Wenn st > 2147483647 dann
+                        lo16 = st - (st / 65536) * 65536
+                        Wenn lo16 == 806 dann
+                            go = 1        // SEC_E_INCOMPLETE_MESSAGE
+                        Ende
+                    Ende
+                Ende
+                Wenn go == 1 dann
+                    // ★ 总是 recv 更多：EXTRA 已保留为 inbuf[0..inoff) 头部，
+                    //   把新数据追加在其后，下次喂给 ISC 以补全被截断的记录。
+                    rr = recv(sock, inbuf + inoff, 131072 - inoff, 0)
+                    Wenn isneg(rr) == 1 oder rr == 0 dann
+                        st = -902
+                        lauf = 0
+                    Sonst
+                        inoff = inoff + rr
+                    Ende
+                    round = round + 1
+                    Wenn round > 30 dann
+                        st = -903
+                        lauf = 0
+                    Ende
+                Sonst
+                    lauf = 0              // 其它错误码 -> 退出
+                Ende
+            Ende
+        Ende
+    Ende
+    Wenn st != 0 dann
+        mg_write_str("TLSDBG st=")
+        mg_write_int(st)
+        mg_write_str(" round=")
+        mg_write_int(round)
+        mg_newline()
+        DeleteSecurityContext(ctx)
+        FreeCredentialsHandle(cred)
+        gebe_zurueck 0 - 2
+    Ende
+    mg_write_str("TLSDBG OK round=")
+    mg_write_int(round)
+    mg_newline()
+    gebe_zurueck 0
+Ende
+
+// TLS 发送：加密 data（len 字节）并写 socket。返回 0 成功 / 负错误码。
+Funktion tls_send(sock, ctx, data, len)
+    // 三缓冲：DATA, TOKEN(预分配), EXTRA —— ★ 必须连续（sdesc 按 count 连续读取）
+    b0 = alloc(48)
+    b1 = b0 + 16
+    b2 = b0 + 32
+    sbuf(b0, len, 1, data)              // SECBUFFER_DATA
+    sbuf(b1, 0, 2, 0)                   // SECBUFFER_TOKEN（输出）
+    sbuf(b2, 0, 0, 0)                   // SECBUFFER_EMPTY（EXTRA）
+    // 预分配 token 缓冲
+    tk = alloc(65536)
+    mem_zero(tk, 65536)
+    raw_set64(b1, 8, tk)                // 提供 token 缓冲指针
+    w32(b1, 0, 65536)                   // 容量（type 保持 TOKEN=2）
+    d = alloc(16)
+    sdesc(d, 0, 3, b0)
+    st = EncryptMessage(ctx, 0, d, 0)
+    mg_write_str("ENC st=")
+    mg_write_int(st)
+    mg_newline()
+    Wenn st != 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    // 发送 token（b1 现在是 SECBUFFER_TOKEN）
+    tklen = r32(b1, 0)
+    Wenn tklen > 0 dann
+        n = send(sock, tk, tklen, 0)
+        Wenn isneg(n) == 1 oder n != tklen dann
+            gebe_zurueck 0 - 2
+        Ende
+    Ende
+    // 处理 extra（若加密产生额外 token）
+    extlen = r32(b2, 0)
+    Wenn extlen > 0 dann
+        ext = raw_get64(b2, 8)
+        n = send(sock, ext, extlen, 0)
+    Ende
+    gebe_zurueck 0
+Ende
+
+// TLS 接收：从 socket 读并解密，写明文到 outbuf（cap 容量）。
+// 返回明文字节数（>=0）或负错误码。
+Funktion tls_recv(sock, ctx, outbuf, cap)
+    inbuf = alloc(65536)
+    mem_zero(inbuf, 65536)
+    rr = recv(sock, inbuf, 65536, 0)
+    Wenn isneg(rr) == 1 oder rr == 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    // 四缓冲：DATA(输入密文), EMPTY, EMPTY(明文), EMPTY —— ★ 必须连续
+    b0 = alloc(64)
+    b1 = b0 + 16
+    b2 = b0 + 32
+    b3 = b0 + 48
+    sbuf(b0, rr, 1, inbuf)
+    sbuf(b1, 0, 0, 0)
+    sbuf(b2, 0, 0, 0)
+    sbuf(b3, 0, 0, 0)
+    d = alloc(16)
+    sdesc(d, 0, 4, b0)
+    seq = alloc(8)
+    qop = alloc(8)
+    st = DecryptMessage(ctx, d, 0, seq, qop)
+    Wenn st != 0 dann
+        gebe_zurueck 0 - 2
+    Ende
+    // 明文在 b2（原 SECBUFFER_EMPTY -> SECBUFFER_DATA）
+    ptlen = r32(b2, 0)
+    pt = raw_get64(b2, 8)
+    Wenn ptlen > cap dann
+        ptlen = cap
+    Ende
+    i = 0
+    Solange i < ptlen
+        raw_setbyte(outbuf, i, raw_byteat(pt, i))
+        i = i + 1
+    Ende
+    gebe_zurueck ptlen
+Ende
+
+Funktion tls_close(ctx, cred)
+    DeleteSecurityContext(ctx)
+    FreeCredentialsHandle(cred)
+    gebe_zurueck 0
+Ende

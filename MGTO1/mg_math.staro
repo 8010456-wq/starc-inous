@@ -1,0 +1,168 @@
+// ============================================================================
+//  MGTO1 :: mg_math.staro —— 软件数学库（sin/cos/exp/sqrt）
+//  全部通过 .staro 运算实现：无第三方、无 linx、无浮点字面量。
+//  double 用 int64 bit 模式；运算用 fadd/fsub/fmul/fdiv/fsqrt/fabs/fcmp/f2i/i2f。
+//  ★ 不做"编译器内置能力"探查——这里只有本 .staro 自己写的函数。
+// ============================================================================
+
+// ---- sqrt：直接用开方 ----
+Funktion m_sqrt(x)
+    gebe_zurueck fsqrt(x)
+Ende
+
+// ---- exp(x)：约化到 |x/2^k|<0.5 后泰勒，再平方 k 次 ----
+Funktion m_exp(x)
+    half = 4602678819172646912      // 0.5
+    c2 = 4602678819172646912        // 1/2!
+    c3 = 4595172819793696085        // 1/3!
+    c4 = 4586165620538955093        // 1/4!
+    c5 = 4575957461383581969        // 1/5!
+    c6 = 4564047942368979991        // 1/6!
+    c7 = 4551452160554016794        // 1/7!
+    c8 = 4537941361671905306        // 1/8!
+    c9 = 4523617214285662004        // 1/9!
+    c10 = 4508805057796939612       // 1/10!
+    k = 0
+    y = x
+    Solange fabs(y) > half
+        y = fmul(y, half)
+        k = k + 1
+        Wenn k > 40 dann
+            k = 40
+            // 输入异常巨大，精度放弃；跳出
+            // 通过把 y 固定为 0 避免继续（实际应用不会到这）
+            // 直接置 y 极小
+            y = half
+        Ende
+    Ende
+    // 泰勒 exp(y) = 1 + y + y^2/2! + ... + y^10/10!
+    s = 4607182418800017408         // 1.0
+    s = fadd(s, y)
+    term = y
+    term = fmul(term, y)            // y^2
+    s = fadd(s, fmul(term, c2))
+    term = fmul(term, y)            // y^3
+    s = fadd(s, fmul(term, c3))
+    term = fmul(term, y)            // y^4
+    s = fadd(s, fmul(term, c4))
+    term = fmul(term, y)            // y^5
+    s = fadd(s, fmul(term, c5))
+    term = fmul(term, y)            // y^6
+    s = fadd(s, fmul(term, c6))
+    term = fmul(term, y)            // y^7
+    s = fadd(s, fmul(term, c7))
+    term = fmul(term, y)            // y^8
+    s = fadd(s, fmul(term, c8))
+    term = fmul(term, y)            // y^9
+    s = fadd(s, fmul(term, c9))
+    term = fmul(term, y)            // y^10
+    s = fadd(s, fmul(term, c10))
+    // 平方 k 次：exp(x) = (exp(y))^(2^k)
+    Solange k > 0
+        s = fmul(s, s)
+        k = k - 1
+    Ende
+    gebe_zurueck s
+Ende
+
+// ---- sin(x)：约化到 [-pi,pi] 后泰勒 ----
+Funktion m_sin(x)
+    twopi = 4618760256179416344     // 2*pi
+    pi = 4614256656552045848        // pi
+    q = fdiv(x, twopi)
+    n = f2i(q)
+    r = fsub(x, fmul(i2f(n), twopi))
+    negpi = fsub(0, pi)
+    Wenn fcmp(r, pi) > 0 dann
+        r = fsub(r, twopi)
+    Ende
+    Wenn fcmp(r, negpi) < 0 dann
+        r = fadd(r, twopi)
+    Ende
+    r2 = fmul(r, r)
+    c3 = -4628199217061079723       // -1/3!
+    c5 = 4575957461383581969        // +1/5!
+    c7 = -4671919876300759014       // -1/7!
+    c9 = 4523617214285662004        // +1/9!
+    c11 = -4730215272828025628      // -1/11!
+    c13 = 4460272573143870729       // +1/13!
+    c15 = -4797767418267846625      // -1/15!
+    c17 = 4389130328383466826       // +1/17!
+    s = r
+    term = r
+    term = fmul(term, r2)           // r^3
+    s = fadd(s, fmul(term, c3))
+    term = fmul(term, r2)           // r^5
+    s = fadd(s, fmul(term, c5))
+    term = fmul(term, r2)           // r^7
+    s = fadd(s, fmul(term, c7))
+    term = fmul(term, r2)           // r^9
+    s = fadd(s, fmul(term, c9))
+    term = fmul(term, r2)           // r^11
+    s = fadd(s, fmul(term, c11))
+    term = fmul(term, r2)           // r^13
+    s = fadd(s, fmul(term, c13))
+    term = fmul(term, r2)           // r^15
+    s = fadd(s, fmul(term, c15))
+    term = fmul(term, r2)           // r^17
+    s = fadd(s, fmul(term, c17))
+    gebe_zurueck s
+Ende
+
+// ---- cos(x)：约化到 [-pi,pi] 后泰勒 ----
+Funktion m_cos(x)
+    twopi = 4618760256179416344     // 2*pi
+    pi = 4614256656552045848        // pi
+    q = fdiv(x, twopi)
+    n = f2i(q)
+    r = fsub(x, fmul(i2f(n), twopi))
+    negpi = fsub(0, pi)
+    Wenn fcmp(r, pi) > 0 dann
+        r = fsub(r, twopi)
+    Ende
+    Wenn fcmp(r, negpi) < 0 dann
+        r = fadd(r, twopi)
+    Ende
+    r2 = fmul(r, r)
+    c2 = -4620693217682128896       // -1/2!
+    c4 = 4586165620538955093        // +1/4!
+    c6 = -4659324094485795817       // -1/6!
+    c8 = 4537941361671905306        // +1/8!
+    c10 = -4714566979057836196      // -1/10!
+    c12 = 4477122120089393304       // +1/12!
+    c14 = -4780226356266894179      // -1/14!
+    c16 = 4407590220077447199       // +1/16!
+    s = 4607182418800017408         // 1.0
+    term = r2                       // r^2
+    s = fadd(s, fmul(term, c2))
+    term = fmul(term, r2)           // r^4
+    s = fadd(s, fmul(term, c4))
+    term = fmul(term, r2)           // r^6
+    s = fadd(s, fmul(term, c6))
+    term = fmul(term, r2)           // r^8
+    s = fadd(s, fmul(term, c8))
+    term = fmul(term, r2)           // r^10
+    s = fadd(s, fmul(term, c10))
+    term = fmul(term, r2)           // r^12
+    s = fadd(s, fmul(term, c12))
+    term = fmul(term, r2)           // r^14
+    s = fadd(s, fmul(term, c14))
+    term = fmul(term, r2)           // r^16
+    s = fadd(s, fmul(term, c16))
+    gebe_zurueck s
+Ende
+
+// ---- sigmoid(x) = 1/(1+exp(-x)) ----
+Funktion m_sigmoid(x)
+    negx = fsub(0, x)
+    e = m_exp(negx)
+    one = 4607182418800017408       // 1.0
+    d = fadd(one, e)
+    gebe_zurueck fdiv(one, d)
+Ende
+
+// ---- silu(x) = x * sigmoid(x) ----
+Funktion m_silu(x)
+    s = m_sigmoid(x)
+    gebe_zurueck fmul(x, s)
+Ende

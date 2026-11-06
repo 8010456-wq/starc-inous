@@ -1,0 +1,358 @@
+// ============================================================================
+//  starshell :: inuos/core.staro
+//  StarShell V4 能力库 · 核心：控制台输出 + 字符串操作 + 命令行解析
+//  铁律 E：能力全部在此 .staro 实现。只用语言原语 alloc/raw_setbyte/
+//  raw_byteat + WinAPI(linx-o)。禁用 Ausgeben/i2s/byteat/as_str 等内建。
+//  本库由 starcc 编译时自动扫描（当前目录 inuos/ 下全部 .staro 自动并入）。
+// ============================================================================
+
+linx-o kernel32 GetStdHandle WriteFile GetCommandLineA GetTickCount
+linx-o kernel32 GetCurrentProcessId GetConsoleMode SetConsoleMode ReadConsoleA ReadFile
+
+// ---------- 控制台句柄 ----------
+
+Funktion get_stdout()
+    gebe_zurueck GetStdHandle(-11)
+Ende
+
+// ---------- StarC 字符串基本（8 字节头 + 数据 + NUL）----------
+
+Funktion str_len(str)
+    i = 0
+    Solange raw_byteat(str, 8 + i) != 0
+        i = i + 1
+    Ende
+    gebe_zurueck i
+Ende
+
+Funktion str_at(str, pos)
+    gebe_zurueck raw_byteat(str, 8 + pos)
+Ende
+
+// 复制 StarC 字符串（返回新分配）
+Funktion str_copy(str)
+    n = str_len(str)
+    buf = alloc(8 + n + 1)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, 8 + i, raw_byteat(str, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 0, n % 256)
+    raw_setbyte(buf, 1, (n / 256) % 256)
+    raw_setbyte(buf, 2, (n / 65536) % 256)
+    raw_setbyte(buf, 3, (n / 16777216) % 256)
+    raw_setbyte(buf, 8 + n, 0)
+    gebe_zurueck buf
+Ende
+
+// 拼接两 StarC 字符串
+Funktion str_concat(s1, s2)
+    n1 = str_len(s1)
+    n2 = str_len(s2)
+    buf = alloc(8 + n1 + n2 + 1)
+    i = 0
+    Solange i < n1
+        raw_setbyte(buf, 8 + i, raw_byteat(s1, 8 + i))
+        i = i + 1
+    Ende
+    i = 0
+    Solange i < n2
+        raw_setbyte(buf, 8 + n1 + i, raw_byteat(s2, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 0, (n1 + n2) % 256)
+    raw_setbyte(buf, 1, ((n1 + n2) / 256) % 256)
+    raw_setbyte(buf, 2, ((n1 + n2) / 65536) % 256)
+    raw_setbyte(buf, 3, ((n1 + n2) / 16777216) % 256)
+    raw_setbyte(buf, 8 + n1 + n2, 0)
+    gebe_zurueck buf
+Ende
+
+// 从 C 字符串（0 结尾）生成 StarC 字符串
+Funktion cstr_to_starc(c)
+    n = 0
+    Solange raw_byteat(c, n) != 0
+        n = n + 1
+    Ende
+    buf = alloc(8 + n + 1)
+    raw_setbyte(buf, 0, n % 256)
+    raw_setbyte(buf, 1, (n / 256) % 256)
+    raw_setbyte(buf, 2, (n / 65536) % 256)
+    raw_setbyte(buf, 3, (n / 16777216) % 256)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, 8 + i, raw_byteat(c, i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 8 + n, 0)
+    gebe_zurueck buf
+Ende
+
+// StarC 字符串 -> C 字符串（返回裸指针，仅临时用）
+Funktion starc_to_cstr(s)
+    n = str_len(s)
+    buf = alloc(n + 1)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, n, 0)
+    gebe_zurueck buf
+Ende
+
+// ---------- 控制台输出（WriteFile，不用 Ausgeben）----------
+
+Funktion write_cstr(c)
+    n = 0
+    Solange raw_byteat(c, n) != 0
+        n = n + 1
+    Ende
+    WriteFile(get_stdout(), c, n, 0, 0)
+    gebe_zurueck 0
+Ende
+
+Funktion write_str(str)
+    WriteFile(get_stdout(), str + 8, str_len(str), 0, 0)
+    gebe_zurueck 0
+Ende
+
+Funktion write_newline()
+    nl = alloc(1)
+    raw_setbyte(nl, 0, 10)
+    WriteFile(get_stdout(), nl, 1, 0, 0)
+    gebe_zurueck 0
+Ende
+
+// ---------- 整数 -> StarC 字符串 ----------
+
+Funktion int_to_str(num)
+    Wenn num == 0 dann
+        buf = alloc(10)
+        raw_setbyte(buf, 0, 1)
+        raw_setbyte(buf, 1, 0)
+        raw_setbyte(buf, 2, 0)
+        raw_setbyte(buf, 3, 0)
+        raw_setbyte(buf, 12, 48)
+        raw_setbyte(buf, 13, 0)
+        gebe_zurueck buf
+    Ende
+    neg = 0
+    Wenn num < 0 dann
+        neg = 1
+        num = 0 - num
+    Ende
+    digits = alloc(24)
+    di = 0
+    Solange num > 0
+        raw_setbyte(digits, di, num % 10)
+        di = di + 1
+        num = num / 10
+    Ende
+    buf = alloc(24)
+    pos = 0
+    Wenn neg == 1 dann
+        raw_setbyte(buf, 8 + pos, 45)
+        pos = pos + 1
+    Ende
+    i = di - 1
+    Solange i >= 0
+        raw_setbyte(buf, 8 + pos, raw_byteat(digits, i) + 48)
+        pos = pos + 1
+        i = i - 1
+    Ende
+    raw_setbyte(buf, 0, pos % 256)
+    raw_setbyte(buf, 1, (pos / 256) % 256)
+    raw_setbyte(buf, 2, (pos / 65536) % 256)
+    raw_setbyte(buf, 3, (pos / 16777216) % 256)
+    raw_setbyte(buf, 8 + pos, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion write_int(num)
+    write_str(int_to_str(num))
+    gebe_zurueck 0
+Ende
+
+// ---------- 字符串比较 ----------
+
+Funktion str_eq(s1, s2)
+    n1 = str_len(s1)
+    n2 = str_len(s2)
+    Wenn n1 != n2 dann
+        gebe_zurueck 0
+    Ende
+    i = 0
+    Solange i < n1
+        Wenn raw_byteat(s1, 8 + i) != raw_byteat(s2, 8 + i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// C 字符串从 pos 起是否等于 StarC 字符串（边界为空格/NUL）
+Funktion str_eq_at(c, pos, s)
+    n = str_len(s)
+    i = 0
+    Solange i < n
+        Wenn raw_byteat(c, pos + i) != raw_byteat(s, 8 + i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    nb = raw_byteat(c, pos + n)
+    Wenn nb != 32 dann
+        Wenn nb != 0 dann
+            gebe_zurueck 0
+        Ende
+    Ende
+    gebe_zurueck 1
+Ende
+
+// ---------- 命令行 ----------
+
+Funktion get_cmdline_cstr()
+    gebe_zurueck GetCommandLineA()
+Ende
+
+// 从 C 字符串 start 起取下一个参数（StarC 字符串）
+Funktion extract_arg(c, start)
+    Solange raw_byteat(c, start) == 32
+        start = start + 1
+    Ende
+    e = start
+    f = 0
+    ch = raw_byteat(c, e)
+    Solange f == 0
+        Wenn ch == 32 dann
+            f = 1
+        Sonst
+            Wenn ch == 0 dann
+                f = 1
+            Sonst
+                e = e + 1
+                ch = raw_byteat(c, e)
+            Ende
+        Ende
+    Ende
+    n = e - start
+    buf = alloc(8 + n + 1)
+    raw_setbyte(buf, 0, n % 256)
+    raw_setbyte(buf, 1, (n / 256) % 256)
+    raw_setbyte(buf, 2, (n / 65536) % 256)
+    raw_setbyte(buf, 3, (n / 16777216) % 256)
+    i = 0
+    Solange i < n
+        raw_setbyte(buf, 8 + i, raw_byteat(c, start + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 8 + n, 0)
+    gebe_zurueck buf
+Ende
+
+// 数字 -> 是否数字字符
+Funktion is_digit(ch)
+    Wenn ch >= 48 dann
+        Wenn ch <= 57 dann
+            gebe_zurueck 1
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+// StarC 字符串 -> 整数
+Funktion str_to_int(s)
+    n = str_len(s)
+    i = 0
+    v = 0
+    neg = 0
+    Wenn n > 0 dann
+        Wenn raw_byteat(s, 8) == 45 dann
+            neg = 1
+            i = 1
+        Ende
+    Ende
+    Solange i < n
+        ch = raw_byteat(s, 8 + i)
+        Wenn is_digit(ch) == 1 dann
+            v = v * 10 + (ch - 48)
+        Ende
+        i = i + 1
+    Ende
+    Wenn neg == 1 dann
+        v = 0 - v
+    Ende
+    gebe_zurueck v
+Ende
+
+// ---------- 控制台输入（ReadFile 逐字节）----------
+
+// 读一行（去掉行尾 CR LF），返回 StarC 字符串；EOF 返回 0
+Funktion read_line()
+    h = GetStdHandle(-10)
+    buf = alloc(1024)
+    i = 0
+    fertig = 0
+    Solange fertig == 0
+        nb = alloc(4)
+        ok = ReadFile(h, buf + i, 1, nb, 0)
+        n = raw_byteat(nb, 0) + raw_byteat(nb, 1) * 256 + raw_byteat(nb, 2) * 65536 + raw_byteat(nb, 3) * 16777216
+        Wenn ok == 0 dann
+            fertig = 1
+        Sonst
+            Wenn n == 0 dann
+                fertig = 1
+            Sonst
+                ch = raw_byteat(buf, i)
+                Wenn ch == 10 dann
+                    fertig = 1
+                Sonst
+                    Wenn ch == 13 dann
+                        // CR 忽略
+                    Sonst
+                        i = i + 1
+                    Ende
+                Ende
+            Ende
+        Ende
+    Ende
+    Wenn i == 0 dann
+        gebe_zurueck 0
+    Ende
+    s = alloc(8 + i + 1)
+    raw_setbyte(s, 0, i % 256)
+    raw_setbyte(s, 1, (i / 256) % 256)
+    raw_setbyte(s, 2, (i / 65536) % 256)
+    raw_setbyte(s, 3, (i / 16777216) % 256)
+    j = 0
+    Solange j < i
+        raw_setbyte(s, 8 + j, raw_byteat(buf, j))
+        j = j + 1
+    Ende
+    raw_setbyte(s, 8 + i, 0)
+    gebe_zurueck s
+Ende
+
+// 去掉末尾 cut 个字符（StarC 字符串）
+Funktion str_cut_tail(s, cut)
+    n = str_len(s)
+    m = n - cut
+    Wenn m < 0 dann
+        m = 0
+    Ende
+    buf = alloc(8 + m + 1)
+    i = 0
+    Solange i < m
+        raw_setbyte(buf, 8 + i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(buf, 0, m % 256)
+    raw_setbyte(buf, 1, (m / 256) % 256)
+    raw_setbyte(buf, 2, (m / 65536) % 256)
+    raw_setbyte(buf, 3, (m / 16777216) % 256)
+    raw_setbyte(buf, 8 + m, 0)
+    gebe_zurueck buf
+Ende

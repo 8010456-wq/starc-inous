@@ -1,0 +1,245 @@
+// inuos/lexer.staro - 词法分析器 (StarC 源码 -> token 流)
+// P1: 支持 数字/标识符/关键字/单字符运算符/注释/空白
+// token 布局 (32 字节):
+//   [0..3]  type : 1=数字 2=标识符 3=关键字 4=运算符 5=字符串 6=EOF
+//   [4..7]  ival : 数字值 / 标识符长度 / 关键字编码 / 运算符长度 / 字符串长度
+//   [8..]   data : 20 字节 标识符/关键字名/运算符符号/字符串字符
+// 依赖: sys.staro(raw_set32/get32/raw_setbyte), str.staro(str_len)
+// 循环跳出用 und stop==0 标志 (禁用 i=len 哨兵, 会污染 i 的语义)
+
+// ---- 字符分类 ----
+Funktion lex_isspace(c)
+    Wenn c == 32 dann gebe_zurueck 1 Ende   // 空格
+    Wenn c == 9 dann gebe_zurueck 1 Ende    // tab
+    Wenn c == 10 dann gebe_zurueck 1 Ende   // LF
+    Wenn c == 13 dann gebe_zurueck 1 Ende   // CR
+    gebe_zurueck 0
+Ende
+
+Funktion lex_isnum(c)
+    Wenn c >= 48 dann
+        Wenn c <= 57 dann gebe_zurueck 1 Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion lex_isidstart(c)
+    Wenn c >= 65 dann
+        Wenn c <= 90 dann gebe_zurueck 1 Ende  // A-Z
+    Ende
+    Wenn c >= 97 dann
+        Wenn c <= 122 dann gebe_zurueck 1 Ende // a-z
+    Ende
+    Wenn c == 95 dann gebe_zurueck 1 Ende      // _
+    gebe_zurueck 0
+Ende
+
+Funktion lex_isidpart(c)
+    Wenn lex_isnum(c) == 1 dann gebe_zurueck 1 Ende
+    Wenn lex_isidstart(c) == 1 dann gebe_zurueck 1 Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 关键字识别 ----
+// 比较原始缓冲 src[start..start+len) 与关键字 kw (StarC 字符串), 等长且逐字节相等返回 1
+Funktion lex_eq_kw(src, start, len, kw)
+    kl = str_len(kw)
+    Wenn kl != len dann gebe_zurueck 0 Ende
+    i = 0
+    Solange i < len
+        Wenn raw_byteat(src, start + i) != raw_byteat(kw, 8 + i) dann
+            gebe_zurueck 0
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck 1
+Ende
+
+// 返回关键字编码: 1=Funktion 2=Ende 3=Wenn 4=dann 5=Sonst 6=Solange
+//   7=gebe_zurueck 8=Ausgeben 9=und 10=Parallel 11=int 12=ptr
+// 非关键字返回 0
+Funktion lex_kw(src, start, len)
+    Wenn lex_eq_kw(src, start, len, "Funktion") dann gebe_zurueck 1 Ende
+    Wenn lex_eq_kw(src, start, len, "Ende") dann gebe_zurueck 2 Ende
+    Wenn lex_eq_kw(src, start, len, "Wenn") dann gebe_zurueck 3 Ende
+    Wenn lex_eq_kw(src, start, len, "dann") dann gebe_zurueck 4 Ende
+    Wenn lex_eq_kw(src, start, len, "Sonst") dann gebe_zurueck 5 Ende
+    Wenn lex_eq_kw(src, start, len, "Solange") dann gebe_zurueck 6 Ende
+    Wenn lex_eq_kw(src, start, len, "gebe_zurueck") dann gebe_zurueck 7 Ende
+    Wenn lex_eq_kw(src, start, len, "Ausgeben") dann gebe_zurueck 8 Ende
+    Wenn lex_eq_kw(src, start, len, "und") dann gebe_zurueck 9 Ende
+    Wenn lex_eq_kw(src, start, len, "Parallel") dann gebe_zurueck 10 Ende
+    Wenn lex_eq_kw(src, start, len, "int") dann gebe_zurueck 11 Ende
+    Wenn lex_eq_kw(src, start, len, "ptr") dann gebe_zurueck 12 Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 主词法 ----
+// src: 原始数据缓冲 (offset 0 起); len: 字节数; tokens: 预分配 token 缓冲; maxtok: 上限
+// 返回 token 总数 (含 EOF)
+Funktion lex_tokenize(src, len, tokens, maxtok)
+    n = 0
+    i = 0
+    Solange i < len
+        Wenn n >= maxtok dann
+            gebe_zurueck n
+        Ende
+        c = raw_byteat(src, i)
+        Wenn lex_isspace(c) == 1 dann
+            Wenn c == 10 dann  // \n -> 换行 token (语句分隔)
+                base = n * 32
+                raw_set32(tokens, base, 7)
+                raw_set32(tokens, base + 4, 0)
+                n = n + 1
+            Ende
+            i = i + 1
+        Sonst
+            // 注释 //
+            Wenn c == 47 dann
+                Wenn raw_byteat(src, i + 1) == 47 dann
+                    // 跳到行尾 (越过 \n, 保留后续代码)
+                    stop = 0
+                    Solange i < len und stop == 0
+                        Wenn raw_byteat(src, i) == 10 dann
+                            i = i + 1
+                            stop = 1
+                        Sonst
+                            i = i + 1
+                        Ende
+                    Ende
+                Sonst
+                    // 单字符运算符 /
+                    base = n * 32
+                    raw_set32(tokens, base, 4)
+                    raw_set32(tokens, base + 4, 1)
+                    raw_setbyte(tokens, base + 8, 47)
+                    n = n + 1
+                    i = i + 1
+                Ende
+            Sonst
+                // 字符串字面量 "..." (type5, 数据存 token data 区)
+                Wenn c == 34 dann  // "
+                    i = i + 1
+                    sstart = 0
+                    slen = 0
+                    stop = 0
+                    Solange i < len und stop == 0
+                        cc = raw_byteat(src, i)
+                        Wenn cc == 34 dann  // 结束引号
+                            i = i + 1
+                            stop = 1
+                        Sonst
+                            Wenn slen < 19 dann
+                                raw_setbyte(tokens, n * 32 + 8 + sstart, cc)
+                                sstart = sstart + 1
+                            Ende
+                            slen = slen + 1
+                            i = i + 1
+                        Ende
+                    Ende
+                    base = n * 32
+                    raw_set32(tokens, base, 5)
+                    raw_set32(tokens, base + 4, slen)
+                    n = n + 1
+                Sonst
+                // 数字
+                Wenn lex_isnum(c) == 1 dann
+                    v = 0
+                    stop = 0
+                    Solange i < len und stop == 0
+                        Wenn lex_isnum(raw_byteat(src, i)) == 1 dann
+                            v = v * 10 + (raw_byteat(src, i) - 48)
+                            i = i + 1
+                        Sonst
+                            stop = 1
+                        Ende
+                    Ende
+                    // 浮点字面量: 整数部分后紧跟 . 且 . 后为数字 (type8, ival=fp32 位模式)
+                    Wenn i + 1 < len und raw_byteat(src, i) == 46 und lex_isnum(raw_byteat(src, i + 1)) == 1 dann
+                        i = i + 1  // 跳过 .
+                        frac = 0
+                        fk = 0
+                        stop = 0
+                        Solange i < len und stop == 0
+                            Wenn lex_isnum(raw_byteat(src, i)) == 1 dann
+                                frac = frac * 10 + (raw_byteat(src, i) - 48)
+                                fk = fk + 1
+                                i = i + 1
+                            Sonst
+                                stop = 1
+                            Ende
+                        Ende
+                        denom = 1
+                        j = 0
+                        Solange j < fk
+                            denom = denom * 10
+                            j = j + 1
+                        Ende
+                        fv = s32_to_f32(v)
+                        Wenn fk > 0 dann
+                            fv = f32_add(fv, f32_div(s32_to_f32(frac), s32_to_f32(denom)))
+                        Ende
+                        base = n * 32
+                        raw_set32(tokens, base, 8)
+                        raw_set32(tokens, base + 4, fv)
+                        n = n + 1
+                    Sonst
+                        base = n * 32
+                        raw_set32(tokens, base, 1)
+                        raw_set32(tokens, base + 4, v)
+                        n = n + 1
+                    Ende
+                Sonst
+                    // 标识符/关键字
+                    Wenn lex_isidstart(c) == 1 dann
+                        start = i
+                        stop = 0
+                        Solange i < len und stop == 0
+                            Wenn lex_isidpart(raw_byteat(src, i)) == 1 dann
+                                i = i + 1
+                            Sonst
+                                stop = 1
+                            Ende
+                        Ende
+                        ilen = i - start
+                        k = lex_kw(src, start, ilen)
+                        base = n * 32
+                        Wenn k != 0 dann
+                            raw_set32(tokens, base, 3)
+                            raw_set32(tokens, base + 4, k)
+                        Sonst
+                            raw_set32(tokens, base, 2)
+                            raw_set32(tokens, base + 4, ilen)
+                            j = 0
+                            stop2 = 0
+                            Solange j < ilen und stop2 == 0
+                                Wenn j < 20 dann
+                                    raw_setbyte(tokens, base + 8 + j, raw_byteat(src, start + j))
+                                    j = j + 1
+                                Sonst
+                                    stop2 = 1
+                                Ende
+                            Ende
+                        Ende
+                        n = n + 1
+                    Sonst
+                        // 单字符运算符
+                        base = n * 32
+                        raw_set32(tokens, base, 4)
+                        raw_set32(tokens, base + 4, 1)
+                        raw_setbyte(tokens, base + 8, c)
+                        n = n + 1
+                        i = i + 1
+                    Ende
+                Ende
+                Ende
+            Ende
+        Ende
+    Ende
+    // EOF token
+    base = n * 32
+    raw_set32(tokens, base, 6)
+    raw_set32(tokens, base + 4, 0)
+    n = n + 1
+    gebe_zurueck n
+Ende

@@ -1,0 +1,229 @@
+// ============================================================================
+//  MGTO1 :: mg_net.staro —— 原始 socket + 自写 HTTP/DNS（绕开 WinHTTP/WinInet）
+//  本机 WinHTTP 与 WinInet 均无法读取响应体（连 example.com 都 0 字节）；
+//  沙箱内 getaddrinfo/gethostbyname 也失效（返回空/坏指针）。故：
+//    - DNS：自研 UDP 查询（8.8.8.8:53 或 1.1.1.1:53），解析 A 记录
+//    - HTTP：原始 TCP socket + 自写 HTTP/1.1 收发
+//    - TLS：后续由 SChannel（schannel.dll）提供
+// ============================================================================
+
+linx "ws2_32.dll!htons"
+linx "ws2_32.dll!WSAGetLastError"
+
+// 给 socket 设接收超时（毫秒）。SO_RCVTIMEO 在 Windows 为 DWORD 毫秒。
+// SOL_SOCKET=65535, SO_RCVTIMEO=4102。
+Funktion net_set_timeout(s, ms)
+    tv = alloc(4)
+    mem_zero(tv, 4)
+    raw_setbyte(tv, 0, ms - (ms / 256) * 256)   // 低字节
+    raw_setbyte(tv, 1, (ms / 256) - ((ms / 65536) * 256))  // 次字节
+    raw_setbyte(tv, 2, (ms / 65536) - ((ms / 16777216) * 256))  // 第三字节
+    raw_setbyte(tv, 3, ms / 16777216)           // 高字节
+    setsockopt(s, 65535, 4102, tv, 4)
+    gebe_zurueck 0
+Ende
+
+// 自研 DNS：查询 host_c 的 A 记录 IPv4，写 4 字节到 ipout。
+// 返回 0 成功 / 负错误码。
+Funktion net_dns_query(host_c, ipout)
+    // UDP socket（AF_INET, SOCK_DGRAM, IPPROTO_UDP）
+    s = socket(2, 2, 17)
+    Wenn isneg(s) == 1 dann
+        gebe_zurueck 0 - 1
+    Ende
+    net_set_timeout(s, 3000)
+    // sockaddr_in -> 8.8.8.8:53
+    sa = alloc(16)
+    mem_zero(sa, 16)
+    raw_setbyte(sa, 0, 2)     // AF_INET
+    raw_setbyte(sa, 2, 0)     // port 53 hi
+    raw_setbyte(sa, 3, 53)    // port 53 lo
+    raw_setbyte(sa, 4, 8)     // 8.8.8.8
+    raw_setbyte(sa, 5, 8)
+    raw_setbyte(sa, 6, 8)
+    raw_setbyte(sa, 7, 8)
+    r = connect(s, sa, 16)
+    Wenn r != 0 dann
+        closesocket(s)
+        gebe_zurueck 0 - 2
+    Ende
+    // 构造查询包（header 12 字节 + QNAME + QTYPE + QCLASS）
+    q = alloc(300)
+    mem_zero(q, 300)
+    raw_setbyte(q, 0, 18)   // ID hi
+    raw_setbyte(q, 1, 52)   // ID lo
+    raw_setbyte(q, 2, 1)   // flags hi（RD=1）
+    raw_setbyte(q, 3, 0)   // flags lo
+    raw_setbyte(q, 4, 0)   // QDCOUNT hi
+    raw_setbyte(q, 5, 1)   // QDCOUNT lo
+    // QNAME：把 host_c（点分域名）拆成 label 序列
+    off = 12
+    i = 0
+    labstart = 0
+    lablen = 0
+    eos = 0
+    Solange eos == 0
+        c = raw_byteat(host_c, i)
+        Wenn c == 0 dann
+            Wenn lablen > 0 dann
+                raw_setbyte(q, labstart, lablen)
+            Ende
+            raw_setbyte(q, off, 0)   // 根 label
+            off = off + 1
+            eos = 1
+        Sonst
+            Wenn c == 46 dann        // '.'
+                raw_setbyte(q, labstart, lablen)
+                lablen = 0
+                labstart = off
+            Sonst
+                Wenn lablen == 0 dann
+                    labstart = off
+                    off = off + 1
+                Ende
+                raw_setbyte(q, off, c)
+                off = off + 1
+                lablen = lablen + 1
+            Ende
+            i = i + 1
+        Ende
+    Ende
+    // QTYPE=A(1), QCLASS=IN(1)
+    raw_setbyte(q, off, 0)
+    raw_setbyte(q, off + 1, 1)
+    raw_setbyte(q, off + 2, 0)
+    raw_setbyte(q, off + 3, 1)
+    qlen = off + 4
+    // 发送
+    n = send(s, q, qlen, 0)
+    Wenn isneg(n) == 1 oder n != qlen dann
+        closesocket(s)
+        gebe_zurueck 0 - 3
+    Ende
+    // 接收响应（DNS 响应是单个数据报，单次 recv 即可；配合 SO_RCVTIMEO 防阻塞）
+    rb = alloc(512)
+    mem_zero(rb, 512)
+    total = recv(s, rb, 512, 0)
+    Wenn isneg(total) == 1 dann
+        closesocket(s)
+        gebe_zurueck 0 - 4
+    Ende
+    Wenn total < 12 dann
+        closesocket(s)
+        gebe_zurueck 0 - 4
+    Ende
+    // 解析：header(12) + question 段 + 遍历 answer 找 A 记录
+    ancount = raw_byteat(rb, 6) * 256 + raw_byteat(rb, 7)
+    pos = 12
+    // 跳过 question（QNAME 标签/压缩指针 + QTYPE + QCLASS 共 4 字节尾）
+    lauf = 1
+    Solange lauf == 1
+        c = raw_byteat(rb, pos)
+        Wenn c == 0 dann
+            pos = pos + 1
+            lauf = 0
+        Sonst
+            Wenn c >= 192 dann
+                pos = pos + 2
+                lauf = 0
+            Sonst
+                pos = pos + c + 1
+            Ende
+        Ende
+    Ende
+    pos = pos + 4
+    found = 0
+    ai = 0
+    Solange ai < ancount
+        // NAME（压缩指针或标签）
+        c = raw_byteat(rb, pos)
+        Wenn c >= 192 dann
+            pos = pos + 2
+        Sonst
+            lauf = 1
+            Solange lauf == 1
+                c = raw_byteat(rb, pos)
+                Wenn c == 0 dann
+                    pos = pos + 1
+                    lauf = 0
+                Sonst
+                    Wenn c >= 192 dann
+                        pos = pos + 2
+                        lauf = 0
+                    Sonst
+                        pos = pos + c + 1
+                    Ende
+                Ende
+            Ende
+        Ende
+        rtype = raw_byteat(rb, pos) * 256 + raw_byteat(rb, pos + 1)
+        rclass = raw_byteat(rb, pos + 2) * 256 + raw_byteat(rb, pos + 3)
+        rdlen = raw_byteat(rb, pos + 8) * 256 + raw_byteat(rb, pos + 9)
+        Wenn rtype == 1 und rclass == 1 und rdlen == 4 dann
+            raw_setbyte(ipout, 0, raw_byteat(rb, pos + 10))
+            raw_setbyte(ipout, 1, raw_byteat(rb, pos + 11))
+            raw_setbyte(ipout, 2, raw_byteat(rb, pos + 12))
+            raw_setbyte(ipout, 3, raw_byteat(rb, pos + 13))
+            found = 1
+            ai = ancount
+        Sonst
+            pos = pos + 10 + rdlen
+            ai = ai + 1
+        Ende
+    Ende
+    closesocket(s)
+    Wenn found == 1 dann
+        gebe_zurueck 0
+    Sonst
+        gebe_zurueck 0 - 5
+    Ende
+Ende
+
+// 连接 host_c:port（自研 DNS + 原始 TCP）；返回 socket（>=0）或负错误码。
+Funktion net_connect(host_c, port)
+    ws = alloc(1024)
+    mem_zero(ws, 1024)
+    WSAStartup(514, ws)
+    ip = alloc(4)
+    mem_zero(ip, 4)
+    r = net_dns_query(host_c, ip)
+    Wenn r != 0 dann
+        gebe_zurueck r
+    Ende
+    addr = alloc(16)
+    mem_zero(addr, 16)
+    raw_setbyte(addr, 0, 2)
+    hi = port / 256
+    lo = port - hi * 256
+    raw_setbyte(addr, 2, hi)
+    raw_setbyte(addr, 3, lo)
+    i = 0
+    Solange i < 4
+        raw_setbyte(addr, 4 + i, raw_byteat(ip, i))
+        i = i + 1
+    Ende
+    s = socket(2, 1, 6)
+    Wenn isneg(s) == 1 dann
+        gebe_zurueck 0 - 2
+    Ende
+    net_set_timeout(s, 15000)
+    r = connect(s, addr, 16)
+    Wenn isneg(r) == 1 oder r != 0 dann
+        closesocket(s)
+        gebe_zurueck 0 - 3
+    Ende
+    gebe_zurueck s
+Ende
+
+// 发送全部字节；返回发送字节数（<0 失败）
+Funktion net_send_all(s, ptr, len)
+    total = 0
+    Solange total < len
+        n = send(s, ptr + total, len - total, 0)
+        Wenn isneg(n) == 1 oder n == 0 dann
+            gebe_zurueck 0 - 1
+        Ende
+        total = total + n
+    Ende
+    gebe_zurueck total
+Ende

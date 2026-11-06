@@ -1,0 +1,69 @@
+// ============================================================================
+//  fileio.staro —— language-bench 实例读取能力层（铁律 E：能力全在 .staro）
+//  WinAPI 文件读取：CreateFileA / GetFileSizeEx / ReadFile / CloseHandle。
+//  全部用语言原语 alloc/raw_setbyte/raw_byteat + linx-o 绑定，零内建、零依赖。
+//  供所有 stream/file 基准把测试实例读入内存缓冲区。
+//  用法（.starc 编排）：h=fio_open(cstr); size=fio_size(h); buf=fio_read_all(h,size); fio_close(h)
+//  ★ StarC 词法仅支持十进制字面量（v=v*10+c-'0'），故 WinAPI 常量一律写十进制。
+// ============================================================================
+
+linx-o kernel32 CreateFileA GetFileSizeEx ReadFile CloseHandle
+
+// ---------- 64 位小端读取（本地定义，避免跨库依赖）----------
+
+Funktion fio_read_u64(buf, off)
+    v = raw_byteat(buf, off + 0) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    v = v + raw_byteat(buf, off + 4) * 4294967296 + raw_byteat(buf, off + 5) * 1099511627776 + raw_byteat(buf, off + 6) * 281474976710656 + raw_byteat(buf, off + 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+// 从 buf（offset off）读取 4 字节小端 int32（有符号）
+Funktion fio_read_i32(buf, off)
+    v = raw_byteat(buf, off) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    Wenn v > 2147483647 dann
+        v = v - 4294967296
+    Ende
+    gebe_zurueck v
+Ende
+
+// 从 buf（offset off）读取 8 字节小端 double（返回 IEEE754 位模式在 64 位整数里）
+Funktion fio_read_f64(buf, off)
+    v = raw_byteat(buf, off + 0) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    v = v + raw_byteat(buf, off + 4) * 4294967296 + raw_byteat(buf, off + 5) * 1099511627776 + raw_byteat(buf, off + 6) * 281474976710656 + raw_byteat(buf, off + 7) * 72057594037927936
+    gebe_zurueck v
+Ende
+
+// ---------- 打开文件（只读共享）----------
+// path_c 必须是 C 字符串（0 结尾裸指针）。返回句柄（>0 成功）。
+Funktion fio_open(path_c)
+    // GENERIC_READ=0x80000000=2147483648, FILE_SHARE_READ=1, OPEN_EXISTING=3, FILE_ATTRIBUTE_NORMAL=0x80=128
+    h = CreateFileA(path_c, 2147483648, 1, 0, 3, 128, 0)
+    gebe_zurueck h
+Ende
+
+// ---------- 文件大小（字节）；失败返回 -1 ----------
+Funktion fio_size(h)
+    p = alloc(8)
+    ok = GetFileSizeEx(h, p)
+    Wenn ok == 0 dann
+        gebe_zurueck -1
+    Ende
+    gebe_zurueck fio_read_u64(p, 0)
+Ende
+
+// ---------- 读整个文件到新分配缓冲区，末尾补 NUL；失败返回 0 ----------
+Funktion fio_read_all(h, size)
+    buf = alloc(size + 1)
+    nb = alloc(4)
+    ok = ReadFile(h, buf, size, nb, 0)
+    Wenn ok == 0 dann
+        gebe_zurueck 0
+    Ende
+    raw_setbyte(buf, size, 0)
+    gebe_zurueck buf
+Ende
+
+Funktion fio_close(h)
+    CloseHandle(h)
+    gebe_zurueck 0
+Ende

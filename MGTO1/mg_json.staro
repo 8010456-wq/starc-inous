@@ -1,0 +1,278 @@
+// ============================================================================
+//  MGTO1 :: mg_json.staro —— JSON 构造（C 字符串输入，输出 JSON 片段）
+// ============================================================================
+
+// C 字符串 → JSON 字符串字面量（含双引号，转义 " 与 \）
+Funktion mg_json_quote(s)
+    n = cstr_len(s)
+    q = alloc(n * 2 + 3)
+    p = 0
+    raw_setbyte(q, p, 34)
+    p = p + 1
+    i = 0
+    Solange i < n
+        c = raw_byteat(s, i)
+        Wenn c == 34 dann
+            raw_setbyte(q, p, 92)
+            p = p + 1
+            raw_setbyte(q, p, 34)
+            p = p + 1
+        Sonst
+            Wenn c == 92 dann
+                raw_setbyte(q, p, 92)
+                p = p + 1
+                raw_setbyte(q, p, 92)
+                p = p + 1
+            Sonst
+                raw_setbyte(q, p, c)
+                p = p + 1
+            Ende
+        Ende
+        i = i + 1
+    Ende
+    raw_setbyte(q, p, 34)
+    p = p + 1
+    raw_setbyte(q, p, 0)
+    gebe_zurueck q
+Ende
+
+// ============================================================================
+//  JSON 提取器（顶层 key → value token）
+//  输入：C 串（json 全文，裸指针）；key：C 串。
+//  返回值：0（未找到）或 value 起点偏移（跳过冒号+空白）。
+//  仅在「深度 0」匹配 key，避免误配嵌套内容。
+// ============================================================================
+
+Funktion js_ws(s, i)
+    Solange 1 == 1
+        c = raw_byteat(s, i)
+        Wenn c == 32 oder c == 9 oder c == 10 oder c == 13 dann
+            i = i + 1
+        Sonst
+            gebe_zurueck i
+        Ende
+    Ende
+Ende
+
+// 从 start 偏移起查找 key，返回值起点偏移；0 未找到
+Funktion js_key_from(s, start, key)
+    i = start
+    kl = cstr_len(key)
+    depth = 0
+    Solange raw_byteat(s, i) != 0
+        c = raw_byteat(s, i)
+        Wenn c == 34 dann
+            j = i + 1
+            klen = 0
+            Solange raw_byteat(s, j) != 34
+                j = j + 1
+                klen = klen + 1
+            Ende
+            // 仅深度 1 匹配（根对象内部 = 顶层 key）
+            Wenn depth == 1 und klen == kl dann
+                eq = 1
+                m = 0
+                Solange m < kl
+                    Wenn raw_byteat(s, i + 1 + m) != raw_byteat(key, m) dann
+                        eq = 0
+                    Ende
+                    m = m + 1
+                Ende
+                Wenn eq == 1 dann
+                    p = j + 1
+                    p = js_ws(s, p)
+                    Wenn raw_byteat(s, p) == 58 dann
+                        p = p + 1
+                        p = js_ws(s, p)
+                        gebe_zurueck p
+                    Ende
+                Ende
+            Ende
+            i = j + 1
+        Sonst
+            Wenn c == 91 oder c == 123 dann
+                depth = depth + 1
+            Sonst
+                Wenn c == 93 oder c == 125 dann
+                    depth = depth - 1
+                Ende
+            Ende
+            i = i + 1
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+// 顶层查找 key（从串首起）
+Funktion js_key(s, key)
+    gebe_zurueck js_key_from(s, 0, key)
+Ende
+
+// 从 safetensors header 提取某张量的 data_offsets[0]/[1]。
+// 写入 o0/o1（8 字节槽）。返回 0 成功 / 负错误码。
+Funktion js_tensor_offsets(s, tname, o0, o1)
+    v = js_key(s, tname)
+    Wenn v == 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    d = js_key_from(s, v, mg_cstr("data_offsets"))
+    Wenn d == 0 dann
+        gebe_zurueck 0 - 2
+    Ende
+    // d 指向 '['，解析 off0, off1
+    // 读整数：跳过非数字
+    i = d
+    Solange raw_byteat(s, i) != 0
+        c = raw_byteat(s, i)
+        Wenn c >= 48 und c <= 57 dann
+            // 读第一个数
+            n0 = 0
+            Solange raw_byteat(s, i) >= 48 und raw_byteat(s, i) <= 57
+                n0 = n0 * 10 + (raw_byteat(s, i) - 48)
+                i = i + 1
+            Ende
+            // 跳过到第二个数
+            Solange raw_byteat(s, i) != 0
+                c = raw_byteat(s, i)
+                Wenn c >= 48 und c <= 57 dann
+                    n1 = 0
+                    Solange raw_byteat(s, i) >= 48 und raw_byteat(s, i) <= 57
+                        n1 = n1 * 10 + (raw_byteat(s, i) - 48)
+                        i = i + 1
+                    Ende
+                    raw_set64(o0, 0, n0)
+                    raw_set64(o1, 0, n1)
+                    gebe_zurueck 0
+                Sonst
+                    i = i + 1
+                Ende
+            Ende
+        Sonst
+            i = i + 1
+        Ende
+    Ende
+    gebe_zurueck 0 - 3
+Ende
+
+// 取 value token 的 C 串（裸指针，NUL 结尾）
+Funktion js_raw(s, key)
+    v = js_key(s, key)
+    Wenn v == 0 dann
+        gebe_zurueck 0
+    Ende
+    depth = 0
+    e = v
+    done = 0
+    Solange done == 0
+        c = raw_byteat(s, e)
+        Wenn c == 34 dann
+            // 字符串：跳到结束引号（处理转义），再继续外层找分隔符
+            e = e + 1
+            instring = 1
+            Solange instring == 1
+                cc = raw_byteat(s, e)
+                Wenn cc == 92 dann
+                    e = e + 2
+                Sonst
+                    Wenn cc == 34 dann
+                        e = e + 1
+                        instring = 0
+                    Sonst
+                        e = e + 1
+                    Ende
+                Ende
+            Ende
+        Sonst
+            Wenn c == 91 oder c == 123 dann
+                depth = depth + 1
+                e = e + 1
+            Sonst
+                Wenn c == 93 oder c == 125 dann
+                    Wenn depth == 0 dann
+                        done = 1   // e 停在 '}' 或 ']'，值不含它
+                    Sonst
+                        depth = depth - 1
+                        e = e + 1
+                    Ende
+                Sonst
+                    Wenn c == 44 und depth == 0 dann
+                        done = 1   // e 停在 ','
+                    Sonst
+                        Wenn c == 0 dann
+                            done = 1
+                        Sonst
+                            e = e + 1
+                        Ende
+                    Ende
+                Ende
+            Ende
+        Ende
+    Ende
+    n = e - v
+    q = alloc(n + 1)
+    i = 0
+    Solange i < n
+        raw_setbyte(q, i, raw_byteat(s, v + i))
+        i = i + 1
+    Ende
+    raw_setbyte(q, n, 0)
+    gebe_zurueck q
+Ende
+
+// 字符串值（去首尾引号），返回 C 串；非字符串/未找到返回 0
+Funktion js_str(s, key)
+    r = js_raw(s, key)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    Wenn raw_byteat(r, 0) != 34 dann
+        gebe_zurueck 0
+    Ende
+    n = cstr_len(r)
+    Wenn n < 2 dann
+        gebe_zurueck 0
+    Ende
+    q = alloc(n)
+    i = 1
+    Solange i < n - 1
+        raw_setbyte(q, i - 1, raw_byteat(r, i))
+        i = i + 1
+    Ende
+    raw_setbyte(q, n - 2, 0)
+    gebe_zurueck q
+Ende
+
+// 数值 token（C 串，供 atof 解析）；未找到返回 0
+Funktion js_num(s, key)
+    r = js_raw(s, key)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    // 若带引号（数字字符串），去引号
+    Wenn raw_byteat(r, 0) == 34 dann
+        n = cstr_len(r)
+        q = alloc(n)
+        i = 1
+        Solange i < n - 1
+            raw_setbyte(q, i - 1, raw_byteat(r, i))
+            i = i + 1
+        Ende
+        raw_setbyte(q, n - 2, 0)
+        gebe_zurueck q
+    Sonst
+        gebe_zurueck r
+    Ende
+Ende
+
+// 布尔值：返回 1/0；未找到返回 0
+Funktion js_bool(s, key)
+    r = js_raw(s, key)
+    Wenn r == 0 dann
+        gebe_zurueck 0
+    Ende
+    Wenn raw_byteat(r, 0) == 116 dann   // 't'
+        gebe_zurueck 1
+    Sonst
+        gebe_zurueck 0
+    Ende
+Ende

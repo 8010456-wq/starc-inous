@@ -1,0 +1,302 @@
+// inuos/tensor.staro - Universe 张量基础库 (3D 体素 VAE 训练用)
+// 依赖: sys.staro (raw_*, alloc), softfloat.staro (f32_*)
+// 布局: 所有张量是 fp32 位模式数组, alloc(size*4), 索引 i*4
+// 3D 张量 (D,H,W) 扁平索引: ((d*H+h)*W+w)
+
+// ---- 分配 n 个 fp32 的张量缓冲 ----
+Funktion t_alloc(n)
+    gebe_zurueck alloc(n * 4)
+Ende
+
+// ---- 张量读/写 (fp32 位模式) ----
+Funktion t_get(buf, i)
+    gebe_zurueck raw_get32(buf, i * 4)
+Ende
+
+Funktion t_set(buf, i, v)
+    raw_set32(buf, i * 4, v)
+    gebe_zurueck 0
+Ende
+
+// ---- 清零 n 个元素 ----
+Funktion t_zero(buf, n)
+    i = 0
+    Solange i < n
+        raw_set32(buf, i * 4, 0)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 填充常量 ----
+Funktion t_fill(buf, n, v)
+    i = 0
+    Solange i < n
+        raw_set32(buf, i * 4, v)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 拷贝 n 个元素 ----
+Funktion t_copy(dst, src, n)
+    i = 0
+    Solange i < n
+        raw_set32(dst, i * 4, raw_get32(src, i * 4))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 逐元素加: dst[i] += b[i] ----
+Funktion t_add(dst, b, n)
+    i = 0
+    Solange i < n
+        raw_set32(dst, i * 4, f32_add(raw_get32(dst, i * 4), raw_get32(b, i * 4)))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 逐元素乘标量: dst[i] *= s ----
+Funktion t_scale(buf, n, s)
+    i = 0
+    Solange i < n
+        raw_set32(buf, i * 4, f32_mul(raw_get32(buf, i * 4), s))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 逐元素 a[i] = b[i] + c[i] ----
+Funktion t_vadd(dst, b, c, n)
+    i = 0
+    Solange i < n
+        raw_set32(dst, i * 4, f32_add(raw_get32(b, i * 4), raw_get32(c, i * 4)))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 逐元素 a[i] = b[i] * c[i] ----
+Funktion t_vmul(dst, b, c, n)
+    i = 0
+    Solange i < n
+        raw_set32(dst, i * 4, f32_mul(raw_get32(b, i * 4), raw_get32(c, i * 4)))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 逐元素 a[i] = b[i] - c[i] ----
+Funktion t_vsub(dst, b, c, n)
+    i = 0
+    Solange i < n
+        raw_set32(dst, i * 4, f32_sub(raw_get32(b, i * 4), raw_get32(c, i * 4)))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 3D 卷积: 输入 (Ci,D,H,W), 权重 (Co,Ci,kd,kh,kw), 输出 (Co,D,H,W)
+// 前向卷积, stride=1, 无 padding (valid). 用软浮点. 纯 CPU 参考实现.
+// in: 输入, w: 权重, out: 输出
+// Ci, D, H, W: 输入通道/深度/高/宽
+// Co, KD, KH, KW: 输出通道/卷积核尺寸
+// 假设输出尺寸 = D-KD+1, H-KH+1, W-KW+1
+Funktion conv3d_forward(in, w, out, Ci, D, H, W, Co, KD, KH, KW)
+    OD = D - KD + 1
+    OH = H - KH + 1
+    OW = W - KW + 1
+    // 清零输出
+    nout = Co * OD * OH * OW
+    t_zero(out, nout)
+    co = 0
+    Solange co < Co
+        od = 0
+        Solange od < OD
+            oh = 0
+            Solange oh < OH
+                ow = 0
+                Solange ow < OW
+                    acc = 0
+                    ci = 0
+                    Solange ci < Ci
+                        kd = 0
+                        Solange kd < KD
+                            kh = 0
+                            Solange kh < KH
+                                kw = 0
+                                Solange kw < KW
+                                    // in_idx = ((ci*D + (od+kd))*H + (oh+kh))*W + (ow+kw)
+                                    in_idx = ((ci * D + od + kd) * H + oh + kh) * W + ow + kw
+                                    // w_idx = (((co*Ci + ci)*KD + kd)*KH + kh)*KW + kw
+                                    w_idx = (((co * Ci + ci) * KD + kd) * KH + kh) * KW + kw
+                                    acc = f32_add(acc, f32_mul(t_get(in, in_idx), t_get(w, w_idx)))
+                                    kw = kw + 1
+                                Ende
+                                kh = kh + 1
+                            Ende
+                            kd = kd + 1
+                        Ende
+                        ci = ci + 1
+                    Ende
+                    out_idx = ((co * OD + od) * OH + oh) * OW + ow
+                    t_set(out, out_idx, acc)
+                    ow = ow + 1
+                Ende
+                oh = oh + 1
+            Ende
+            od = od + 1
+        Ende
+        co = co + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 3D 卷积 + 加偏置 + 激活 (ReLU), in-place 输出 ----
+// 与 conv3d_forward 相同, 但每输出通道加 bias 并 ReLU
+Funktion conv3d_bias_relu(in, w, bias, out, Ci, D, H, W, Co, KD, KH, KW)
+    OD = D - KD + 1
+    OH = H - KH + 1
+    OW = W - KW + 1
+    nout = Co * OD * OH * OW
+    t_zero(out, nout)
+    co = 0
+    Solange co < Co
+        od = 0
+        Solange od < OD
+            oh = 0
+            Solange oh < OH
+                ow = 0
+                Solange ow < OW
+                    acc = 0
+                    ci = 0
+                    Solange ci < Ci
+                        kd = 0
+                        Solange kd < KD
+                            kh = 0
+                            Solange kh < KH
+                                kw = 0
+                                Solange kw < KW
+                                    in_idx = ((ci * D + od + kd) * H + oh + kh) * W + ow + kw
+                                    w_idx = (((co * Ci + ci) * KD + kd) * KH + kh) * KW + kw
+                                    acc = f32_add(acc, f32_mul(t_get(in, in_idx), t_get(w, w_idx)))
+                                    kw = kw + 1
+                                Ende
+                                kh = kh + 1
+                            Ende
+                            kd = kd + 1
+                        Ende
+                        ci = ci + 1
+                    Ende
+                    // + bias + ReLU
+                    acc = f32_add(acc, t_get(bias, co))
+                    // ReLU: 若负则 0 (用符号位判断: 位模式最高位=1 即负数)
+                    Wenn (acc / 2147483648) == 1 dann
+                        acc = 0
+                    Ende
+                    out_idx = ((co * OD + od) * OH + oh) * OW + ow
+                    t_set(out, out_idx, acc)
+                    ow = ow + 1
+                Ende
+                oh = oh + 1
+            Ende
+            od = od + 1
+        Ende
+        co = co + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 3D 反卷积 (转置卷积): 输入 (Ci,Di,Hi,Wi), 权重 (Ci,Co,kd,kh,kw), 输出 (Co,Do,Ho,Wo)
+// Do=Di+KD-1, Ho=Hi+KH-1, Wo=Wi+KW-1. stride=1, 无 padding.
+Funktion deconv3d_forward(in, w, out, Ci, Di, Hi, Wi, Co, KD, KH, KW)
+    Do = Di + KD - 1
+    Ho = Hi + KH - 1
+    Wo = Wi + KW - 1
+    nout = Co * Do * Ho * Wo
+    t_zero(out, nout)
+    ci = 0
+    Solange ci < Ci
+        di = 0
+        Solange di < Di
+            hi = 0
+            Solange hi < Hi
+                wi = 0
+                Solange wi < Wi
+                    vin = t_get(in, ((ci * Di + di) * Hi + hi) * Wi + wi)
+                    co = 0
+                    Solange co < Co
+                        kd = 0
+                        Solange kd < KD
+                            kh = 0
+                            Solange kh < KH
+                                kw = 0
+                                Solange kw < KW
+                                    od = di + kd
+                                    oh = hi + kh
+                                    ow = wi + kw
+                                    w_idx = (((ci * Co + co) * KD + kd) * KH + kh) * KW + kw
+                                    out_idx = ((co * Do + od) * Ho + oh) * Wo + ow
+                                    raw_set32(out, out_idx * 4, f32_add(t_get(out, out_idx), f32_mul(vin, t_get(w, w_idx))))
+                                    kw = kw + 1
+                                Ende
+                                kh = kh + 1
+                            Ende
+                            kd = kd + 1
+                        Ende
+                        co = co + 1
+                    Ende
+                    wi = wi + 1
+                Ende
+                hi = hi + 1
+            Ende
+            di = di + 1
+        Ende
+        ci = ci + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 3D 最大池化: 输入 (Ci,D,H,W) -> 输出 (Ci,D/2,H/2,W/2), 2x2x2 窗口 ----
+Funktion pool3d_max(in, out, Ci, D, H, W)
+    OD = D / 2
+    OH = H / 2
+    OW = W / 2
+    ci = 0
+    Solange ci < Ci
+        od = 0
+        Solange od < OD
+            oh = 0
+            Solange oh < OH
+                ow = 0
+                Solange ow < OW
+                    mx = 0
+                    d = 0
+                    Solange d < 2
+                        h = 0
+                        Solange h < 2
+                            w = 0
+                            Solange w < 2
+                                v = t_get(in, ((ci * D + od * 2 + d) * H + oh * 2 + h) * W + ow * 2 + w)
+                                Wenn v > mx dann
+                                    mx = v
+                                Ende
+                                w = w + 1
+                            Ende
+                            h = h + 1
+                        Ende
+                        d = d + 1
+                    Ende
+                    t_set(out, ((ci * OD + od) * OH + oh) * OW + ow, mx)
+                    ow = ow + 1
+                Ende
+                oh = oh + 1
+            Ende
+            od = od + 1
+        Ende
+        ci = ci + 1
+    Ende
+    gebe_zurueck 0
+Ende

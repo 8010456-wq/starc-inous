@@ -1,0 +1,504 @@
+// ============================================================================
+//  MGTO1 :: engine.staro —— P2d 自研推理引擎（UWF1 前向）
+//  全部通过 .staro 实现。无第三方。
+//  UWF1 布局：88B 头 + FP32 权重段（mmap）。加载时转 FP64 存内存。
+//  前向：RMSNorm + RoPE(GQA) + SwiGLU，单 token（带 KV cache）。
+//  张量顺序（每层）：ln1,qw,qb,kw,kb,vw,vb,ow,ln2,gate,up,down
+// ============================================================================
+
+// ---- FP32 → FP64（double bit）。tmp 为 8 字节临时缓冲。----
+Funktion f32_to_f64(src, soff, tmp)
+    b0 = raw_byteat(src, soff + 0)
+    b1 = raw_byteat(src, soff + 1)
+    b2 = raw_byteat(src, soff + 2)
+    b3 = raw_byteat(src, soff + 3)
+    sign = b3 / 128
+    e_hi = b3 - sign * 128
+    exp8 = e_hi * 2 + b2 / 128
+    m_hi = b2 - (b2 / 128) * 128
+    exp11 = exp8 + 896
+    c3 = (b0 - (b0 / 8) * 8) * 32
+    c4 = (b1 - (b1 / 8) * 8) * 32 + b0 / 8
+    c5 = (m_hi - (m_hi / 8) * 8) * 32 + b1 / 8
+    c6 = m_hi / 8 + (exp11 - (exp11 / 16) * 16) * 16
+    c7 = sign * 128 + exp11 / 16
+    raw_setbyte(tmp, 0, 0)
+    raw_setbyte(tmp, 1, 0)
+    raw_setbyte(tmp, 2, 0)
+    raw_setbyte(tmp, 3, c3)
+    raw_setbyte(tmp, 4, c4)
+    raw_setbyte(tmp, 5, c5)
+    raw_setbyte(tmp, 6, c6)
+    raw_setbyte(tmp, 7, c7)
+    gebe_zurueck raw_get64(tmp, 0)
+Ende
+
+// ---- 引擎结构常量（eng 块偏移，8 字节步进）----
+Funktion eng_off_base()      gebe_zurueck 0     Ende
+Funktion eng_off_vocab()     gebe_zurueck 8     Ende
+Funktion eng_off_hidden()    gebe_zurueck 16    Ende
+Funktion eng_off_layers()    gebe_zurueck 24    Ende
+Funktion eng_off_heads()     gebe_zurueck 32    Ende
+Funktion eng_off_kv()        gebe_zurueck 40    Ende
+Funktion eng_off_inter()     gebe_zurueck 48    Ende
+Funktion eng_off_maxpos()    gebe_zurueck 56    Ende
+Funktion eng_off_dim()       gebe_zurueck 64    Ende
+Funktion eng_off_tied()      gebe_zurueck 72    Ende
+Funktion eng_off_eps()       gebe_zurueck 80    Ende
+Funktion eng_off_theta()     gebe_zurueck 88    Ende
+Funktion eng_off_invfr()     gebe_zurueck 96    Ende
+Funktion eng_off_kc()        gebe_zurueck 104   Ende
+Funktion eng_off_vc()        gebe_zurueck 112   Ende
+Funktion eng_off_perlayer()  gebe_zurueck 120   Ende
+Funktion eng_off_wte_el()    gebe_zurueck 128   Ende
+Funktion eng_off_lnf_el()    gebe_zurueck 136   Ende
+Funktion eng_off_scale()     gebe_zurueck 144   Ende
+
+// ---- 引擎初始化：mmap + 读头 + 转 FP64 + 预计算 inv_freq + 分配 KV ----
+Funktion eng_init(eng, path_c)
+    // 打开文件（只读）+ mmap
+    hf = CreateFileA(path_c, 2147483648, 1, 0, 3, 128, 0)
+    Wenn hf <= 0 dann
+        gebe_zurueck 0 - 1
+    Ende
+    hmap = CreateFileMappingA(hf, 0, 2, 0, 0, 0)
+    base = MapViewOfFile(hmap, 4, 0, 0, 0)
+    // 读 88B 头
+    vocab = u32r(base, 32)
+    hidden = u32r(base, 36)
+    layers = u32r(base, 40)
+    n_heads = u32r(base, 44)
+    kv = u32r(base, 48)
+    inter = u32r(base, 52)
+    max_pos = u32r(base, 56)
+    head_dim = u32r(base, 60)
+    tied = u32r(base, 64)
+    eps = raw_get64(base, 72)
+    theta = raw_get64(base, 80)
+    dim = head_dim
+    // 存头
+    raw_set64(eng, eng_off_base(), base)
+    raw_set64(eng, eng_off_vocab(), vocab)
+    raw_set64(eng, eng_off_hidden(), hidden)
+    raw_set64(eng, eng_off_layers(), layers)
+    raw_set64(eng, eng_off_heads(), n_heads)
+    raw_set64(eng, eng_off_kv(), kv)
+    raw_set64(eng, eng_off_inter(), inter)
+    raw_set64(eng, eng_off_maxpos(), max_pos)
+    raw_set64(eng, eng_off_dim(), dim)
+    raw_set64(eng, eng_off_tied(), tied)
+    raw_set64(eng, eng_off_eps(), eps)
+    raw_set64(eng, eng_off_theta(), theta)
+    // per_layer_elems（FP64 元素）
+    pl = hidden + hidden * hidden + hidden + kv * dim * hidden + kv * dim + kv * dim * hidden + kv * dim + hidden * hidden + hidden + inter * hidden + inter * hidden + hidden * inter
+    raw_set64(eng, eng_off_perlayer(), pl)
+    wte_el = vocab * hidden
+    raw_set64(eng, eng_off_wte_el(), wte_el)
+    lnf_el = wte_el + layers * pl
+    raw_set64(eng, eng_off_lnf_el(), lnf_el)
+    scale = fdiv(4607182418800017408, m_sqrt(i2f(dim)))
+    raw_set64(eng, eng_off_scale(), scale)
+    // 预计算 inv_freq（dim/2 个）：theta^(-2i/dim)
+    invfr = alloc(64 * 8)
+    half = dim / 2
+    // ln(theta) = 13.815510557964274
+    ln_theta = 4640536007111860224
+    i = 0
+    Solange i < half
+        // angle_exp = -i*ln_theta/half
+        ae = fdiv(fmul(fsub(0, i2f(i)), ln_theta), i2f(half))
+        v = m_exp(ae)
+        raw_set64(invfr, i * 8, v)
+        i = i + 1
+    Ende
+    raw_set64(eng, eng_off_invfr(), invfr)
+    // KV cache（layers * kv * maxpos * dim 个 double）
+    kcs = layers * kv * max_pos * dim
+    kc = alloc(kcs * 8)
+    vc = alloc(kcs * 8)
+    raw_set64(eng, eng_off_kc(), kc)
+    raw_set64(eng, eng_off_vc(), vc)
+    // 转权重 FP32→FP64（权重段从 88B 起）
+    // 权重段起始（mmap base + 88），全部 FP32
+    woff = 88
+    // 分配 FP64 权重区
+    tot = wte_el + layers * pl + hidden
+    w64 = alloc(tot * 8)
+    raw_set64(eng, eng_off_base(), w64)   // 基址改为 FP64 区（覆盖）
+    // 转换
+    tmp = alloc(8)
+    i = 0
+    Solange i < tot
+        raw_set64(w64, i * 8, f32_to_f64(base, woff + i * 4, tmp))
+        i = i + 1
+    Ende
+    // 转换完 base（mmap）不再需要，释放映射
+    UnmapViewOfFile(base)
+    CloseHandle(hmap)
+    CloseHandle(hf)
+    gebe_zurueck 0
+Ende
+
+// ---- matvec: y[m] = sum_n w[m*N+n] * x[n]（w/x/y 均 FP64 double bit，8 字节步进）----
+Funktion eng_matvec(w, M, N, x, y)
+    m = 0
+    Solange m < M
+        acc = 0
+        n = 0
+        Solange n < N
+            wv = raw_get64(w, (m * N + n) * 8)
+            xv = raw_get64(x, n * 8)
+            acc = fadd(acc, fmul(wv, xv))
+            n = n + 1
+        Ende
+        raw_set64(y, m * 8, acc)
+        m = m + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- matvec + bias: y[m] = sum_n w[m*N+n]*x[n] + b[m] ----
+Funktion eng_matvec_b(w, b, M, N, x, y)
+    m = 0
+    Solange m < M
+        acc = 0
+        n = 0
+        Solange n < N
+            wv = raw_get64(w, (m * N + n) * 8)
+            xv = raw_get64(x, n * 8)
+            acc = fadd(acc, fmul(wv, xv))
+            n = n + 1
+        Ende
+        acc = fadd(acc, raw_get64(b, m * 8))
+        raw_set64(y, m * 8, acc)
+        m = m + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- RMSNorm: out[i] = x[i] * r * w[i]，r = 1/sqrt(mean(x^2)+eps) ----
+Funktion eng_rmsnorm(x, w, hidden, eps, out)
+    acc = 0
+    i = 0
+    Solange i < hidden
+        xv = raw_get64(x, i * 8)
+        acc = fadd(acc, fmul(xv, xv))
+        i = i + 1
+    Ende
+    mean = fdiv(acc, i2f(hidden))
+    r = fdiv(4607182418800017408, m_sqrt(fadd(mean, eps)))
+    i = 0
+    Solange i < hidden
+        xv = raw_get64(x, i * 8)
+        wv = raw_get64(w, i * 8)
+        raw_set64(out, i * 8, fmul(fmul(xv, r), wv))
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 预计算 RoPE cos/sin 表（dim 长）per pos ----
+Funktion eng_rope_tab(eng, pos, cos_tab, sin_tab)
+    dim = raw_get64(eng, eng_off_dim())
+    invfr = raw_get64(eng, eng_off_invfr())
+    half = dim / 2
+    i = 0
+    Solange i < half
+        inv = raw_get64(invfr, i * 8)
+        angle = fmul(i2f(pos), inv)
+        c = m_cos(angle)
+        s = m_sin(angle)
+        raw_set64(cos_tab, (2 * i) * 8, c)
+        raw_set64(cos_tab, (2 * i + 1) * 8, c)
+        raw_set64(sin_tab, (2 * i) * 8, s)
+        raw_set64(sin_tab, (2 * i + 1) * 8, s)
+        i = i + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 应用 RoPE 到 q（n_heads*dim）与 k（kv*dim）----
+Funktion eng_rope(q, k, cos_tab, sin_tab, dim, n_heads, kv)
+    half = dim / 2
+    h = 0
+    Solange h < n_heads
+        d = 0
+        Solange d < half
+            qd = raw_get64(q, (h * dim + d) * 8)
+            qd2 = raw_get64(q, (h * dim + d + half) * 8)
+            c = raw_get64(cos_tab, d * 8)
+            s = raw_get64(sin_tab, d * 8)
+            c2 = raw_get64(cos_tab, (d + half) * 8)
+            s2 = raw_get64(sin_tab, (d + half) * 8)
+            n1 = fsub(fmul(qd, c), fmul(qd2, s))
+            n2 = fadd(fmul(qd2, c2), fmul(qd, s2))
+            raw_set64(q, (h * dim + d) * 8, n1)
+            raw_set64(q, (h * dim + d + half) * 8, n2)
+            d = d + 1
+        Ende
+        h = h + 1
+    Ende
+    h = 0
+    Solange h < kv
+        d = 0
+        Solange d < half
+            kd = raw_get64(k, (h * dim + d) * 8)
+            kd2 = raw_get64(k, (h * dim + d + half) * 8)
+            c = raw_get64(cos_tab, d * 8)
+            s = raw_get64(sin_tab, d * 8)
+            c2 = raw_get64(cos_tab, (d + half) * 8)
+            s2 = raw_get64(sin_tab, (d + half) * 8)
+            n1 = fsub(fmul(kd, c), fmul(kd2, s))
+            n2 = fadd(fmul(kd2, c2), fmul(kd, s2))
+            raw_set64(k, (h * dim + d) * 8, n1)
+            raw_set64(k, (h * dim + d + half) * 8, n2)
+            d = d + 1
+        Ende
+        h = h + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- GQA 注意力（单 token，pos）。q 已 RoPE；k/v cache 已存。----
+Funktion eng_attn(eng, q, pos, dim, n_heads, kv, out)
+    kc = raw_get64(eng, eng_off_kc())
+    vc = raw_get64(eng, eng_off_vc())
+    maxp = raw_get64(eng, eng_off_maxpos())
+    scale = raw_get64(eng, eng_off_scale())
+    groups = n_heads / kv
+    // scores 临时（maxpos 缓冲）
+    scores = alloc(4096 * 8)
+    h = 0
+    Solange h < n_heads
+        kh = h / groups
+        j = 0
+        Solange j <= pos
+            acc = 0
+            d = 0
+            Solange d < dim
+                qv = raw_get64(q, (h * dim + d) * 8)
+                kvv = raw_get64(kc, (kh * maxp + j) * dim * 8 + d * 8)
+                acc = fadd(acc, fmul(qv, kvv))
+                d = d + 1
+            Ende
+            raw_set64(scores, j * 8, fmul(acc, scale))
+            j = j + 1
+        Ende
+        // softmax
+        mx = raw_get64(scores, 0)
+        j = 1
+        Solange j <= pos
+            v = raw_get64(scores, j * 8)
+            Wenn fcmp(v, mx) > 0 dann
+                mx = v
+            Ende
+            j = j + 1
+        Ende
+        sum = 0
+        j = 0
+        Solange j <= pos
+            v = raw_get64(scores, j * 8)
+            e = m_exp(fsub(v, mx))
+            raw_set64(scores, j * 8, e)
+            sum = fadd(sum, e)
+            j = j + 1
+        Ende
+        d = 0
+        Solange d < dim
+            acc = 0
+            j = 0
+            Solange j <= pos
+                p = raw_get64(scores, j * 8)
+        vv = raw_get64(vc, (kh * maxp + j) * dim * 8 + d * 8)
+                acc = fadd(acc, fmul(p, vv))
+                j = j + 1
+            Ende
+            raw_set64(out, (h * dim + d) * 8, fdiv(acc, sum))
+            d = d + 1
+        Ende
+        h = h + 1
+    Ende
+    gebe_zurueck 0
+Ende
+
+// ---- 前向单 token。token：id；pos：位置；logits：vocab 输出缓冲。----
+Funktion eng_forward(eng, token, pos, logits)
+    base = raw_get64(eng, eng_off_base())
+    vocab = raw_get64(eng, eng_off_vocab())
+    hidden = raw_get64(eng, eng_off_hidden())
+    layers = raw_get64(eng, eng_off_layers())
+    n_heads = raw_get64(eng, eng_off_heads())
+    kv = raw_get64(eng, eng_off_kv())
+    inter = raw_get64(eng, eng_off_inter())
+    dim = raw_get64(eng, eng_off_dim())
+    eps = raw_get64(eng, eng_off_eps())
+    per_layer = raw_get64(eng, eng_off_perlayer())
+    wte_el = raw_get64(eng, eng_off_wte_el())
+    kc = raw_get64(eng, eng_off_kc())
+    vc = raw_get64(eng, eng_off_vc())
+    maxp = raw_get64(eng, eng_off_maxpos())
+    half = dim / 2
+    // x = wte[token]
+    x = alloc(hidden * 8)
+    i = 0
+    Solange i < hidden
+        raw_set64(x, i * 8, raw_get64(base, (token * hidden + i) * 8))
+        i = i + 1
+    Ende
+    // cos/sin 表
+    cos_tab = alloc(dim * 8)
+    sin_tab = alloc(dim * 8)
+    eng_rope_tab(eng, pos, cos_tab, sin_tab)
+    lc = 0
+    Solange lc < layers
+        Wenn lc < 3 dann
+            mg_write_str("  L enter lc=")
+            mg_write_int(lc)
+            mg_write_str(" x0=")
+            mg_write_int(raw_get64(x, 0))
+            mg_newline()
+        Ende
+        lb = wte_el * 8 + lc * per_layer * 8
+        ln1 = base + lb
+        qw = base + lb + hidden * 8
+        qb = base + lb + (hidden + hidden * hidden) * 8
+        kw = base + lb + (hidden + hidden * hidden + hidden) * 8
+        kb = base + lb + (hidden + hidden * hidden + hidden + kv * dim * hidden) * 8
+        vw = base + lb + (hidden + hidden * hidden + hidden + kv * dim * hidden + kv * dim) * 8
+        vb = base + lb + (hidden + hidden * hidden + hidden + kv * dim * hidden + kv * dim + kv * dim * hidden) * 8
+        ow = base + lb + (hidden + hidden * hidden + hidden + kv * dim * hidden + kv * dim + kv * dim * hidden + kv * dim) * 8
+        ln2 = base + lb + (hidden + hidden * hidden + hidden + kv * dim * hidden + kv * dim + kv * dim * hidden + kv * dim + hidden * hidden) * 8
+        gate = base + lb + (hidden + hidden * hidden + hidden + kv * dim * hidden + kv * dim + kv * dim * hidden + kv * dim + hidden * hidden + hidden) * 8
+        up = base + lb + (hidden + hidden * hidden + hidden + kv * dim * hidden + kv * dim + kv * dim * hidden + kv * dim + hidden * hidden + hidden + inter * hidden) * 8
+        down = base + lb + (hidden + hidden * hidden + hidden + kv * dim * hidden + kv * dim + kv * dim * hidden + kv * dim + hidden * hidden + hidden + inter * hidden + inter * hidden) * 8
+        // RMSNorm
+        xn = alloc(hidden * 8)
+        eng_rmsnorm(x, ln1, hidden, eps, xn)
+        Wenn lc == 0 dann
+            mg_write_str("    xn0=")
+            mg_write_int(raw_get64(xn, 0))
+            mg_newline()
+        Ende
+        // q/k/v
+        q = alloc(n_heads * dim * 8)
+        k = alloc(kv * dim * 8)
+        v = alloc(kv * dim * 8)
+        eng_matvec_b(qw, qb, n_heads * dim, hidden, xn, q)
+        eng_matvec_b(kw, kb, kv * dim, hidden, xn, k)
+        eng_matvec_b(vw, vb, kv * dim, hidden, xn, v)
+        Wenn lc == 0 dann
+            mg_write_str("    q0=")
+            mg_write_int(raw_get64(q, 0))
+            mg_write_str(" k0=")
+            mg_write_int(raw_get64(k, 0))
+            mg_write_str(" v0=")
+            mg_write_int(raw_get64(v, 0))
+            mg_newline()
+        Ende
+        // RoPE
+        eng_rope(q, k, cos_tab, sin_tab, dim, n_heads, kv)
+        // 存 KV cache：kc[layer][kh][pos][dim]
+        kh = 0
+        Solange kh < kv
+            d = 0
+            Solange d < dim
+                kvv = raw_get64(k, (kh * dim + d) * 8)
+                vvv = raw_get64(v, (kh * dim + d) * 8)
+                raw_set64(kc, ((lc * kv + kh) * maxp + pos) * dim * 8 + d * 8, kvv)
+                raw_set64(vc, ((lc * kv + kh) * maxp + pos) * dim * 8 + d * 8, vvv)
+                d = d + 1
+            Ende
+            kh = kh + 1
+        Ende
+        // attention
+        att = alloc(n_heads * dim * 8)
+        eng_attn(eng, q, pos, dim, n_heads, kv, att)
+        Wenn lc == 0 dann
+            mg_write_str("    att0=")
+            mg_write_int(raw_get64(att, 0))
+            mg_newline()
+        Ende
+        // o_proj
+        o = alloc(hidden * 8)
+        eng_matvec(ow, hidden, n_heads * dim, att, o)
+        Wenn lc == 0 dann
+            mg_write_str("    o0=")
+            mg_write_int(raw_get64(o, 0))
+            mg_newline()
+        Ende
+        // residual
+        i = 0
+        Solange i < hidden
+            raw_set64(x, i * 8, fadd(raw_get64(x, i * 8), raw_get64(o, i * 8)))
+            i = i + 1
+        Ende
+        // ln2 + SwiGLU
+        eng_rmsnorm(x, ln2, hidden, eps, xn)
+        g = alloc(inter * 8)
+        upv = alloc(inter * 8)
+        eng_matvec(gate, inter, hidden, xn, g)
+        eng_matvec(up, inter, hidden, xn, upv)
+        hh = alloc(inter * 8)
+        i = 0
+        Solange i < inter
+            raw_set64(hh, i * 8, fmul(m_silu(raw_get64(g, i * 8)), raw_get64(upv, i * 8)))
+            i = i + 1
+        Ende
+        dv = alloc(hidden * 8)
+        eng_matvec(down, hidden, inter, hh, dv)
+        i = 0
+        Solange i < hidden
+            raw_set64(x, i * 8, fadd(raw_get64(x, i * 8), raw_get64(dv, i * 8)))
+            i = i + 1
+        Ende
+        lc = lc + 1
+        Wenn lc <= 3 dann
+            mg_write_str("  L exit lc=")
+            mg_write_int(lc)
+            mg_write_str(" x0=")
+            mg_write_int(raw_get64(x, 0))
+            mg_write_str(" x1=")
+            mg_write_int(raw_get64(x, 8))
+            mg_write_str(" x100=")
+            mg_write_int(raw_get64(x, 800))
+            mg_write_str(" x895=")
+            mg_write_int(raw_get64(x, 7160))
+            mg_newline()
+        Ende
+    Ende
+    // lnf
+    lnf = base + (wte_el + layers * per_layer) * 8
+    xn = alloc(hidden * 8)
+    eng_rmsnorm(x, lnf, hidden, eps, xn)
+    mg_write_str("  lnf eps=")
+    mg_write_int(eps)
+    mg_write_str(" lnf0=")
+    mg_write_int(raw_get64(lnf, 0))
+    mg_write_str(" lnf1=")
+    mg_write_int(raw_get64(lnf, 8))
+    mg_write_str(" xn0=")
+    mg_write_int(raw_get64(xn, 0))
+    mg_newline()
+    // logits = wte @ xn（lm_head tied = wte）
+    eng_matvec(base, vocab, hidden, xn, logits)
+    mg_write_str("  logits0=")
+    mg_write_int(raw_get64(logits, 0))
+    mg_newline()
+    gebe_zurueck 0
+Ende
+
+// ---- argmax ----
+Funktion eng_argmax(logits, vocab)
+    best = raw_get64(logits, 0)
+    bi = 0
+    i = 1
+    Solange i < vocab
+        v = raw_get64(logits, i * 8)
+        Wenn fcmp(v, best) > 0 dann
+            best = v
+            bi = i
+        Ende
+        i = i + 1
+    Ende
+    gebe_zurueck bi
+Ende

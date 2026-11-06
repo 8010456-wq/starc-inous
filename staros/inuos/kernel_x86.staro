@@ -1,0 +1,58 @@
+// kernel_x86.staro - StarOS x86-64 内核能力库 (能力全部在此 .staro 实现)
+// 遵循铁律 E: starcc 只编译正确/输出正确, 能力在 .staro 里实现。
+// 这些函数的机器码由 codegen_bare.staro 按名字识别并发射
+//   (与 GPU 路径的 relu/exp/sqrt/tid_x 被 parse_prog/codegen_prog 识别同理)。
+//
+// ===== 特权指令叶函数 (codegen_bare 发射固定机器码, 非 StarC 表达式) =====
+Funktion x86_cli()          // cli  FA
+    gebe_zurueck 0
+Ende
+
+Funktion x86_sti()          // sti  FB
+    gebe_zurueck 0
+Ende
+
+Funktion x86_hlt()          // hlt  F4
+    gebe_zurueck 0
+Ende
+
+// 端口输出 outb(port, val):  mov edx,port; mov al,val; out dx,al
+Funktion port_outb(port, val)
+    gebe_zurueck 0
+Ende
+
+// 端口输入 inb(port):  mov edx,port; in al,dx; 返回 al
+Funktion port_inb(port)
+    gebe_zurueck 0
+Ende
+
+// 读取 CR2 (页错误地址)
+Funktion x86_read_cr2()
+    gebe_zurueck 0
+Ende
+
+// ===== VGA 文本模式能力 (80x25, 0xB8000) =====
+// 写一个字符到指定行/列 (attr 默认 0x0F 亮白/黑)
+Funktion vga_putc(ch, row, col)
+    gebe_zurueck 0
+Ende
+
+// 写字符串到当前行 (codegen 编译为循环, 能力在 .staro)
+Funktion vga_str(s)
+    gebe_zurueck 0
+Ende
+
+// 清屏
+Funktion vga_clear()
+    gebe_zurueck 0
+Ende
+
+// ===== 内核死循环 (cli + hlt 循环) =====
+Funktion kernel_halt_loop()
+    x86_cli()
+    stop = 0
+    Solange stop == 0
+        x86_hlt()
+    Ende
+    gebe_zurueck 0
+Ende
