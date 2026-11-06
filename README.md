@@ -1,7 +1,14 @@
 # StarC 语言项目简介
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Language: StarC](https://img.shields.io/badge/Language-StarC-7C3AED.svg)](https://github.com/8010456-wq/starc-inous)
+[![Platform: x86-64](https://img.shields.io/badge/Platform-x86--64-1f6feb.svg)]()
+[![Self-hosted Compiler](https://img.shields.io/badge/Compiler-Self--hosted-0a9d58.svg)]()
+
 > **StarC** —— 一门德语式关键字、直出原生 PE32+、零外部工具链的自研编程语言。
 > 本仓库（`inous`）是 StarC 的全部标准库（`.staro`）、函数清单、项目简介与编译器目录的统一整合仓库。
+>
+> 📄 **许可证**：本仓库以 **MIT License** 开源（见 [LICENSE](LICENSE)），可自由使用、修改、分发与商用。
 
 ---
 
@@ -141,7 +148,9 @@ starcc main.starc util.starc -o app.exe
 
 ## 七、许可证与自主性
 
-StarC 语言、`starcc` 编译器、`.staro` 标准库均为**完全自主开发**，无任何第三方依赖、无外部工具链、无运行时。语言设计、实现与生态皆由本仓库所有，可自由用于学习、研究与工程实践。
+StarC 语言、`starcc` 编译器、`.staro` 标准库均为**完全自主开发**，无任何第三方依赖、无外部工具链、无运行时。语言设计、实现与生态皆由本仓库所有。
+
+本仓库以 **MIT License** 开源（见 [LICENSE](LICENSE)）：允许自由使用、复制、修改、合并、发布、分发、再许可及销售本软件副本，仅需保留版权与许可声明。软件按"原样"提供，不附带任何明示或默示担保。
 
 ---
 
