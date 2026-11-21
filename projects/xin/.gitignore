@@ -1,0 +1,15 @@
+# build artifacts
+dist/
+build/
+*.sc
+
+# generated data (rebuild with build.sh)
+data/rules_sorted.txt
+data/rules.qrb
+data/hosts_block.txt
+
+# upstream seed lists (fetch with scripts/fetch-rules.sh; not redistributed)
+data/src_*.txt
+
+# local backups
+backup/

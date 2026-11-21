@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "辛 / Xin 去广告",
+  "version": "1.2.1",
+  "description": "页面层广告容器清道夫 · 柔和 / 强迫双模式",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "辛 / Xin V1.2.0"
+  }
+}

@@ -1,0 +1,27 @@
+Funktion main()
+    k_print("=== Xin serve v1 ===")
+    k_nl()
+    rules = qrb_load("D:/starc/xin/data/rules.qrb")
+    Wenn rules == 0 dann
+        k_print("load rules failed")
+        k_nl()
+        gebe_zurueck 1
+    Ende
+    k_print("rules = ")
+    k_int(qrb_count(rules))
+    k_nl()
+    sl = h_start(8353)
+    Wenn sl <= 0 dann
+        k_print("start failed")
+        k_nl()
+        gebe_zurueck 2
+    Ende
+    k_print("listening on http://127.0.0.1:8353")
+    k_nl()
+    k_print("try: /check?domain=ads.doubleclick.net")
+    k_nl()
+    h_serve(sl, rules)
+    gebe_zurueck 0
+Ende
+
+main()

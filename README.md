@@ -9,6 +9,8 @@
 > 本仓库（`inous`）是 StarC 的全部标准库（`.staro`）、函数清单、项目简介与编译器目录的统一整合仓库。
 >
 > 📄 **许可证**：本仓库以 **MIT License** 开源（见 [LICENSE](LICENSE)），可自由使用、修改、分发与商用。
+>
+> 🚀 **首个基于 StarC 的完整产品**：[**辛 / Xin**](projects/xin/README.md) —— 全系统去广告引擎（自研二进制规则容器 + 自研匹配器 + 本地 HTTP 判定接口），11 万条规则 656 ns 查询，纯 StarC 实现，零第三方依赖。
 
 ---
 
@@ -155,3 +157,38 @@ StarC 语言、`starcc` 编译器、`.staro` 标准库均为**完全自主开发
 ---
 
 *本简介生成于 2026-11-06，数据来源：`D:\starc\inous` 仓库整合实录。*
+
+---
+
+## 八、产品：辛 / Xin（首个完整产品）
+
+> 📖 完整文档：[`projects/xin/README.md`](projects/xin/README.md) ｜ 核心流程逐行剖析：[`projects/xin/docs/CORE-FLOW.md`](projects/xin/docs/CORE-FLOW.md)
+
+**辛 / Xin** 是第一个完全跑在 StarC 上的完整产品：**全系统去广告引擎**。
+
+它不写浏览器插件了事，而是把广告问题推回到 DNS 层——域名解析不出来，任何程序（浏览器、微信内嵌页、Steam、桌面软件）里的广告都加载不了：
+
+| 层 | 实现 | 作用 |
+|---|---|---|
+| 网络层 | `hosts` 110,302 条 `0.0.0.0` | 广告域名解析失败，全系统生效 |
+| 页面层 | Chrome/Edge MV3 扩展（53 条选择器） | 删掉残留广告容器与「广告」标识 |
+| 判定层 | `127.0.0.1:8353/check?domain=` | 本地微秒级判定，供其他程序调用 |
+
+**技术要点（全部自研，零第三方依赖）**
+
+| 组件 | 说明 |
+|---|---|
+| `.qrb` 容器 | 自研二进制格式：`XINR` 魔数 + 定长 48 字节记录 + 选择器尾区，加载零解析 |
+| `xin_pack` | 文本 → 二进制的规则编译器，11 万条 **132 ms** |
+| 匹配器 | 定长表**二分查找** + 域名**后缀逐段下钻**，110,302 条规则 **656 ns/次** |
+| 接口 | Winsock 手写 HTTP 服务（`WSAStartup`/`bind`/`listen`/`recv`），仅绑 `127.0.0.1` |
+| 语言 | 全部 `.starc` / `.staro`，仅调用 `kernel32.dll` 与 `ws2_32.dll` |
+
+**为什么它不会被浏览器政策杀死**：拦截发生在 DNS 层，扩展只做"删容器"的化妆品工作，因此**不依赖 `webRequest`，也不占用 `declarativeNetRequest` 规则配额**——Chrome 的 Manifest V3 收紧打不到这个架构上。
+
+**诚实的边界**（详见 [README §5](projects/xin/README.md#5-honest-assessment)）：仅 Windows；`hosts` 方案会被 DoH/HTTPDNS 绕过；同域名自营广告拦不了；无白名单、无自动更新、无安装器、无测试套件。
+
+```bash
+cd projects/xin
+STARC_CC=/path/to/starcc.exe bash build.sh     # 一键：归一化 → 编译 → 打包 → 自测
+```

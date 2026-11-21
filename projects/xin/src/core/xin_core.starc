@@ -1,0 +1,155 @@
+Funktion k_span(src, s, e)
+    ln = e - s
+    out = alloc(ln + 10)
+    i = 0
+    Solange i < ln
+        raw_setbyte(out, 8 + i, raw_byteat(src, s + i))
+        i = i + 1
+    Ende
+    raw_setbyte(out, 8 + ln, 0)
+    k_print(out)
+    gebe_zurueck 0
+Ende
+
+Funktion run(inpath, qpath)
+    rules = qrb_load(inpath)
+    Wenn rules == 0 dann
+        k_print("load rules failed")
+        k_nl()
+        gebe_zurueck 1
+    Ende
+    cnt = qrb_count(rules)
+    k_print("rules loaded = ")
+    k_int(cnt)
+    k_nl()
+    h = x_open_r(qpath)
+    Wenn h <= 0 dann
+        k_print("open query failed")
+        k_nl()
+        gebe_zurueck 2
+    Ende
+    qs = x_size(h)
+    x_seek(h, 0)
+    buf = alloc(qs + 8)
+    n = x_read_buf(h, buf, qs)
+    x_close(h)
+    total = 0
+    blocked = 0
+    s = 0
+    i = 0
+    Solange i <= n
+        is_end = 0
+        Wenn i == n dann
+            Wenn s < n dann is_end = 1 Ende
+        Sonst
+            Wenn raw_byteat(buf, i) == 10 dann is_end = 1 Ende
+        Ende
+        Wenn is_end == 1 dann
+            e = i
+            Wenn e > s dann
+                Wenn raw_byteat(buf, e - 1) == 13 dann e = e - 1 Ende
+            Ende
+            Wenn e > s dann
+                hit = qrb_check(rules, buf, s, e)
+                total = total + 1
+                Wenn hit == 1 dann
+                    blocked = blocked + 1
+                    k_print("BLOCK  ")
+                Sonst
+                    k_print("ALLOW  ")
+                Ende
+                k_span(buf, s, e)
+                k_nl()
+            Ende
+            s = i + 1
+        Ende
+        i = i + 1
+    Ende
+    k_print("--- summary ---")
+    k_nl()
+    k_print("total   = ")
+    k_int(total)
+    k_nl()
+    k_print("blocked = ")
+    k_int(blocked)
+    k_nl()
+    k_print("allowed = ")
+    k_int(total - blocked)
+    k_nl()
+    gebe_zurueck 0
+Ende
+
+Funktion bench(inpath, qpath, reps)
+    rules = qrb_load(inpath)
+    h = x_open_r(qpath)
+    qs = x_size(h)
+    x_seek(h, 0)
+    buf = alloc(qs + 8)
+    n = x_read_buf(h, buf, qs)
+    x_close(h)
+    t0 = x_tick()
+    hits = 0
+    r = 0
+    Solange r < reps
+        s = 0
+        i = 0
+        Solange i <= n
+            is_end = 0
+            Wenn i == n dann
+                Wenn s < n dann is_end = 1 Ende
+            Sonst
+                Wenn raw_byteat(buf, i) == 10 dann is_end = 1 Ende
+            Ende
+            Wenn is_end == 1 dann
+                e = i
+                Wenn e > s dann
+                    Wenn raw_byteat(buf, e - 1) == 13 dann e = e - 1 Ende
+                Ende
+                Wenn e > s dann
+                    hits = hits + qrb_check(rules, buf, s, e)
+                Ende
+                s = i + 1
+            Ende
+            i = i + 1
+        Ende
+        r = r + 1
+    Ende
+    t1 = x_tick()
+    ms = t1 - t0
+    q = reps * 32
+    k_print("--- bench ---")
+    k_nl()
+    k_print("reps      = ")
+    k_int(reps)
+    k_nl()
+    k_print("queries   = ")
+    k_int(q)
+    k_nl()
+    k_print("elapsed   = ")
+    k_int(ms)
+    k_print(" ms")
+    k_nl()
+    k_print("hits      = ")
+    k_int(hits)
+    k_nl()
+    k_print("ns/query  = ")
+    k_int((ms * 1000000) / q)
+    k_nl()
+    k_print("qps       = ")
+    k_int((q * 1000) / (ms + 1))
+    k_nl()
+    gebe_zurueck 0
+Ende
+
+Funktion main()
+    k_print("=== Xin core v1 ===")
+    k_nl()
+    r = run("D:/starc/xin/data/rules.qrb", "D:/starc/xin/data/query.txt")
+    k_print("exit = ")
+    k_int(r)
+    k_nl()
+    b = bench("D:/starc/xin/data/rules.qrb", "D:/starc/xin/data/query.txt", 3000)
+    gebe_zurueck 0
+Ende
+
+main()

@@ -1,0 +1,45 @@
+Funktion pack_cos(inpath, out, base)
+    h = x_open_r(inpath)
+    Wenn h <= 0 dann gebe_zurueck base Ende
+    sz = x_size(h)
+    x_seek(h, 0)
+    buf = alloc(sz + 8)
+    n = x_read_buf(h, buf, sz)
+    x_close(h)
+    p = base + 4
+    cnt = 0
+    s = 0
+    i = 0
+    Solange i <= n
+        is_end = 0
+        Wenn i == n dann
+            Wenn s < n dann is_end = 1 Ende
+        Sonst
+            Wenn raw_byteat(buf, i) == 10 dann is_end = 1 Ende
+        Ende
+        Wenn is_end == 1 dann
+            e = i
+            Wenn e > s dann
+                Wenn raw_byteat(buf, e - 1) == 13 dann e = e - 1 Ende
+            Ende
+            ln = e - s
+            Wenn ln > 0 dann
+                Wenn ln <= 200 dann
+                    raw_setbyte(out, p, ln % 256)
+                    raw_setbyte(out, p + 1, ln / 256)
+                    j = 0
+                    Solange j < ln
+                        raw_setbyte(out, p + 2 + j, raw_byteat(buf, s + j))
+                        j = j + 1
+                    Ende
+                    p = p + 2 + ln
+                    cnt = cnt + 1
+                Ende
+            Ende
+            s = i + 1
+        Ende
+        i = i + 1
+    Ende
+    u32_put(out, base, cnt)
+    gebe_zurueck p
+Ende
