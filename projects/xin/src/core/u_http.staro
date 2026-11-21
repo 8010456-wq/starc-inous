@@ -1,0 +1,155 @@
+linx "ws2_32.dll!WSAStartup"
+linx "ws2_32.dll!socket"
+linx "ws2_32.dll!bind"
+linx "ws2_32.dll!listen"
+linx "ws2_32.dll!accept"
+linx "ws2_32.dll!recv"
+linx "ws2_32.dll!send"
+linx "ws2_32.dll!closesocket"
+
+Funktion h_put(buf, pos, s)
+    i = 0
+    Solange raw_byteat(s, 8 + i) != 0
+        raw_setbyte(buf, pos + i, raw_byteat(s, 8 + i))
+        i = i + 1
+    Ende
+    gebe_zurueck pos + i
+Ende
+
+Funktion h_crlf(buf, pos)
+    raw_setbyte(buf, pos, 13)
+    raw_setbyte(buf, pos + 1, 10)
+    gebe_zurueck pos + 2
+Ende
+
+Funktion h_start(port)
+    wsa = alloc(512)
+    i = 0
+    Solange i < 512
+        raw_setbyte(wsa, i, 0)
+        i = i + 1
+    Ende
+    raw_setbyte(wsa, 0, 2)
+    raw_setbyte(wsa, 1, 2)
+    r = WSAStartup(514, wsa)
+    k_print("  WSAStartup = ")
+    k_int(r)
+    k_nl()
+    s = socket(2, 1, 6)
+    k_print("  socket     = ")
+    k_int(s)
+    k_nl()
+    Wenn s <= 0 dann gebe_zurueck 0 - 1 Ende
+    a = alloc(16)
+    j = 0
+    Solange j < 16
+        raw_setbyte(a, j, 0)
+        j = j + 1
+    Ende
+    raw_setbyte(a, 0, 2)
+    raw_setbyte(a, 1, 0)
+    raw_setbyte(a, 2, port / 256)
+    raw_setbyte(a, 3, port % 256)
+    raw_setbyte(a, 4, 127)
+    raw_setbyte(a, 5, 0)
+    raw_setbyte(a, 6, 0)
+    raw_setbyte(a, 7, 1)
+    rb = bind(s, a, 16)
+    k_print("  bind       = ")
+    k_int(rb)
+    k_nl()
+    Wenn rb != 0 dann
+        closesocket(s)
+        gebe_zurueck 0 - 2
+    Ende
+    rl = listen(s, 32)
+    k_print("  listen     = ")
+    k_int(rl)
+    k_nl()
+    Wenn rl != 0 dann
+        closesocket(s)
+        gebe_zurueck 0 - 3
+    Ende
+    gebe_zurueck s
+Ende
+
+Funktion h_resp(c, is_block)
+    b = alloc(512)
+    p = 0
+    p = h_put(b, p, "HTTP/1.1 200 OK")
+    p = h_crlf(b, p)
+    p = h_put(b, p, "Content-Type: text/plain")
+    p = h_crlf(b, p)
+    p = h_put(b, p, "Access-Control-Allow-Origin: *")
+    p = h_crlf(b, p)
+    p = h_put(b, p, "Content-Length: 6")
+    p = h_crlf(b, p)
+    p = h_put(b, p, "Connection: close")
+    p = h_crlf(b, p)
+    p = h_crlf(b, p)
+    Wenn is_block == 1 dann
+        p = h_put(b, p, "BLOCK")
+    Sonst
+        p = h_put(b, p, "ALLOW")
+    Ende
+    p = h_crlf(b, p)
+    r = send(c, b, p, 0)
+    gebe_zurueck r
+Ende
+
+Funktion h_serve(sl, rules)
+    served = 0
+    blocked = 0
+    Solange 1 == 1
+        c = accept(sl, 0, 0)
+        Wenn c > 0 dann
+            req = alloc(4096)
+            i = 0
+            Solange i < 4096
+                raw_setbyte(req, i, 0)
+                i = i + 1
+            Ende
+            n = recv(c, req, 4095, 0)
+            Wenn n > 0 dann
+                dstart = 0
+                dend = 0
+                i = 0
+                Solange i < n
+                    ch = raw_byteat(req, i)
+                    Wenn ch == 61 dann
+                        Wenn dstart == 0 dann dstart = i + 1 Ende
+                    Ende
+                    Wenn ch == 32 oder ch == 13 dann
+                        Wenn dstart > 0 dann
+                            Wenn dend == 0 dann dend = i Ende
+                        Ende
+                    Ende
+                    i = i + 1
+                Ende
+                hit = 0
+                Wenn dend > dstart dann
+                    hit = qrb_check(rules, req, dstart, dend)
+                Ende
+                served = served + 1
+                Wenn hit == 1 dann blocked = blocked + 1 Ende
+                k_print("  [")
+                k_int(served)
+                k_print("] ")
+                Wenn hit == 1 dann
+                    k_print("BLOCK ")
+                Sonst
+                    k_print("ALLOW ")
+                Ende
+                Wenn dend > dstart dann
+                    k_span(req, dstart, dend)
+                Sonst
+                    k_print("(no domain)")
+                Ende
+                k_nl()
+                h_resp(c, hit)
+            Ende
+            closesocket(c)
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende

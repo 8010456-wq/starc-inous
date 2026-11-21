@@ -1,0 +1,101 @@
+Funktion pack(inpath, cospath, outpath)
+    h = x_open_r(inpath)
+    Wenn h <= 0 dann
+        k_print("open input failed")
+        k_nl()
+        gebe_zurueck 1
+    Ende
+    sz = x_size(h)
+    x_seek(h, 0)
+    buf = alloc(sz + 8)
+    n = x_read_buf(h, buf, sz)
+    x_close(h)
+    k_print("domain bytes = ")
+    k_int(n)
+    k_nl()
+    lines = 0
+    i = 0
+    Solange i < n
+        Wenn raw_byteat(buf, i) == 10 dann lines = lines + 1 Ende
+        i = i + 1
+    Ende
+    Wenn n > 0 dann
+        Wenn raw_byteat(buf, n - 1) != 10 dann lines = lines + 1 Ende
+    Ende
+    rs = 48
+    out = alloc(16 + lines * rs + 16384)
+    raw_setbyte(out, 0, 88)
+    raw_setbyte(out, 1, 73)
+    raw_setbyte(out, 2, 78)
+    raw_setbyte(out, 3, 82)
+    u32_put(out, 4, 2)
+    u32_put(out, 8, 0)
+    u32_put(out, 12, rs)
+    rec = 0
+    s = 0
+    i = 0
+    Solange i <= n
+        is_end = 0
+        Wenn i == n dann
+            Wenn s < n dann is_end = 1 Ende
+        Sonst
+            Wenn raw_byteat(buf, i) == 10 dann is_end = 1 Ende
+        Ende
+        Wenn is_end == 1 dann
+            e = i
+            Wenn e > s dann
+                Wenn raw_byteat(buf, e - 1) == 13 dann e = e - 1 Ende
+            Ende
+            ln = e - s
+            Wenn ln > 0 dann
+                Wenn ln > 47 dann ln = 47 Ende
+                roff = 16 + rec * rs
+                raw_setbyte(out, roff, ln)
+                j = 0
+                Solange j < ln
+                    raw_setbyte(out, roff + 1 + j, raw_byteat(buf, s + j))
+                    j = j + 1
+                Ende
+                rec = rec + 1
+            Ende
+            s = i + 1
+        Ende
+        i = i + 1
+    Ende
+    u32_put(out, 8, rec)
+    base = 16 + rec * rs
+    total = pack_cos(cospath, out, base)
+    ccnt = u32_get(out, base)
+    ho = x_open_w(outpath)
+    Wenn ho <= 0 dann
+        k_print("open output failed")
+        k_nl()
+        gebe_zurueck 2
+    Ende
+    x_write_buf(ho, out, total)
+    x_close(ho)
+    k_print("format version = 2 (V1.2.0)")
+    k_nl()
+    k_print("domain records = ")
+    k_int(rec)
+    k_nl()
+    k_print("cosmetic rules = ")
+    k_int(ccnt)
+    k_nl()
+    k_print("output bytes   = ")
+    k_int(total)
+    k_nl()
+    gebe_zurueck 0
+Ende
+
+Funktion main()
+    k_print("=== Xin rule packer v2 (V1.2.0) ===")
+    k_nl()
+    r = pack("D:/starc/xin/data/rules_sorted.txt", "D:/starc/xin/data/cosmetic_raw.txt", "D:/starc/xin/data/rules.qrb")
+    k_print("exit = ")
+    k_int(r)
+    k_nl()
+    gebe_zurueck 0
+Ende
+
+main()

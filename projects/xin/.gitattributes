@@ -1,0 +1,16 @@
+# Normalize line endings so the project behaves identically on Windows / Linux.
+* text=auto
+
+# Shell scripts and sources must be LF even on Windows (CRLF breaks the shebang).
+*.sh      text eol=lf
+*.starc   text eol=lf
+*.staro   text eol=lf
+*.js      text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# PowerShell scripts are Windows-only; CRLF is expected.
+*.ps1     text eol=crlf

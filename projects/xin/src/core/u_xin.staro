@@ -1,0 +1,236 @@
+linx "kernel32.dll!GetStdHandle"
+linx "kernel32.dll!WriteFile"
+linx "kernel32.dll!ReadFile"
+linx "kernel32.dll!CreateFileA"
+linx "kernel32.dll!CloseHandle"
+linx "kernel32.dll!SetFilePointerEx"
+linx "kernel32.dll!GetTickCount"
+
+Funktion x_tick()
+    t = GetTickCount()
+    gebe_zurueck t
+Ende
+
+Funktion k_print(s)
+    h = GetStdHandle(0 - 11)
+    len = 0
+    Solange raw_byteat(s, 8 + len) != 0
+        len = len + 1
+    Ende
+    ok = WriteFile(h, s + 8, len, 0, 0)
+    gebe_zurueck ok
+Ende
+
+Funktion k_nl()
+    m = alloc(4)
+    raw_setbyte(m, 8, 10)
+    raw_setbyte(m, 9, 0)
+    h = GetStdHandle(0 - 11)
+    ok = WriteFile(h, m + 8, 1, 0, 0)
+    gebe_zurueck ok
+Ende
+
+Funktion k_int(v)
+    buf = alloc(40)
+    dig = 0
+    neg = 0
+    x = v
+    Wenn x < 0 dann
+        neg = 1
+        x = 0 - x
+    Ende
+    tmp = x
+    Solange tmp > 0
+        d = tmp % 10
+        raw_setbyte(buf, 8 + dig, 48 + d)
+        dig = dig + 1
+        tmp = tmp / 10
+    Ende
+    Wenn dig == 0 dann
+        raw_setbyte(buf, 8, 48)
+        dig = 1
+    Ende
+    out = alloc(dig + neg + 2)
+    pos = 0
+    Wenn neg == 1 dann
+        raw_setbyte(out, 8 + pos, 45)
+        pos = pos + 1
+    Ende
+    j = dig - 1
+    Solange j >= 0
+        raw_setbyte(out, 8 + pos, raw_byteat(buf, 8 + j))
+        pos = pos + 1
+        j = j - 1
+    Ende
+    raw_setbyte(out, 8 + pos, 0)
+    ok = k_print(out)
+    gebe_zurueck ok
+Ende
+
+Funktion k_intln(v)
+    k_int(v)
+    k_nl()
+    gebe_zurueck 0
+Ende
+
+Funktion x_open_r(path)
+    fn = alloc(260)
+    ln = 0
+    Solange raw_byteat(path, 8 + ln) != 0
+        ln = ln + 1
+    Ende
+    i = 0
+    Solange i < ln
+        raw_setbyte(fn, i, raw_byteat(path, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(fn, ln, 0)
+    h = CreateFileA(fn, 2147483648, 0, 0, 3, 128, 0)
+    gebe_zurueck h
+Ende
+
+Funktion x_open_w(path)
+    fn = alloc(260)
+    ln = 0
+    Solange raw_byteat(path, 8 + ln) != 0
+        ln = ln + 1
+    Ende
+    i = 0
+    Solange i < ln
+        raw_setbyte(fn, i, raw_byteat(path, 8 + i))
+        i = i + 1
+    Ende
+    raw_setbyte(fn, ln, 0)
+    h = CreateFileA(fn, 1073741824, 0, 0, 2, 128, 0)
+    gebe_zurueck h
+Ende
+
+Funktion x_seek(h, pos)
+    pp = alloc(8)
+    r = SetFilePointerEx(h, pos, pp, 0)
+    gebe_zurueck r
+Ende
+
+Funktion x_size(h)
+    pp = alloc(8)
+    r = SetFilePointerEx(h, 0, pp, 2)
+    lo = raw_byteat(pp, 0) + raw_byteat(pp, 1) * 256 + raw_byteat(pp, 2) * 65536 + raw_byteat(pp, 3) * 16777216
+    gebe_zurueck lo
+Ende
+
+Funktion x_read_buf(h, buf, n)
+    got = alloc(8)
+    total = 0
+    done = 0
+    Solange done == 0
+        raw_setbyte(got, 0, 0)
+        raw_setbyte(got, 1, 0)
+        raw_setbyte(got, 2, 0)
+        raw_setbyte(got, 3, 0)
+        ok = ReadFile(h, buf + total, n - total, got, 0)
+        v = raw_byteat(got, 0) + raw_byteat(got, 1) * 256 + raw_byteat(got, 2) * 65536 + raw_byteat(got, 3) * 16777216
+        Wenn v == 0 dann
+            done = 1
+        Sonst
+            total = total + v
+        Ende
+        Wenn total >= n dann done = 1 Ende
+    Ende
+    gebe_zurueck total
+Ende
+
+Funktion x_write_buf(h, buf, n)
+    w = alloc(8)
+    raw_setbyte(w, 0, 0)
+    raw_setbyte(w, 1, 0)
+    raw_setbyte(w, 2, 0)
+    raw_setbyte(w, 3, 0)
+    ok = WriteFile(h, buf, n, w, 0)
+    gebe_zurueck ok
+Ende
+
+Funktion x_close(h)
+    ok = CloseHandle(h)
+    gebe_zurueck ok
+Ende
+
+Funktion u32_get(buf, off)
+    v = raw_byteat(buf, off) + raw_byteat(buf, off + 1) * 256 + raw_byteat(buf, off + 2) * 65536 + raw_byteat(buf, off + 3) * 16777216
+    gebe_zurueck v
+Ende
+
+Funktion u32_put(buf, off, v)
+    raw_setbyte(buf, off, v % 256)
+    raw_setbyte(buf, off + 1, (v / 256) % 256)
+    raw_setbyte(buf, off + 2, (v / 65536) % 256)
+    raw_setbyte(buf, off + 3, (v / 16777216) % 256)
+    gebe_zurueck 0
+Ende
+
+Funktion str_cmp(buf, o1, l1, buf2, o2, l2)
+    n = l1
+    Wenn l2 < n dann n = l2 Ende
+    i = 0
+    Solange i < n
+        a = raw_byteat(buf, o1 + i)
+        b = raw_byteat(buf2, o2 + i)
+        Wenn a < b dann gebe_zurueck 0 - 1 Ende
+        Wenn a > b dann gebe_zurueck 1 Ende
+        i = i + 1
+    Ende
+    Wenn l1 < l2 dann gebe_zurueck 0 - 1 Ende
+    Wenn l1 > l2 dann gebe_zurueck 1 Ende
+    gebe_zurueck 0
+Ende
+
+Funktion qrb_load(path)
+    h = x_open_r(path)
+    Wenn h <= 0 dann gebe_zurueck 0 Ende
+    hs = x_size(h)
+    x_seek(h, 0)
+    buf = alloc(hs)
+    n = x_read_buf(h, buf, hs)
+    x_close(h)
+    gebe_zurueck buf
+Ende
+
+Funktion qrb_count(buf)
+    Wenn buf == 0 dann gebe_zurueck 0 Ende
+    v = u32_get(buf, 8)
+    gebe_zurueck v
+Ende
+
+Funktion qrb_find(buf, src, s, e)
+    cnt = u32_get(buf, 8)
+    rs = u32_get(buf, 12)
+    l1 = e - s
+    lo = 0
+    hi = cnt - 1
+    Solange lo <= hi
+        mid = (lo + hi) / 2
+        roff = 16 + mid * rs
+        rl = raw_byteat(buf, roff)
+        c = str_cmp(buf, roff + 1, rl, src, s, l1)
+        Wenn c == 0 dann gebe_zurueck 1 Ende
+        Wenn c < 0 dann
+            lo = mid + 1
+        Sonst
+            hi = mid - 1
+        Ende
+    Ende
+    gebe_zurueck 0
+Ende
+
+Funktion qrb_check(buf, src, s, e)
+    hit = qrb_find(buf, src, s, e)
+    Wenn hit == 1 dann gebe_zurueck 1 Ende
+    p = s
+    Solange p < e
+        Wenn raw_byteat(src, p) == 46 dann
+            hit = qrb_find(buf, src, p + 1, e)
+            Wenn hit == 1 dann gebe_zurueck 1 Ende
+        Ende
+        p = p + 1
+    Ende
+    gebe_zurueck 0
+Ende
